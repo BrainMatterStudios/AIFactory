@@ -1,0 +1,82 @@
+name: CI
+
+# A project that files defects against other people's repositories should pass
+# its own gate in its own CI. `assert_tier_policy`'s docstring tells adopters to
+# run it in CI; this is that, for us.
+#
+# Security note: this workflow interpolates no event data. The only expression is
+# `matrix.python-version`, which is defined below and never reaches a `run:` body
+# — so there is no path for issue/PR/commit text to be evaluated as shell.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Tests
+        run: python -m pytest -q
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Pinned deliberately: an unpinned linter turns "CI is green" into a
+      # statement about what shipped this week rather than about the code.
+      - run: pip install "ruff==0.16.0"
+      - run: ruff check software_factory tests
+
+  policy:
+    # The gate rules the doctrine says must be enforced rather than remembered.
+    # If these fail, the frontier floor has been edited away.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - name: Model-tier policy + persona drift
+        run: python -m software_factory.cli personas
+      - name: The loop runs end to end offline
+        run: python -m software_factory.cli demo
+
+  no-hard-deps:
+    # The core advertises zero hard third-party dependencies. Prove it: import and
+    # run the deterministic core in an environment with nothing else installed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install .
+      - name: Core imports and runs without PyYAML
+        run: |
+          python - <<'PY'
+          import importlib.util
+          assert importlib.util.find_spec("yaml") is None, "PyYAML present; this job must run bare"
+          from software_factory.core.orchestrate import classify_tier, combine
+          from software_factory.loop.verify import scan_logs          # noqa: F401
+          from software_factory.loop.harvester import harvest         # noqa: F401
+          print("tier:", classify_tier(source="feature", files_changed=8, lines_changed=300))
+          print("combine:", combine(["PASS"], revise_count=0, security_block=False))
+          PY

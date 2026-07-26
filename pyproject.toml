@@ -1,0 +1,90 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "software-factory"
+version = "0.1.0"
+description = "A reusable, extensible, resilient AI software factory — orchestrate doctrine + observe→fix→verify loop, behind swappable provider adapters."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "BrainMatter Studio" }]
+keywords = ["ai", "software-factory", "agents", "orchestration", "devops"]
+
+# The core (doctrine, helpers, loop, governance) has ZERO hard third-party deps —
+# it is pure-Python and adapter-driven. Providers pull their own extras.
+dependencies = []
+
+[project.optional-dependencies]
+yaml = ["PyYAML>=6"]                 # config manifest + persona catalog parsing
+github = ["PyYAML>=6"]              # github source/board adapter (uses `gh` CLI; yaml for forms)
+postgres = ["psycopg[binary]>=3.1"] # postgres data adapter
+dev = ["pytest>=7", "PyYAML>=6", "ruff==0.16.0"]
+
+# ── lint ─────────────────────────────────────────────────────────────────────
+# The rule set is declared explicitly rather than inherited from the tool's
+# defaults. Defaults move between releases, which means an unpinned linter can
+# fail CI on a day nobody touched the code — exactly what happened here when a
+# new ruff shipped a wider default set. The version is pinned in the dev extra
+# and in CI so `ruff check` means the same thing on every machine.
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+  "E", "W",      # pycodestyle
+  "F",           # pyflakes
+  "I",           # import sorting
+  "UP",          # pyupgrade — keep the typing imports current
+  "B",           # bugbear
+  "C4",          # comprehensions
+  "SIM",         # simplify
+  "RUF",         # ruff-specific
+  "PLW", "PLE",  # pylint warnings + errors
+]
+ignore = [
+  # The loop fails SOFT on purpose: one flaky collector, log fetch or adapter
+  # must degrade its own check to WARN rather than abort a pass that is the only
+  # thing looking at the system. Those handlers are broad by design and each one
+  # records the error as evidence — see loop/verify.py and loop/ratchet.py.
+  "BLE001",   # blind except
+  "S110",     # try/except/pass — same rationale, at call sites that must not raise
+  # We check `returncode` explicitly everywhere we shell out, because the
+  # difference between "the command failed" and "the command found nothing" is
+  # load-bearing here (see adapters/reference/github.py).
+  "PLW1510",  # subprocess.run without check=
+  "E501",     # long lines are prose in docstrings; the formatter owns wrapping
+  # This codebase's docstrings are prose and use typographic punctuation — em
+  # dashes, curly quotes, arrows. That is deliberate: these files are read by
+  # people at least as often as by the interpreter.
+  "RUF001", "RUF002", "RUF003",   # "ambiguous" unicode in strings/docstrings/comments
+  # An unpacked value that a caller ignores is often the clearest way to show
+  # WHICH element of a tuple is being used, e.g. `hits, _scanned, err = scan()`.
+  "RUF059",
+  # try/except/pass here is a deliberate best-effort step whose failure must not
+  # affect the outcome (a board move, a cleanup). contextlib.suppress is not
+  # clearer at these call sites.
+  "SIM105",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]   # asserts are the point
+
+[project.scripts]
+factory = "software_factory.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["software_factory*"]
+
+# Ship the non-Python data files (doctrine/conventions .md, persona catalog + packs
+# .yaml) inside the wheel. Without this a non-editable install omits them and
+# `factory doctor`/`personas` crash with FileNotFoundError on catalog.yaml.
+[tool.setuptools.package-data]
+software_factory = ["**/*.md", "**/*.yaml", "**/*.yml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

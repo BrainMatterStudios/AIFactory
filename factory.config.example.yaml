@@ -1,0 +1,115 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# factory.config.yaml — the per-instance manifest.
+#
+# This single file holds everything specific to YOUR stack. The core reads it and
+# builds the adapter bundle from the registry; there is no find/replace and no
+# project identity baked into the code. Copy this to `factory.config.yaml`, fill
+# it in, and run `factory doctor`.
+#
+# Every `provider:` value must be a name registered for that adapter kind. See
+# the registered names with:  python3 -c "import software_factory.adapters as a; \
+#   print({k:a.get_registry().names(k) for k in ['source','runner','observe','data','alert','scheduler']})"
+# ─────────────────────────────────────────────────────────────────────────────
+factory:
+  name: my-project
+
+  # 0. PLUGINS — load YOUR custom adapters/collectors so their @register fires.
+  #    Each entry is an importable module on the PYTHONPATH (drop a .py next to
+  #    this file, or `pip install` a plugin package). Installed plugin packages
+  #    that advertise the `software_factory.plugins` entry-point group are picked
+  #    up automatically and need not be listed here. See docs/WRITING_A_PLUGIN.md.
+  plugins: []                 # e.g. [mycompany_factory.adapters]
+
+  # Optional: project-local persona packs (extra roles for your domain).
+  personas:
+    packs: []                 # e.g. [factory-personas]  (dirs of *.yaml, relative to this file)
+
+  # 1. SOURCE — VCS + the issue board that is the work queue.
+  source:
+    provider: github          # reference: github (gh CLI) | memory (offline)
+    repo: my-org/my-repo
+    ready_label: ready        # the only label/column a build loop pulls from
+    # board columns are advisory here; on the free plan the github adapter
+    # mirrors columns onto col:<name> labels (see github.py).
+
+  # 2. RUNNER — spawns agents at a model tier. Tier names map to concrete ids
+  #    here, so the doctrine never hardcodes a vendor model id in prose.
+  runner:
+    provider: claude_code     # reference: claude_code | echo (offline)
+    models:
+      opus: claude-opus-4-8
+      sonnet: claude-sonnet-4-6
+      haiku: claude-haiku-4-5-20251001
+
+  # 3. OBSERVE — read-only run status + logs. Swap for your platform.
+  observe:
+    provider: docker          # reference: docker | null. Bring your own: k8s,
+                              # datadog, cloudwatch, …
+    containers: [my-api, my-worker]   # docker: which containers to watch
+    # ssh_host: deploy@vps            # docker: run `docker` over SSH on a remote host
+    log_targets: [my-api, my-worker]  # scan these targets' recent logs for errors
+    # log_patterns: ['\bERROR\b', '\bFATAL\b', 'Traceback']   # override the defaults
+    # collectors: myproject.factory.collectors:collectors      # your own data checks
+
+  # 4. DATA — read-only DSN for data-quality collectors. Fail-closed.
+  data:
+    provider: postgres        # reference: postgres | dict (offline)
+    dsn_env: FACTORY_RO_DSN   # name of the env var holding the READ-ONLY dsn
+
+  # 5. ALERT — digest + critical pings.
+  alert:
+    provider: slack           # reference: slack | telegram | stdout (offline)
+    webhook_env: SLACK_WEBHOOK_URL
+
+  # 6. SCHEDULER — when the observe loop fires (unattended). Install it with
+  #    `factory schedule install`; preview with `factory schedule render`.
+  scheduler:
+    provider: github_actions  # reference: cron | launchd | github_actions
+    cron: "0 9 * * *"         # nightly at 09:00
+    command: "factory observe --target prod --apply --alert"
+    repo_dir: .               # github_actions: where to write the workflow file
+
+  # ── how the L3 build loop turns an issue into a PR (`factory build <id>`) ───
+  build:
+    dev_branch: develop       # the ONLY base the loop may target — never a prod ref
+    verify_cmd: "pytest -q"   # YOUR project's test/lint gate; must pass before a PR
+    workspace_root: .factory-worktrees
+    max_revise: 2             # judge revise cycles before it escalates to a human
+
+  # ── policy ────────────────────────────────────────────────────────────────
+  routing:
+    thresholds:               # what counts as "large" (floors a task at T2)
+      large_files: 5
+      large_lines: 150
+
+  # Spend caps. `monthly_usd` is enforced across runs via a small state file
+  # outside the repo (FACTORY_STATE_DIR, default ~/.software-factory-state), so a
+  # nightly loop cannot spend the month's cap every night. Caps only bite when the
+  # runner reports a cost — the claude_code runner does; a custom runner must set
+  # RunResult.cost_usd or the caps are advisory.
+  budget:
+    monthly_usd: 200
+    per_task_usd: 50
+    daily_alert_usd: 20
+
+  governance:
+    killswitch_env: KILL_FACTORY
+    # For UNATTENDED autonomy this must be true AND your Source provider must
+    # have server-side branch protection on the prod ref — a convention-only
+    # gate is not enough. `factory doctor` flags this.
+    require_branch_protection: true
+    # The agent must never be able to read the gate it is measured against.
+    eval_gate_path: evals/
+    # Branch names the ceiling refuses to open a PR into. The built-in defaults
+    # are main / master / production / prod, compared after normalizing
+    # `refs/heads/…` and `origin/…`. Add yours if you release from something else
+    # — a ceiling that does not know your production branch name is not a ceiling.
+    prod_refs: [main, release]
+
+  # ── routines: the owner-owned dial between "file & auto-Ready" and "ask me" ──
+  routines:
+    auto_ready:               # finding classes promoted straight to Ready
+      - run_status_fail
+    suppress: []              # classes to never file
+    budget:
+      max_filed_per_run: 25   # a bad night can't flood the board

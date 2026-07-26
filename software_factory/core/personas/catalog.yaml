@@ -1,0 +1,182 @@
+# Factory persona catalog — the orchestration doctrine's roles (doctrine §2).
+#
+# The orchestrator forms a proportional team from this catalog. Each entry is
+# cross-industry: nothing here assumes a particular product domain. A domain
+# persona pack plugs in as a SEPARATE yaml an adopter drops into
+# `core/personas/packs/<pack>.yaml` (same `personas:` shape); the loader can merge
+# packs without editing this file.
+#
+# Fields per persona:
+#   name       unique slug.
+#   model      opus | sonnet | haiku  — the tier (mapped to a concrete model by
+#              config `runner.models`, never a hardcoded vendor id).
+#   author     file   — ships as a real `<name>.md` beside this catalog (lean core);
+#              prompt — instantiated on demand from the catalog `role` brief.
+#   frequency  always | feature | standard | context | frontend — when it participates.
+#   phase      intake | design | implement | review | release — pipeline stage.
+#   role       one-line description / role brief.
+#   tier_lock  floor | thorough (optional) — a model-tier minimum enforced in code
+#              by `core.personas.tiers.assert_tier_policy`, NOT by this file.
+#
+# Model tiers (field-calibrated — see docs/MODEL_TIERING.md):
+#   opus   = hard reasoning/judgment + ALL judges. This is the frontier floor
+#            (`tier_lock: floor`) — never downgrade it. A cheap gate does not fail
+#            loudly; it silently passes work that should have been stopped.
+#   sonnet = standard work, all review agents, and thoroughness-critical coding —
+#            parsers, input/format handling, adapters, edge-case-heavy logic
+#            (`tier_lock: thorough`). Benchmarking found the cheap tier silently
+#            UNDER-COVERS this class: it drops input variants rather than failing.
+#   haiku  = mechanical + clean-algorithmic coding, code reading/exploration, and
+#            structured text (changelogs, docs). Benchmark-confirmed at parity
+#            with the standard tier on this class, at a fraction of the cost.
+#
+# Retier a persona on measurement, not on intuition: run the benchmark recipe in
+# docs/MODEL_TIERING.md against your own repo before moving anything down.
+
+meta:
+  note: >
+    author:prompt personas are promoted to author:file by evidence — once a prompt
+    persona proves repeatedly useful, author a `<name>.md` for it and flip the field.
+
+personas:
+  # --- the gate ---
+  - name: judge
+    model: opus
+    tier_lock: floor
+    author: file
+    frequency: always
+    phase: review
+    role: Independent quality gate; scores a deliverable against the rubric and returns PASS/REVISE/BLOCK.
+
+  # --- lean core (authored as files) ---
+  - name: product-manager
+    model: opus
+    tier_lock: floor     # owns the T2 plan gate — the decision a human is asked to approve
+    author: file
+    frequency: feature
+    phase: intake
+    role: Owns prioritization, scope arbitration, and turning business goals into engineering-ready specs + success metrics.
+  - name: requirements-analyst
+    model: sonnet
+    author: file
+    frequency: feature
+    phase: intake
+    role: Turns briefs/tickets/feedback into unambiguous, testable acceptance criteria and edge-case inventories.
+  - name: security-specialist
+    model: opus
+    tier_lock: floor     # holds the veto channel — a cheap veto is no veto
+    author: file
+    frequency: always
+    phase: review
+    role: Audits for vulnerabilities (OWASP, secrets, authz, injection, supply-chain); can BLOCK a merge.
+  - name: test-author
+    model: sonnet
+    tier_lock: thorough  # coverage completeness — the cheap tier drops edge cases silently
+    author: file
+    frequency: standard
+    phase: implement
+    role: Writes missing unit/integration/E2E tests from spec + implementation (distinct from pr-test-analyzer which reviews).
+
+  # --- cross-industry prompt-personas ---
+  - name: ux-researcher
+    model: sonnet        # retiered from opus: research synthesis needs no flagship (over-spend)
+    author: prompt
+    frequency: frontend
+    phase: intake
+    role: Synthesizes user research/usability heuristics into design constraints and flows.
+  - name: api-contract-designer
+    model: sonnet
+    tier_lock: thorough  # backward-compatibility analysis is exhaustive-by-nature
+    author: prompt
+    frequency: standard
+    phase: design
+    role: OpenAPI/GraphQL schema design + backward-compatibility analysis.
+  - name: data-modeler
+    model: sonnet
+    tier_lock: thorough  # migration correctness — a missed case is a production incident
+    author: prompt
+    frequency: standard
+    phase: design
+    role: Schema/index/migration design + query-plan review.
+  - name: performance-profiler
+    model: sonnet
+    author: prompt
+    frequency: context
+    phase: review
+    role: CPU/memory/query/render bottleneck diagnosis + before/after benchmarks.
+  - name: accessibility-auditor
+    model: haiku
+    author: prompt
+    frequency: frontend
+    phase: review
+    role: WCAG 2.2 AA / keyboard / screen-reader / contrast checklist audit.
+  - name: dependency-auditor
+    model: haiku
+    author: prompt
+    frequency: context
+    phase: review
+    role: Dependency CVE/license/health/version-drift review.
+  - name: qa-scenario-designer
+    model: sonnet
+    author: prompt
+    frequency: standard
+    phase: review
+    role: Exploratory/regression test plans, edge-case matrices, E2E user-flow scripts.
+  - name: release-manager
+    model: haiku         # retiered from sonnet: structured text at benchmark parity
+    author: prompt
+    frequency: context
+    phase: release
+    role: Changelogs, migration guides, rollback plans, go/no-go safety summary for a diff.
+  - name: devops-engineer
+    model: sonnet
+    author: prompt
+    frequency: context
+    phase: release
+    role: CI/CD, container, IaC, deployment-manifest correctness + env parity.
+  - name: incident-responder
+    model: opus
+    author: prompt
+    frequency: context
+    phase: review
+    role: Diagnose live incidents from logs/metrics/traces; RCA + mitigation.
+  - name: observability-engineer
+    model: sonnet
+    author: prompt
+    frequency: context
+    phase: implement
+    role: Logging/metrics/alerting/tracing coverage + signal quality.
+  - name: technical-writer
+    model: haiku         # retiered from sonnet: structured text at benchmark parity
+    author: prompt
+    frequency: context
+    phase: release
+    role: User docs, API reference, runbooks (distinct from comment-analyzer).
+  - name: implementer
+    model: sonnet
+    author: prompt
+    frequency: standard
+    phase: implement
+    role: Writes the change against acceptance criteria, failing-test-first, following repo conventions.
+
+# Reused built-in agents (no authoring; spawned directly by name).
+#
+# The orchestrator MUST pass an explicit model when spawning these — they carry no
+# catalog entry, so an unpinned spawn inherits whatever the host defaults to. That
+# is exactly how a gate-adjacent reviewer ends up quietly running on the cheapest
+# available model without anyone deciding it should. The required pin per built-in
+# lives in `core.personas.tiers.BUILTIN_MODELS`; `null` here means "tier by task"
+# (use the task's own T0/T1/T2 tier). Ask for it via `tiers.builtin_model(name,
+# tier=...)` rather than reading this list.
+builtins:
+  code-reviewer: sonnet
+  silent-failure-hunter: sonnet
+  type-design-analyzer: sonnet
+  pr-test-analyzer: sonnet
+  code-architect: null
+  Plan: null
+  code-explorer: haiku
+  Explore: haiku
+  code-simplifier: haiku
+  comment-analyzer: haiku
+  general-purpose: null
