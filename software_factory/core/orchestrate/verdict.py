@@ -82,6 +82,7 @@ def decide_restart(
     security_block: bool,
     tier: str | object,
     restart_cap: int = RESTART_CAP,
+    revise_cap: int = REVISE_CAP,
 ) -> Verdict:
     """Decide whether a BLOCK should be upgraded to RESTART.
 
@@ -97,14 +98,20 @@ def decide_restart(
       * restart_count < restart_cap (default 1 — one fresh attempt per dispatch);
       * tier is T1 or T2 — T0 blocks are always a human call;
       * the block is recoverable: `wrong_design` is set, OR the revise budget ran
-        out without an explicit BLOCK vote (`revise_count >= REVISE_CAP and not
+        out without an explicit BLOCK vote (`revise_count >= revise_cap and not
         block_vote`). A deliberate BLOCK vote that isn't a wrong-design call is a
         human decision, not a restart.
+
+    `revise_cap` must be the SAME value the caller passed to `combine`. It used
+    to be hardwired to the module default here while `combine` took the operator's
+    `max_revise`, so a project that lowered the cap to 1 exhausted its revise
+    budget, blocked, and was then judged un-restartable by a rule reading a cap it
+    was not run under — the restart path silently disappeared.
     """
     tier_name = getattr(tier, "value", tier)
     if combine_result is not Verdict.BLOCK:
         return combine_result
     if security_block or restart_count >= restart_cap or tier_name not in _RESTARTABLE_TIERS:
         return Verdict.BLOCK
-    recoverable = wrong_design or (revise_count >= REVISE_CAP and not block_vote)
+    recoverable = wrong_design or (revise_count >= revise_cap and not block_vote)
     return Verdict.RESTART if recoverable else Verdict.BLOCK

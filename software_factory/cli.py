@@ -205,15 +205,21 @@ def cmd_doctor(args) -> int:
     ok = True
     print("== factory doctor ==")
 
-    # kill switch
+    # kill switch. Both the root AND the env var name come from the manifest:
+    # checking the default `KILL_FACTORY` while the project configured its own
+    # name reports "clear" for a switch it never looked at, which is the one
+    # false reassurance a kill-switch check must not produce.
     _root = resolve_repo_root(None, getattr(args, "repo", None))
+    _kill_env = "KILL_FACTORY"
     try:
-        _root = resolve_repo_root(_load_config(getattr(args, "config", None)),
-                                  getattr(args, "repo", None))
+        _cfg = _load_config(getattr(args, "config", None))
+        _root = resolve_repo_root(_cfg, getattr(args, "repo", None))
+        _kill_env = _cfg.governance.killswitch_env
     except Exception:
-        pass  # no manifest reachable — fall back to cwd
-    reason = kill_requested(root=_root)
-    print(f"kill switch     : {'ENGAGED — ' + reason if reason else 'clear'}  (root: {_root})")
+        pass  # no manifest reachable — fall back to cwd + the default name
+    reason = kill_requested(_kill_env, root=_root)
+    print(f"kill switch     : {'ENGAGED — ' + reason if reason else 'clear'}  "
+          f"(env: {_kill_env}, root: {_root})")
 
     # persona drift
     drift = validate_against_files()
@@ -238,9 +244,14 @@ def cmd_doctor(args) -> int:
     try:
         cfg = _load_config(args.config)
     except Exception as e:
+        # A manifest that cannot be loaded is a failed check, not a skipped one.
+        # Exiting 0 here made `factory doctor` report success for a project with
+        # no config at all — and doctor is precisely what a new adopter runs to
+        # find that out, and what a scheduler runs to decide whether to fire.
         print(f"manifest        : NOT LOADED — {e}")
-        print("\n(doctor ran the stack-independent checks only)")
-        return 0 if ok else 1
+        print("\nverdict: ISSUES FOUND — only the stack-independent checks ran. "
+              "Run `factory init` in your project, or pass --config.")
+        return 1
 
     print(f"manifest        : {cfg.source_path}  (project: {cfg.name})")
     if _LOADED_PLUGINS:
@@ -469,6 +480,7 @@ def _run_build_locked(args, cfg, repo_dir: str) -> int:
         max_revise=cfg.build_cfg.max_revise,
         require_contract=cfg.build_cfg.require_contract,
         contracts_dir=cfg.build_cfg.contracts_dir,
+        plan_approved_label=cfg.build_cfg.plan_approved_label,
         killswitch_env=cfg.governance.killswitch_env,
         repo_root=repo_dir,
         prod_refs=cfg.governance.prod_refs or None,
@@ -495,8 +507,10 @@ def _run_build_locked(args, cfg, repo_dir: str) -> int:
         for line in outcome.plan.splitlines():
             print(f"  {line}")
         print("  " + "─" * 74)
-        print("  Approve by re-running the build once the issue is retiered, or "
-              "reject by\n  closing the issue. Nothing was written to the repo.")
+        print(f"  Approve: label the issue `{cfg.build_cfg.plan_approved_label}` and "
+              "re-run this build — it will\n  implement the plan above, which is stored "
+              f"at .factory/plans/issue-{issue.id}.md\n  and posted on the issue. Reject: "
+              "close the issue. Nothing was written to\n  the repo.")
     # Non-zero exit for the states a human needs to look at.
     return 0 if outcome.status.value in ("shipped", "plan-pending") else 1
 

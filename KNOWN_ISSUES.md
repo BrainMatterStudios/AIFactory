@@ -14,7 +14,7 @@ present. It is the newest code in this package and the only major subsystem with
 no production provenance: everything else was generalized from a factory that has
 run against a live system, and this was written from scratch.
 
-Four independent adversarial review panels have examined it. Every one found
+Five independent adversarial review panels have examined it. Every one found
 defects, and every serious defect they found was here rather than in the ported
 subsystems. All of the following were reproduced, and are fixed — the list exists
 so you can judge the code's maturity, not because these are open:
@@ -25,11 +25,20 @@ so you can judge the code's maturity, not because these are open:
 | 2 | Work preserved onto the build branch was pushed unscanned on the next run, putting a live token on a remote. The same change wedged every re-run, and made a build that produced nothing ship the *previous* failed attempt. |
 | 3 | The gate scanned the working tree while `push` sends the commit range, so a secret committed and then scrubbed shipped through a clean gate. Its history-scanning helper was inverted: unreachable for the case it was written for, and firing only on the legitimate *removal* of a credential. Separately, on a fresh clone the default config caused agent commits to land on the shared dev branch. |
 | 4 | Git C-quotes non-ASCII filenames, so a token in `café_config.py` was skipped as "deleted" and pushed. Per-commit enumeration missed merge commits and typechanges entirely. |
+| 5 | **Three ways to pass the judge gate without a judge passing the work.** A failed judge run was never checked for success, so a crash log containing the word PASS shipped an unreviewed branch. The verdict parser took the first match, so a reply that quoted the response template (`verdict: PASS\|REVISE\|BLOCK`) parsed as PASS — as did a reply that said PASS and then revised itself to BLOCK. And the judge held a writable worktree while the test gate had already run, so anything it wrote afterwards shipped untested. Separately: `require_contract` and `contracts_dir` were declared in config and never parsed, so a gate an operator switched on silently did not exist; the T2 plan halt had no continuation path, so an approval could only be expressed by re-tiering the issue *around* the gate; and `decide_restart` read a hardwired revise cap while `combine` read the operator's, which deleted the restart path for anyone who lowered it. |
 
-The pattern across all four: **fixes that were correct alone and destroyed each
-other in composition**, invisible to a test suite that exercised one at a time.
-`tests/test_interactions.py` exists because of that, and runs multi-step sequences
-against real git and real remotes.
+The pattern across the first four: **fixes that were correct alone and destroyed
+each other in composition**, invisible to a test suite that exercised one at a
+time. `tests/test_interactions.py` exists because of that, and runs multi-step
+sequences against real git and real remotes.
+
+The pattern in round five is different and worth naming separately: every one of
+those defects read an **absence of evidence as a pass**. A run that failed, a
+reply that was ambiguous, a window between two checks. The gates were all present
+and all of them failed open. `tests/test_judge_gate_integrity.py` pins each one,
+and the loop now re-runs your verify command against the exact tree it is about
+to push — the control that catches a mutation regardless of which layer above it
+was bypassed.
 
 What that history means for you: the individual defects are fixed and pinned by
 tests, but the density has not obviously fallen, and this subsystem has never run
@@ -67,6 +76,28 @@ and leave running.
   It only means something in a repo that writes `contracts/<issue>.json`; turned
   on elsewhere it blocks every build for a missing file nobody agreed to write.
   When on, it fails closed: a commit order it cannot read is a block, not a pass.
+  It checks commit order, document shape, and that no criterion carries an
+  instruction aimed at the judge — but there is **no negotiation round** in the
+  autonomous loop, so it cannot require the evidence of one, and a contract that
+  lands in the same commit as its implementation satisfies "at or before". The
+  doctrine's version of this gate is stronger than the autonomous one.
+- **The judge's read-only allowlist is advisory.** Judges are dispatched with a
+  read-only `tools` list, which the reference Claude runner forwards as
+  `--allowedTools`; a runner that ignores the argument enforces nothing. What
+  actually holds the line is the re-run of your `verify_cmd` against the tree
+  about to be pushed, which turns a mutation into a blocked build rather than an
+  untested PR.
+- **The runner deny list is pattern matching, not a sandbox.** The reference
+  Claude runner refuses `git push`, `git merge`, `git tag`, `gh pr merge`,
+  `gh release` and `gh workflow run` on every turn. A shell script or an
+  unmatched spelling reaches the same effect. It narrows the surface; unattended
+  operation still wants a sandboxed runner and least-privilege credentials.
+- **T2 plan approval is a label and a file.** The plan is stored under
+  `.factory/plans/issue-<id>.md` and posted on the issue; adding
+  `build.plan_approved_label` (default `plan-approved`) makes the next run
+  implement it. The approval is therefore only as strong as who can add a label
+  to your issues, and the stored plan is not signed — an editable file plus a
+  label is a workflow, not a cryptographic control.
 - **A RESTART discards the branch.** `Workspace.reset()` hard-resets to the base
   and runs `git clean -xdff` in the worktree. That is the intent — a restart
   exists to throw the work away — but it is destructive, and a custom `Workspace`
@@ -108,6 +139,8 @@ Caveats worth knowing:
 - **`require_branch_protection` is reported, not enforced.** `factory doctor`
   reads the flag in your manifest and reminds you; it does not query your
   provider's branch-protection state, and it cannot make your host enforce it.
+  The same is true of `eval_gate_path`: doctor prints the path it must stay
+  unreadable at, and does not verify that it is.
 - **Concurrent observe passes can duplicate.** Only builds take a lock. Two
   overlapping `observe --apply` runs may both search the board before either
   files, so both file. Schedule passes so they cannot overlap, or accept the
