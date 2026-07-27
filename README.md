@@ -243,4 +243,4 @@ session** following the doctrine, which is why the doctrine is the proven artifa
 and the autonomous builder is not. Six adversarial review panels have gone at
 `build/`; see [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for exactly what they found.
 
-Maintainer: BrainMatter Studio.
+Maintainer: BrainMatterStudios.
