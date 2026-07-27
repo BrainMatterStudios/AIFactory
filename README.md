@@ -31,7 +31,7 @@ another, Postgres or Snowflake, Slack or Telegram. Adopting it is configuration
 and adapters, not a rewrite. The core has zero hard dependencies and ships a
 complete offline adapter set, so the whole loop runs in your tests and your CI.
 
-**Status:** 387 tests, CI on Python 3.10–3.13, Apache-2.0. The observe→diagnose→
+**Status:** 387 tests, CI on Python 3.10, 3.12–3.13, Apache-2.0. The observe→diagnose→
 queue→verify loop and the deterministic gate helpers are generalized from a
 factory that has run nightly against a production system — including six weeks
 when that schedule silently stopped and nobody noticed, which is why
