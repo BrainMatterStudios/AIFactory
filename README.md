@@ -22,7 +22,8 @@ pipx install "software-factory[yaml,github] @ git+https://github.com/BrainMatter
 cd ~/my-project && factory init && factory doctor && factory demo
 ```
 
-`factory demo` runs the entire loop offline in a few seconds, no services and no
+`factory demo` runs the observe half of the loop offline in a few seconds —
+verify, harvest, then select the next Ready issue — with no services and no
 config — the fastest way to see whether this is for you.
 
 **It is provider-agnostic by construction.** The engine talks to six small adapter
@@ -33,9 +34,10 @@ complete offline adapter set, so the whole loop runs in your tests and your CI.
 
 **Status:** 387 tests, CI on Python 3.10, 3.12–3.13, Apache-2.0. The observe→diagnose→
 queue→verify loop and the deterministic gate helpers are generalized from a
-factory that has run nightly against a production system — including six weeks
-when that schedule silently stopped and nobody noticed, which is why
-[OPERATING.md](docs/OPERATING.md) is written the way it is. The *autonomous*
+factory that has run against a production system, where the passes are invoked
+on demand rather than on a schedule. If you intend to automate that,
+[OPERATING.md](docs/OPERATING.md) is about the failure modes that introduces.
+The *autonomous*
 build loop (`factory build`) is newer and marked experimental — see
 [KNOWN_ISSUES.md](KNOWN_ISSUES.md), and §Provenance below for exactly which parts
 carry production behind them.
@@ -183,8 +185,17 @@ Observe(🤖) → Diagnose(🤖) → Queue(🤖) → Triage(🧑) → Fix+PR(�
 
 The autonomy ceiling holds **by construction and by check**: the loop exposes no
 merge/deploy capability (the Source adapter has no `merge`), and
-`core.governance.assert_within_ceiling` refuses any action that targets a prod ref. A complex feature (tier **T2**) additionally halts
-after planning for human approval. Nothing the loop can do reaches production.
+`core.governance.assert_within_ceiling` refuses any action that targets a prod
+ref. A complex feature (tier **T2**) additionally halts after planning for human
+approval.
+
+**What that does and does not cover.** No loop code can merge or deploy. The
+*agent process* the loop invokes is a separate program: if your runner supports a
+permission allowlist, pass one — `RunnerAdapter.run_agent` takes a `tools`
+argument and the reference Claude runner forwards it as `--allowedTools`, but the
+build loop does not set one for you. The workspace also shells out to `git`
+directly for branch, commit and push. Unattended operation needs a sandboxed
+runner and least-privilege credentials, which are yours to supply.
 
 ## Extending it
 

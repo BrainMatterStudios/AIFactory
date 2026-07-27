@@ -12,8 +12,7 @@ Honest status, by subsystem. Read this before you rely on anything here.
 worktree, gates on your tests, submits to a judge, and opens a PR — with no human
 present. It is the newest code in this package and the only major subsystem with
 no production provenance: everything else was generalized from a factory that has
-run nightly against a live system (with one six-week gap nobody noticed,
-documented in docs/OPERATING.md), and this was written from scratch.
+run against a live system, and this was written from scratch.
 
 Four independent adversarial review panels have examined it. Every one found
 defects, and every serious defect they found was here rather than in the ported
@@ -59,6 +58,26 @@ and leave running.
   says so, but cannot stop them.
 - **Not concurrency-safe across projects** sharing one state directory for spend
   accounting, beyond the per-project keys.
+- **It does not form a persona team.** The doctrine path assembles a proportional
+  team from `core/personas/`; the autonomous builder runs one implementer and one
+  correctness judge, adding a security lens when the issue looks security-flavoured.
+  It never loads the persona catalog.
+- **Judge feedback is not fed back.** `judge_brief` asks the judge for
+  `required_changes`, but `parse_verdict` returns only the verdict and the
+  security flag, so the revise pass tells the worker to "address the judge's
+  required_changes" without supplying them. Expect revisions to be weaker than
+  the doctrine path's.
+- **`decide_restart` is not wired in.** The helper is tested and used by the
+  doctrine, but the autonomous loop escalates on BLOCK rather than considering a
+  restart.
+- **The contract validator is not invoked** by the builder. Contracts-before-code
+  is a doctrine practice; nothing in `build/` enforces commit order.
+- **Tier signals are thin.** `classify_tier` accepts scope, risk and size signals;
+  `derive_signals` populates only `source` and `touches_security` from labels and
+  issue text. It does not read file counts, cross-cutting scope, production impact
+  or migration risk, so routing is coarser than the doctrine's.
+- **Every T2 halts, not only T2 features.** The doctrine gates T2 *features*; the
+  code gates all T2 classifications. Conservative, but broader than documented.
 
 ---
 
@@ -82,7 +101,7 @@ review round.
 
 `loop/verify.py`, `loop/harvester.py`, `loop/collectors.py`, `loop/ratchet.py`,
 `loop/security.py`, `loop/spend.py` and the adapter layer are generalizations of
-code that has run nightly against a production system. The review panels found
+code that has run against a production system. The review panels found
 defects here in the first round (all fixed, all pinned by tests) and none since.
 
 Caveats worth knowing:
@@ -93,8 +112,12 @@ Caveats worth knowing:
 - **Collectors are yours to write.** Two generic verdict helpers ship; the checks
   that matter for your data are ones only you can write.
 - **`require_branch_protection` is reported, not enforced.** `factory doctor`
-  tells you when your production gate is convention-only. It cannot make your
-  host enforce it.
+  reads the flag in your manifest and reminds you; it does not query your
+  provider's branch-protection state, and it cannot make your host enforce it.
+- **Concurrent observe passes can duplicate.** Only builds take a lock. Two
+  overlapping `observe --apply` runs may both search the board before either
+  files, so both file. Schedule passes so they cannot overlap, or accept the
+  duplicates and let the fingerprint dedup catch them on the following run.
 
 ---
 

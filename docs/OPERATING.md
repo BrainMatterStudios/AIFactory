@@ -18,11 +18,13 @@ also the default output of a dead one, a misconfigured one, and one whose
 credentials expired three weeks ago.
 
 Every recommendation below is a way of making those two silences distinguishable.
-This is not hypothetical: the factory this package came from stopped executing on
-schedule for **six weeks** — the job failed at the OS level, the error went to a
-log nobody watched, and the dead-man's switch meant to catch exactly that was
-never configured, so it skipped silently. Every check was correct. Every verdict
-was right. None of them ran.
+
+The factory this package came from side-steps the problem rather than solving it:
+its observe passes are invoked on demand by a person, not by a scheduler, so a
+missing run is obvious to the person who did not start it. That is a legitimate
+choice at one operator and one repo, and it stops being one the moment you
+automate — which is what the rest of this page is about. Every check being
+correct buys you nothing if none of them run.
 
 ---
 
@@ -52,8 +54,9 @@ Two things about that command:
 
 ### Where it runs matters more than when
 
-The failure above was a macOS launchd job that could not execute its own script
-because of a filesystem permission policy. The class of problem generalises:
+Scheduled jobs fail in ways that leave no trace where you would look for it —
+a desktop OS refusing to launch the script, a cron entry with no environment, a
+runner whose credentials expired. The class of problem generalises:
 
 - **Prefer a server to a laptop.** A laptop sleeps, changes networks, and has an
   OS that may quietly refuse to run your job.
@@ -95,7 +98,7 @@ fi
 exit $status
 ```
 
-Three details, each of which was a real defect somewhere:
+Three details worth getting right:
 
 1. **`:?` on the URL, not `if [ -n ... ]`.** A conditional ping means an unset
    variable silently disables your only outage detector, with no log line. Fail

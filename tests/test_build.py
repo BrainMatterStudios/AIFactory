@@ -162,6 +162,51 @@ def test_t2_feature_halts_for_plan_approval():
     assert out.tier is Tier.T2
     assert out.pr is None
     assert not ws.created  # never entered the build — no code written
+    # The gate exists so a human can approve a plan. Asserting only the status
+    # enum let a version ship that discarded the plan and still said
+    # "plan produced" — approvable by nobody.
+    assert out.plan, "PLAN_PENDING must carry the plan a human is asked to approve"
+
+
+class _FailingPlanner(FakeRunner):
+    """Planner turn fails; everything else behaves."""
+
+    def run_agent(self, prompt, *, model, system=None, tools=None, cwd=None):
+        if system == "planner":
+            self.calls.append("planner")
+            return RunResult(ok=False, output="", model=model, cost_usd=self.cost)
+        return super().run_agent(prompt, model=model, system=system, tools=tools, cwd=cwd)
+
+
+def test_a_failed_planner_does_not_report_a_plan_that_does_not_exist():
+    """It used to return PLAN_PENDING with 'plan produced' regardless of whether
+    the planner succeeded, because r.ok was never read and r.output was
+    discarded. The human it halted for had nothing to approve, and the status
+    said the opposite of the truth."""
+    src, issue = _issue(labels=("type:feature",), title="add a new feature")
+    ws = FakeWorkspace()
+    out = _build(src, issue, _FailingPlanner(), ws)
+    assert out.status is BuildStatus.BLOCKED
+    assert out.status is not BuildStatus.PLAN_PENDING
+    assert not out.plan
+    assert "no plan" in out.reason
+    assert not ws.created  # still no code written
+
+
+def test_an_empty_plan_is_treated_as_no_plan():
+    """A runner that exits 0 with empty output is the same failure wearing a
+    success code."""
+    class _Empty(FakeRunner):
+        def run_agent(self, prompt, *, model, system=None, tools=None, cwd=None):
+            if system == "planner":
+                self.calls.append("planner")
+                return RunResult(ok=True, output="   \n  ", model=model, cost_usd=self.cost)
+            return super().run_agent(prompt, model=model, system=system, tools=tools, cwd=cwd)
+
+    src, issue = _issue(labels=("type:feature",), title="add a new feature")
+    out = _build(src, issue, _Empty(), FakeWorkspace())
+    assert out.status is BuildStatus.BLOCKED
+    assert not out.plan
 
 
 def test_prod_ceiling_refuses_main():
