@@ -31,6 +31,7 @@ from software_factory.build.briefs import (
     implementer_brief,
     judge_brief,
     parse_required_changes,
+    parse_security_block,
     parse_verdict,
     parse_wrong_design,
     planner_brief,
@@ -404,10 +405,20 @@ def _check_contract(workspace, dev_branch: str, issue_id: str,
     from software_factory.core.contracts.schema import validate_contract
 
     rel = f"{contracts_dir.rstrip('/')}/{issue_id}.json"
+    # The contract path is built from the issue number, so a source adapter whose
+    # ids are not numeric (Jira, GitLab-with-prefix) cannot use this gate at all.
+    # Say that, rather than reporting it as unreadable git history — which sends
+    # the operator to look at a repository that is perfectly fine.
+    try:
+        number = int(issue_id)
+    except (TypeError, ValueError):
+        return False, (f"issue id {issue_id!r} is not numeric, so the contract path "
+                       f"{rel} cannot be derived; the contract gate needs a numeric "
+                       "issue id"), None
     try:
         commits = commits_from_git(str(workspace.path), dev_branch)
         ok, why = contract_precedes_implementation(
-            commits, int(issue_id), contracts_dir=contracts_dir)
+            commits, number, contracts_dir=contracts_dir)
     except Exception as e:                       # unreadable history is not a pass
         return False, f"could not read commit order: {e}", None
     if not ok:
@@ -461,6 +472,12 @@ def run_build(
     can never remove one. `judge_tools` is the allowlist handed to the runner for
     judge turns; pass None only if your runner rejects the argument."""
     sig = dict(signals) if signals is not None else derive_signals(issue)
+    # Materialised ONCE. Consumed inside the judge loop, a one-shot iterable
+    # (generator, `iter(...)`, `map`) is drained by the first judge and every
+    # later one is dispatched with an empty list — which is falsy, so the runner
+    # omits the flag entirely and the judge runs unrestricted. The judge that
+    # loses the allowlist is always the second one, i.e. the security lens.
+    _judge_tools = tuple(judge_tools) if judge_tools else ()
     _keep: dict[str, bool] = {}
     _ceiling_kw = {"extra_prod_refs": tuple(prod_refs)} if prod_refs else {}
 
@@ -519,8 +536,21 @@ def run_build(
         plan_file = _plan_path(repo_root, issue.id)
         if plan_approved_label in set(issue.labels):
             stored = None
-            if plan_file is not None and plan_file.exists():
-                stored = plan_file.read_text(encoding="utf-8").strip()
+            if plan_file is not None and plan_file.is_file():
+                try:
+                    stored = plan_file.read_text(encoding="utf-8").strip()
+                except (OSError, UnicodeDecodeError) as e:
+                    # A plan that cannot be read is not a plan. Letting this
+                    # escape turned a mis-permissioned or corrupt file into a
+                    # traceback out of the middle of a build, with the issue
+                    # never labelled and the board never told anything.
+                    source.add_labels(issue.id, ["blocked"])
+                    source.comment(issue.id,
+                                   f"Approved plan at `{plan_file}` could not be read: {e}")
+                    return BuildOutcome(
+                        issue.id, BuildStatus.BLOCKED, tier=tier,
+                        reason=f"approved plan is unreadable: {e}",
+                        cost_usd=spent["total"], unmetered_runs=unmetered["n"])
             if not stored:
                 # Labelled approved with nothing to implement. Building anyway
                 # would mean an unplanned T2 feature carrying an approval it
@@ -541,6 +571,25 @@ def run_build(
             approved_plan = stored
             team = form_team(tier, sig, planned=True)
         else:
+            # A plan is already waiting. Re-planning would overwrite it with a
+            # different plan while the issue still carries the comment describing
+            # the FIRST one — so a human who read that comment and then approved
+            # would be approving text the loop had already replaced. The approval
+            # token (a label) and the artifact (a file) have to stay bound to
+            # each other, so a pending plan is reported, never regenerated.
+            if plan_file is not None and plan_file.is_file():
+                try:
+                    pending = plan_file.read_text(encoding="utf-8").strip()
+                except (OSError, UnicodeDecodeError):
+                    pending = ""
+                if pending:
+                    return BuildOutcome(
+                        issue.id, BuildStatus.PLAN_PENDING, tier=tier,
+                        reason=(f"T2 feature: a plan is already awaiting approval at "
+                                f"`{plan_file}`; not replanning. Add `{plan_approved_label}` "
+                                "to build it, or delete the file to plan again."),
+                        plan=pending,
+                        cost_usd=spent["total"], unmetered_runs=unmetered["n"])
             try:
                 r = runner.run_agent(planner_brief(issue), model=team.planner_model,
                                      system=team.planner or "planner")
@@ -681,10 +730,15 @@ def run_build(
             for name, model in team.judges:
                 lens = "security" if name == _SECURITY_ROLE else "correctness"
                 judged = True
+                # `tools` is omitted entirely rather than passed as None when no
+                # allowlist is configured: the keyword is newer than the
+                # RunnerAdapter protocol, and passing it unconditionally means a
+                # third-party runner written before it dies with a TypeError —
+                # after the worker turn has already been spawned and charged.
+                extra = {"tools": _judge_tools} if _judge_tools else {}
                 jr = runner.run_agent(
                     judge_brief(issue, lens=lens, contract=contract_text), model=model,
-                    system=name, cwd=workspace.path,
-                    tools=tuple(judge_tools) if judge_tools else None)
+                    system=name, cwd=workspace.path, **extra)
                 _charge(jr)
                 if not jr.ok:
                     # The judge turn itself failed — a missing binary, a timeout,
@@ -705,8 +759,11 @@ def run_build(
                 try:
                     v, sb = parse_verdict(jr.output)
                 except ValueError:
-                    # An unparseable judge reply must never be read as PASS.
-                    v, sb = Verdict.REVISE, False
+                    # An unparseable judge reply must never be read as PASS. The
+                    # security flag is read SEPARATELY here rather than defaulted
+                    # to False: a formatting quirk on the verdict line is not a
+                    # reason to discard a veto stated plainly two lines below.
+                    v, sb = Verdict.REVISE, parse_security_block(jr.output)
                 verdicts.append(v)
                 sec = sec or sb
                 block_vote = block_vote or v is Verdict.BLOCK

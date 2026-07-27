@@ -14,7 +14,7 @@ present. It is the newest code in this package and the only major subsystem with
 no production provenance: everything else was generalized from a factory that has
 run against a live system, and this was written from scratch.
 
-Five independent adversarial review panels have examined it. Every one found
+Six independent adversarial review panels have examined it. Every one found
 defects, and every serious defect they found was here rather than in the ported
 subsystems. All of the following were reproduced, and are fixed — the list exists
 so you can judge the code's maturity, not because these are open:
@@ -26,13 +26,14 @@ so you can judge the code's maturity, not because these are open:
 | 3 | The gate scanned the working tree while `push` sends the commit range, so a secret committed and then scrubbed shipped through a clean gate. Its history-scanning helper was inverted: unreachable for the case it was written for, and firing only on the legitimate *removal* of a credential. Separately, on a fresh clone the default config caused agent commits to land on the shared dev branch. |
 | 4 | Git C-quotes non-ASCII filenames, so a token in `café_config.py` was skipped as "deleted" and pushed. Per-commit enumeration missed merge commits and typechanges entirely. |
 | 5 | **Three ways to pass the judge gate without a judge passing the work.** A failed judge run was never checked for success, so a crash log containing the word PASS shipped an unreviewed branch. The verdict parser took the first match, so a reply that quoted the response template (`verdict: PASS\|REVISE\|BLOCK`) parsed as PASS — as did a reply that said PASS and then revised itself to BLOCK. And the judge held a writable worktree while the test gate had already run, so anything it wrote afterwards shipped untested. Separately: `require_contract` and `contracts_dir` were declared in config and never parsed, so a gate an operator switched on silently did not exist; the T2 plan halt had no continuation path, so an approval could only be expressed by re-tiering the issue *around* the gate; and `decide_restart` read a hardwired revise cap while `combine` read the operator's, which deleted the restart path for anyone who lowered it. |
+| 6 | A panel run against the round-5 fixes found four more ways the same class of bug survives. The **security veto was still first-match** while the verdict had been hardened to most-severe, so a judge that wrote `security_block: false` in a checklist and `true` after finding the bug had its veto — the one channel `combine` treats as absolute — silently dropped. A judge that **filled in the response template** and then refused in prose still parsed as PASS, leaving its own contradicting `required_changes` behind. The judge's tool allowlist was materialised **inside** the dispatch loop, so a one-shot iterable was drained by the first judge and the second (always the security lens) ran unrestricted. And the T2 plan file was **overwritten by any later unapproved run**, so a human could approve the plan they read and get a different one built. Separately, the ceiling's `crosses_prod_boundary` returned False for any action name it did not recognise — an allowlist defaulting to permitted. |
 
 The pattern across the first four: **fixes that were correct alone and destroyed
 each other in composition**, invisible to a test suite that exercised one at a
 time. `tests/test_interactions.py` exists because of that, and runs multi-step
 sequences against real git and real remotes.
 
-The pattern in round five is different and worth naming separately: every one of
+The pattern in rounds five and six is different and worth naming separately: every one of
 those defects read an **absence of evidence as a pass**. A run that failed, a
 reply that was ambiguous, a window between two checks. The gates were all present
 and all of them failed open. `tests/test_judge_gate_integrity.py` pins each one,
@@ -81,6 +82,12 @@ and leave running.
   autonomous loop, so it cannot require the evidence of one, and a contract that
   lands in the same commit as its implementation satisfies "at or before". The
   doctrine's version of this gate is stronger than the autonomous one.
+- **The issue body reaches the judge's prompt.** Anyone who can file an issue can
+  put text in it, and the judge brief includes the issue and (when enabled) the
+  contract. Field syntax in that text is neutralised before it is pasted in
+  (`briefs.quote_untrusted`), so a judge quoting it back cannot be read as a
+  verdict — but neutralising a known field syntax is not the same as making
+  untrusted text safe to put in a prompt. Treat board write access as trusted.
 - **The judge's read-only allowlist is advisory.** Judges are dispatched with a
   read-only `tools` list, which the reference Claude runner forwards as
   `--allowedTools`; a runner that ignores the argument enforces nothing. What

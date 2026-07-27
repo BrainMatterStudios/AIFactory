@@ -261,7 +261,7 @@ A narrower version of the same loop, with no human. It creates a worktree, runs
 the agent, gates on `verify_cmd`, judges read-only, re-runs `verify_cmd` against
 the tree it is about to push, scans the produced diff for secrets, and opens a PR.
 
-Read [KNOWN_ISSUES.md](../KNOWN_ISSUES.md) before you use it. Five adversarial
+Read [KNOWN_ISSUES.md](../KNOWN_ISSUES.md) before you use it. Six adversarial
 review panels have examined this subsystem and each found real defects; they are
 fixed and pinned by tests, but it has never run unattended against a real
 repository for a sustained period. It is the only part of this package with no
