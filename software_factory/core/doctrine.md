@@ -109,9 +109,10 @@ the configured dev/integration branch via PR once CI is green.
 The reason to draw the line here rather than at every diff: reviewing everything
 does not scale, and at volume it quietly becomes rubber-stamping — which is worse
 than no review, because it looks like review. Reviewing every *release* scales
-indefinitely. In the factory this doctrine came from, humans looked at 12% of
-merges and looked at them properly; the other 88% landed on a branch where being
-wrong costs nothing and a red check never merges.
+indefinitely. In the factory this doctrine came from, a person merged 12%
+of merges — each one a deliberate release, with the full diff in view — and 3% of
+the integration traffic. The remaining 85% landed with no human involved at all,
+on a branch where being wrong costs nothing and a red check never merges.
 
 **If you find yourself needing to review every diff, the gates are too weak. Fix
 the gates — do not add reviewers.** A reviewer is a person you are asking to
