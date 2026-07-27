@@ -13,9 +13,12 @@ The doctrine is one rule and the gates that make it hold:
 That is not a philosophy statement. It is enforced here by an installable Python
 package you point at your project: it watches your codebase, diagnoses what is
 wrong, queues it, builds fixes with a team of agent personas under an independent
-judge, and opens pull requests — while exposing no capability that reaches
-production. `core/governance.assert_within_ceiling` refuses a prod ref; the
-`SourceAdapter` protocol has no `merge` method to call.
+judge, and opens pull requests — and stops there. **No loop code can merge or
+deploy:** `core/governance.assert_within_ceiling` refuses a prod ref, and the
+`SourceAdapter` protocol has no `merge` method to call. The agent the loop spawns
+is a separate process with its own shell; the reference runner refuses the
+release verbs on every turn, which narrows that surface without sealing it — see
+[the ceiling](#the-loop-and-the-ceiling) for exactly what each layer covers.
 
 ```bash
 pipx install "software-factory[yaml,github] @ git+https://github.com/BrainMatterStudios/AIFactory@main"
@@ -32,7 +35,7 @@ another, Postgres or Snowflake, Slack or Telegram. Adopting it is configuration
 and adapters, not a rewrite. The core has zero hard dependencies and ships a
 complete offline adapter set, so the whole loop runs in your tests and your CI.
 
-**Status:** 387 tests, CI on Python 3.10, 3.12–3.13, Apache-2.0. The observe→diagnose→
+**Status:** 439 tests, CI on Python 3.10, 3.12–3.13, Apache-2.0. The observe→diagnose→
 queue→verify loop and the deterministic gate helpers are generalized from a
 factory that has run against a production system, where the passes are invoked
 on demand rather than on a schedule. If you intend to automate that,
@@ -52,7 +55,7 @@ carry production behind them.
 | [Writing a plugin](docs/WRITING_A_PLUGIN.md) | New providers and custom adapters, without forking. |
 | [The doctrine](software_factory/core/doctrine.md) | The orchestration procedure itself — the artifact with production behind it. |
 | [Conventions](software_factory/core/conventions.md) | The portable rules the loop is built on. |
-| [Known issues](KNOWN_ISSUES.md) | Honest status by subsystem, including what four review panels found. |
+| [Known issues](KNOWN_ISSUES.md) | Honest status by subsystem, including what six review panels found. |
 
 ---
 
@@ -95,7 +98,8 @@ software_factory/            ← the product (installable Python package)
                                least-privilege
     spend.py                 ← where the factory's own token budget goes, and
                                how much of it is re-routable
-  cli.py                     ← `factory doctor | personas | demo | observe | pickup`
+  cli.py                     ← `factory init | doctor | personas | demo | observe |
+                               pickup | build | schedule | version`
 
 scripts/ci-local.sh          ← every CI job, locally, with CI's pinned toolchain
 factory.config.example.yaml  ← copy to factory.config.yaml and fill in
@@ -160,16 +164,19 @@ directory, so run it from anywhere inside your project. Real (non-offline) use n
 `gh` authenticated and your providers' secrets in env vars named by the manifest.
 
 `factory build` classifies the tier, runs a worker in an isolated git worktree, gates
-on your `verify_cmd`, runs the judge (revise ≤ 2), and opens a PR into your dev branch —
-charging the budget and refusing any prod base. It never merges; a T2 feature halts for
-plan-approval before any code.
+on your `verify_cmd`, runs the judge (revise ≤ 2) read-only, re-runs your gate against
+the tree it is about to push, and opens a PR into your dev branch — charging the budget
+and refusing any prod base. It never merges. A T2 feature halts after planning: the plan
+is written to `.factory/plans/` and posted on the issue, and adding the
+`plan-approved` label makes the next run implement *that* plan rather than produce
+another one.
 
 ## Develop the factory itself (contributors)
 
 ```bash
 git clone https://github.com/BrainMatterStudios/AIFactory && cd AIFactory
 pip install -e ".[dev]"          # core has zero hard deps; this adds pytest + ruff + yaml
-python -m pytest -q              # 387 passing — deterministic core + full offline loop
+python -m pytest -q              # 439 passing — deterministic core + full offline loop
 ./scripts/ci-local.sh            # every CI job, with CI's pinned toolchain
 ```
 
@@ -189,13 +196,19 @@ merge/deploy capability (the Source adapter has no `merge`), and
 ref. A complex feature (tier **T2**) additionally halts after planning for human
 approval.
 
-**What that does and does not cover.** No loop code can merge or deploy. The
-*agent process* the loop invokes is a separate program: if your runner supports a
-permission allowlist, pass one — `RunnerAdapter.run_agent` takes a `tools`
-argument and the reference Claude runner forwards it as `--allowedTools`, but the
-build loop does not set one for you. The workspace also shells out to `git`
-directly for branch, commit and push. Unattended operation needs a sandboxed
-runner and least-privilege credentials, which are yours to supply.
+**What that does and does not cover**, layer by layer, because the difference is
+where people get hurt:
+
+| Layer | Covers | Does not cover |
+|---|---|---|
+| Loop code | Cannot merge, deploy, or target a prod ref. Structural — there is no method to call. | Says nothing about the agent process, and the workspace shells out to `git` directly for branch, commit and push. |
+| Runner deny list | The reference Claude runner refuses `git push`, `git merge`, `git tag`, `gh pr merge`, `gh release`, `gh workflow run` on **every** turn. | Pattern matching, not a sandbox: a script or an unmatched invocation reaches the same effect. |
+| Judge allowlist | Judges are dispatched read-only (`--allowedTools`). | Advisory — a runner may ignore the argument. |
+| Re-verify | The suite is re-run after judging, so a tree modified after the gate went green cannot ship. | Catches the mutation; does not prevent it. |
+
+Unattended operation still needs a sandboxed runner and least-privilege
+credentials, which are yours to supply. What changed is that ignoring that advice
+now costs you a layer rather than all of them.
 
 ## Extending it
 
@@ -216,8 +229,8 @@ without forking it. Full recipe (a Dokploy connector, end to end): **[docs/WRITI
 Being precise about this, because "generalized from a production system" is easy
 to over-claim and the distinction changes how much you should trust each part.
 
-**Generalized from a production factory** (ElBasket `TheScraperEngine`, which has
-run this loop nightly against a live system):
+**Generalized from a production factory** (ElBasket `TheScraperEngine`, which runs
+this loop against a live system, invoked on demand rather than on a schedule):
 the observe→diagnose→queue→verify loop, the harvester and its dedup, the
 collectors and ratchets, the orchestration doctrine, the persona catalog and tier
 policy, the deterministic gate helpers (`classify_tier`, `combine`,
@@ -227,7 +240,7 @@ policy, the deterministic gate helpers (`classify_tier`, `combine`,
 (`software_factory/build/`) — the autonomous, unattended L3 loop. The system this
 package came from does not have one. It builds with a **human-supervised agent
 session** following the doctrine, which is why the doctrine is the proven artifact
-and the autonomous builder is not. Four adversarial review panels have gone at
+and the autonomous builder is not. Six adversarial review panels have gone at
 `build/`; see [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for exactly what they found.
 
-Maintainer: BrainMatter Studio.
+Maintainer: BrainMatterStudios.

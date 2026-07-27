@@ -3,7 +3,9 @@
 
 The doctrine's tier→model policy is applied by the orchestrator; this adapter
 just runs one agent turn at the requested model. When the caller passes a tool
-list, it is forwarded via --allowedTools.
+list it is forwarded as `--allowedTools`; on top of that, every turn carries a
+default deny list for the release verbs, so the ceiling reaches the agent process
+and not only the loop that spawned it.
 """
 from __future__ import annotations
 
@@ -22,6 +24,25 @@ DEFAULT_MODELS = {
     "haiku": "claude-haiku-4-5-20251001",
 }
 
+#: Refused on every turn, worker and judge alike. The loop's own ceiling stops
+#: *loop* code from merging or deploying; it says nothing about the agent, which
+#: is a separate process with its own shell. These are the verbs that cross the
+#: production boundary. The loop pushes its branch itself, via the workspace, so
+#: denying the agent them costs the build nothing.
+#:
+#: This narrows the blast radius; it does not seal it. A determined agent can
+#: reach the same effect through a script or an unmatched invocation, and pattern
+#: matching is not a sandbox. Unattended operation still wants a sandboxed runner
+#: and least-privilege credentials — this is the floor, not the ceiling.
+DEFAULT_DENIED_TOOLS: tuple[str, ...] = (
+    "Bash(git push:*)",
+    "Bash(git merge:*)",
+    "Bash(git tag:*)",
+    "Bash(gh pr merge:*)",
+    "Bash(gh release:*)",
+    "Bash(gh workflow run:*)",
+)
+
 
 class ClaudeCodeRunner:
     def __init__(
@@ -31,10 +52,16 @@ class ClaudeCodeRunner:
         claude_bin: str = "claude",
         extra_args: Sequence[str] = (),
         timeout_s: float = 1800.0,
+        denied_tools: Sequence[str] | None = None,
     ) -> None:
         self.models = {**DEFAULT_MODELS, **(models or {})}
         self.claude_bin = claude_bin
         self.extra_args = list(extra_args)
+        # `None` means "use the defaults"; an explicit empty sequence means the
+        # operator turned the deny list off and owns the consequence. Those are
+        # different intentions and a truthiness check would merge them.
+        self.denied_tools = list(DEFAULT_DENIED_TOOLS if denied_tools is None
+                                 else denied_tools)
         # No subprocess in this package should be able to hang a nightly loop
         # forever. Generous by default; an agent turn is legitimately slow.
         self.timeout_s = timeout_s
@@ -57,6 +84,8 @@ class ClaudeCodeRunner:
             args += ["--append-system-prompt", system]
         if tools:
             args += ["--allowedTools", ",".join(tools)]
+        if self.denied_tools:
+            args += ["--disallowedTools", ",".join(self.denied_tools)]
 
         try:
             proc = subprocess.run(args, capture_output=True, text=True, cwd=cwd,
@@ -118,4 +147,5 @@ def _build_claude_runner(config: Mapping[str, Any]) -> ClaudeCodeRunner:
         claude_bin=config.get("claude_bin", "claude"),
         extra_args=config.get("extra_args", ()),
         timeout_s=float(config.get("timeout_s", 1800.0)),
+        denied_tools=config.get("denied_tools"),
     )

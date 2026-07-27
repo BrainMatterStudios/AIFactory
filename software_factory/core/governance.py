@@ -283,8 +283,10 @@ def crosses_prod_boundary(*, pr_base: str, action: str = "open_pr",
     documented as additive must be additive by construction, because the one
     thing nobody will test is whether configuring the ceiling removed it.
 
-    Unknown actions are denied. A typo in a call site or a newly introduced
-    action name should block rather than silently pass the ceiling check.
+    Unknown actions are DENIED. A typo at a call site or a newly introduced
+    action name must block rather than silently pass the ceiling check — an
+    allowlist that defaults to "permitted" is not a ceiling, and this is the one
+    function in the package where that distinction is the entire product.
     """
     if action in ("merge", "deploy", "publish", "prod_write"):
         return True

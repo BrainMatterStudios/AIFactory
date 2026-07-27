@@ -88,6 +88,9 @@ class BuildConfig:
     #: build for a missing file nobody agreed to write.
     require_contract: bool = False
     contracts_dir: str = "contracts"
+    #: The label a human adds to a T2 feature issue to approve its stored plan.
+    #: The build then implements that plan instead of producing another one.
+    plan_approved_label: str = "plan-approved"
 
 
 @dataclass(frozen=True)
@@ -171,6 +174,14 @@ class FactoryConfig:
             verify_cmd=bd.get("verify_cmd", "pytest -q"),
             workspace_root=bd.get("workspace_root", ".factory-worktrees"),
             max_revise=int(bd.get("max_revise", 2)),
+            # These three were declared on BuildConfig and never read out of the
+            # manifest, so `require_contract: true` was accepted, ignored, and
+            # reported nowhere — the gate the operator asked for silently did not
+            # exist. Every field on BuildConfig is parsed here; the test suite
+            # asserts that, so the next field added cannot repeat it.
+            require_contract=bool(bd.get("require_contract", False)),
+            contracts_dir=bd.get("contracts_dir", "contracts"),
+            plan_approved_label=bd.get("plan_approved_label", "plan-approved"),
         )
 
         plugins = tuple(f.get("plugins") or ())

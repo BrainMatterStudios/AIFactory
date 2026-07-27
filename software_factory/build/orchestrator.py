@@ -31,6 +31,7 @@ from software_factory.build.briefs import (
     implementer_brief,
     judge_brief,
     parse_required_changes,
+    parse_security_block,
     parse_verdict,
     parse_wrong_design,
     planner_brief,
@@ -144,6 +145,17 @@ def derive_signals(issue: Issue) -> dict[str, Any]:
 
 _WORKER_MODEL = {Tier.T0: "haiku", Tier.T1: "sonnet"}
 
+#: What a judge is permitted to do. A judge reads the work and reports on it; it
+#: never writes. Runners that accept an allowlist enforce this at the process
+#: boundary (the reference Claude runner forwards it as `--allowedTools`).
+#: Runners that ignore the argument do not enforce anything, which is why the
+#: loop ALSO re-runs the verify gate after judging: neither control is trusted on
+#: its own, and the one that catches a mutation is the test run, not the prompt.
+JUDGE_TOOLS: tuple[str, ...] = (
+    "Read", "Grep", "Glob", "LS", "NotebookRead",
+    "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(git status:*)",
+)
+
 #: Roles the loop asks the catalog for, by job. Names must exist in
 #: `core/personas/catalog.yaml`; `form_team` fails loudly if one does not,
 #: because silently dropping the security reviewer is the failure that matters.
@@ -175,13 +187,18 @@ class Team:
         return ", ".join(parts)
 
 
-def form_team(tier: Tier, signals: Mapping[str, Any], *, personas=None) -> Team:
+def form_team(tier: Tier, signals: Mapping[str, Any], *, personas=None,
+              planned: bool = False) -> Team:
     """Assemble a proportional team from the persona catalog.
 
     Proportional means: T0 is gated by the tests alone and gets no judge; T1 gets
     an independent judge; a security-flavoured issue adds the security reviewer
     as a *separate* lens, because a veto that can be outvoted is not a veto; a T2
-    feature gets a planner and stops there.
+    gets both lenses as a panel regardless of the issue's wording, because the
+    thing that makes it T2 is the blast radius.
+
+    `planned=True` says a human has already approved a plan for this issue, so
+    the T2 planning halt has been satisfied and the team to form is a build team.
 
     Each persona runs at the model the catalog declares. A `tier_lock: floor`
     persona is never cheapened — the whole point of the floor is that judging and
@@ -203,7 +220,7 @@ def form_team(tier: Tier, signals: Mapping[str, Any], *, personas=None) -> Team:
             model = allow_cheaper
         return (p.name, model)
 
-    if tier is Tier.T2 and signals.get("source") == "feature":
+    if tier is Tier.T2 and signals.get("source") == "feature" and not planned:
         planner, planner_model = pick(_PLANNER_ROLES[0])
         return Team(worker="", worker_model="", planner=planner, planner_model=planner_model)
 
@@ -211,7 +228,7 @@ def form_team(tier: Tier, signals: Mapping[str, Any], *, personas=None) -> Team:
     judges: list[tuple[str, str]] = []
     if tier is not Tier.T0:
         judges.append(pick(_JUDGE_ROLE))
-        if signals.get("touches_security"):
+        if tier is Tier.T2 or signals.get("touches_security"):
             judges.append(pick(_SECURITY_ROLE))
     return Team(worker=worker, worker_model=worker_model, judges=tuple(judges))
 
@@ -356,6 +373,80 @@ def _scan_for_secrets(workspace) -> tuple[list[str], int, str | None]:
     return hits, len(blobs), None
 
 
+def _check_contract(workspace, dev_branch: str, issue_id: str,
+                    contracts_dir: str) -> tuple[bool, str, str | None]:
+    """Contracts-before-code. Returns (ok, reason, contract_text).
+
+    Three things are checked, and all of them fail closed:
+      * **order** — the commit writing `<contracts_dir>/<issue>.json` lands at or
+        before the first implementation commit, so the criteria were pinned
+        before there was code to write them around;
+      * **shape** — the file is a valid contract document, not an empty stub. A
+        gate that only checks a filename is satisfied by `{}`;
+      * **inertness** — no criterion carries an instruction aimed at the judge.
+        The text is about to be pasted into the judge's brief, so a contract is
+        an injection surface unless it is checked. `validate_contract` runs this
+        check; it is called out here because it is the reason the shape check is
+        not optional once the contract is forwarded.
+
+    Negotiation evidence is NOT required here. The doctrine's contract is
+    negotiated between implementer and judge before the build; the autonomous
+    loop has no negotiation round, so demanding `negotiation_rounds >= 1` would
+    fail every build it could ever produce. Shape and order are what this gate
+    can honestly enforce.
+    """
+    import json
+    from pathlib import Path
+
+    from software_factory.core.contracts.git_check import (
+        commits_from_git,
+        contract_precedes_implementation,
+    )
+    from software_factory.core.contracts.schema import validate_contract
+
+    rel = f"{contracts_dir.rstrip('/')}/{issue_id}.json"
+    # The contract path is built from the issue number, so a source adapter whose
+    # ids are not numeric (Jira, GitLab-with-prefix) cannot use this gate at all.
+    # Say that, rather than reporting it as unreadable git history — which sends
+    # the operator to look at a repository that is perfectly fine.
+    try:
+        number = int(issue_id)
+    except (TypeError, ValueError):
+        return False, (f"issue id {issue_id!r} is not numeric, so the contract path "
+                       f"{rel} cannot be derived; the contract gate needs a numeric "
+                       "issue id"), None
+    try:
+        commits = commits_from_git(str(workspace.path), dev_branch)
+        ok, why = contract_precedes_implementation(
+            commits, number, contracts_dir=contracts_dir)
+    except Exception as e:                       # unreadable history is not a pass
+        return False, f"could not read commit order: {e}", None
+    if not ok:
+        return False, why, None
+
+    path = Path(workspace.path, rel)
+    try:
+        raw = path.read_text(encoding="utf-8")
+        doc = json.loads(raw)
+    except Exception as e:
+        return False, f"{rel} is committed but unreadable as a contract: {e}", None
+    errors = validate_contract(doc, require_negotiation_evidence=False)
+    if errors:
+        return False, f"{rel} is not a valid contract: {'; '.join(errors[:4])}", None
+    return True, why, raw
+
+
+def _plan_path(repo_root: str | None, issue_id: str):
+    """Where an approved T2 plan lives. Outside the worktree deliberately: the
+    worktree is created and destroyed per build, and a plan that vanishes with it
+    cannot be approved and re-used on the next run."""
+    from pathlib import Path
+
+    if not repo_root:
+        return None
+    return Path(repo_root, ".factory", "plans", f"issue-{issue_id}.md")
+
+
 def run_build(
     issue: Issue,
     *,
@@ -371,12 +462,22 @@ def run_build(
     prod_refs: Iterable[str] | None = None,
     require_contract: bool = False,
     contracts_dir: str = "contracts",
+    plan_approved_label: str = "plan-approved",
+    judge_tools: Iterable[str] | None = JUDGE_TOOLS,
 ) -> BuildOutcome:
     """`repo_root` anchors the halt-file check; without it the durable kill switch
     is relative to the process cwd and a cron run that does not cd into the repo
-    cannot be stopped. `prod_refs` ADDS to the built-in prod branch names the
-    ceiling refuses — it can never remove one."""
+    cannot be stopped. It also anchors where an approved T2 plan is stored.
+    `prod_refs` ADDS to the built-in prod branch names the ceiling refuses — it
+    can never remove one. `judge_tools` is the allowlist handed to the runner for
+    judge turns; pass None only if your runner rejects the argument."""
     sig = dict(signals) if signals is not None else derive_signals(issue)
+    # Materialised ONCE. Consumed inside the judge loop, a one-shot iterable
+    # (generator, `iter(...)`, `map`) is drained by the first judge and every
+    # later one is dispatched with an empty list — which is falsy, so the runner
+    # omits the flag entirely and the judge runs unrestricted. The judge that
+    # loses the allowlist is always the second one, i.e. the security lens.
+    _judge_tools = tuple(judge_tools) if judge_tools else ()
     _keep: dict[str, bool] = {}
     _ceiling_kw = {"extra_prod_refs": tuple(prod_refs)} if prod_refs else {}
 
@@ -425,39 +526,124 @@ def run_build(
     # The doctrine gates T2 features specifically; this used to halt every T2,
     # so a large bug or chore stalled for an approval the doctrine never asked
     # for. Anything T2 and not a feature builds under the same judge as T1.
+    approved_plan: str | None = None
     if tier is Tier.T2 and sig.get("source") == "feature":
-        try:
-            r = runner.run_agent(planner_brief(issue), model=team.planner_model,
-                                 system=team.planner or "planner")
-            _charge(r)
-        except BudgetExceeded as e:
-            return BuildOutcome(issue.id, BuildStatus.HALTED, tier=tier,
-                                reason=f"budget: {e}", cost_usd=spent["total"],
-                                unmetered_runs=unmetered["n"])
-        # A failed planner used to return PLAN_PENDING saying "plan produced",
-        # which is both false and unapprovable: the gate halts for a human who
-        # then has nothing to read. Fail closed instead.
-        plan = (r.output or "").strip()
-        if not r.ok or not plan:
+        # An approval has to be able to *continue* the build, or the gate is a
+        # dead end: the plan was printed to a terminal, the human agreed with it,
+        # and the only way forward was to re-tier the issue — which does not
+        # approve anything, it just routes around the gate. The approval is the
+        # label; the artifact it approves is the stored plan.
+        plan_file = _plan_path(repo_root, issue.id)
+        if plan_approved_label in set(issue.labels):
+            stored = None
+            if plan_file is not None and plan_file.is_file():
+                try:
+                    stored = plan_file.read_text(encoding="utf-8").strip()
+                except (OSError, UnicodeDecodeError) as e:
+                    # A plan that cannot be read is not a plan. Letting this
+                    # escape turned a mis-permissioned or corrupt file into a
+                    # traceback out of the middle of a build, with the issue
+                    # never labelled and the board never told anything.
+                    source.add_labels(issue.id, ["blocked"])
+                    source.comment(issue.id,
+                                   f"Approved plan at `{plan_file}` could not be read: {e}")
+                    return BuildOutcome(
+                        issue.id, BuildStatus.BLOCKED, tier=tier,
+                        reason=f"approved plan is unreadable: {e}",
+                        cost_usd=spent["total"], unmetered_runs=unmetered["n"])
+            if not stored:
+                # Labelled approved with nothing to implement. Building anyway
+                # would mean an unplanned T2 feature carrying an approval it
+                # never received.
+                source.add_labels(issue.id, ["blocked"])
+                source.comment(
+                    issue.id,
+                    f"Issue is labelled {plan_approved_label!r} but no approved plan is "
+                    f"stored at {plan_file or '(no repo root configured)'}. Remove the "
+                    "label and re-run to produce a plan to approve.")
+                return BuildOutcome(
+                    issue.id, BuildStatus.BLOCKED, tier=tier,
+                    reason=f"{plan_approved_label!r} set but no stored plan to implement",
+                    cost_usd=spent["total"], unmetered_runs=unmetered["n"])
+            # Fall through and build it — with a build team, not the planner-only
+            # team formed above. The planning halt this issue is standing at has
+            # already been satisfied by a human.
+            approved_plan = stored
+            team = form_team(tier, sig, planned=True)
+        else:
+            # A plan is already waiting. Re-planning would overwrite it with a
+            # different plan while the issue still carries the comment describing
+            # the FIRST one — so a human who read that comment and then approved
+            # would be approving text the loop had already replaced. The approval
+            # token (a label) and the artifact (a file) have to stay bound to
+            # each other, so a pending plan is reported, never regenerated.
+            if plan_file is not None and plan_file.is_file():
+                try:
+                    pending = plan_file.read_text(encoding="utf-8").strip()
+                except (OSError, UnicodeDecodeError):
+                    pending = ""
+                if pending:
+                    return BuildOutcome(
+                        issue.id, BuildStatus.PLAN_PENDING, tier=tier,
+                        reason=(f"T2 feature: a plan is already awaiting approval at "
+                                f"`{plan_file}`; not replanning. Add `{plan_approved_label}` "
+                                "to build it, or delete the file to plan again."),
+                        plan=pending,
+                        cost_usd=spent["total"], unmetered_runs=unmetered["n"])
+            try:
+                r = runner.run_agent(planner_brief(issue), model=team.planner_model,
+                                     system=team.planner or "planner")
+                _charge(r)
+            except BudgetExceeded as e:
+                return BuildOutcome(issue.id, BuildStatus.HALTED, tier=tier,
+                                    reason=f"budget: {e}", cost_usd=spent["total"],
+                                    unmetered_runs=unmetered["n"])
+            # A failed planner used to return PLAN_PENDING saying "plan produced",
+            # which is both false and unapprovable: the gate halts for a human who
+            # then has nothing to read. Fail closed instead.
+            plan = (r.output or "").strip()
+            if not r.ok or not plan:
+                return BuildOutcome(
+                    issue.id, BuildStatus.BLOCKED, tier=tier,
+                    reason=("T2 feature: the planner failed, so there is no plan to approve"
+                            + (f" ({r.error})" if getattr(r, "error", None) else "")),
+                    cost_usd=spent["total"], unmetered_runs=unmetered["n"],
+                )
+            stored_at = ""
+            if plan_file is not None:
+                try:
+                    plan_file.parent.mkdir(parents=True, exist_ok=True)
+                    plan_file.write_text(plan, encoding="utf-8")
+                    stored_at = f" Stored at `{plan_file}`."
+                except OSError as e:
+                    stored_at = f" (could not store the plan on disk: {e})"
+            # The plan also goes on the board, where the person who has to
+            # approve it is actually looking.
+            try:
+                source.comment(
+                    issue.id,
+                    f"**T2 plan awaiting approval.** No code was written.\n\n{plan}\n\n"
+                    f"---\nApprove by adding the `{plan_approved_label}` label and "
+                    "re-running the build; reject by closing the issue.")
+                source.add_labels(issue.id, ["plan-pending"])
+            except Exception:
+                pass          # the plan is still on disk and in the outcome
             return BuildOutcome(
-                issue.id, BuildStatus.BLOCKED, tier=tier,
-                reason=("T2 feature: the planner failed, so there is no plan to approve"
-                        + (f" ({r.error})" if getattr(r, "error", None) else "")),
-                cost_usd=spent["total"], unmetered_runs=unmetered["n"],
+                issue.id, BuildStatus.PLAN_PENDING, tier=tier,
+                reason=(f"T2 feature: plan produced; awaiting human approval "
+                        f"(label `{plan_approved_label}`) before build.{stored_at}"),
+                plan=plan,
+                cost_usd=spent['total'], unmetered_runs=unmetered['n'],
             )
-        return BuildOutcome(
-            issue.id, BuildStatus.PLAN_PENDING, tier=tier,
-            reason="T2 feature: plan produced; awaiting human approval before build.",
-            plan=plan,
-            cost_usd=spent['total'], unmetered_runs=unmetered['n'],
-        )
 
     # T0/T1 → build in an isolated workspace.
     revise = 0
     restarts = 0
     required: str | None = None
+    learnings: str | None = None
     history: list[str] = []
     created = False
+    judged = False
     try:
         # Inside the try: create() legitimately refuses (a wedged branch, a
         # worktree on the wrong branch, a base it cannot resolve) and those must
@@ -480,7 +666,8 @@ def run_build(
 
             # worker pass
             r = runner.run_agent(
-                implementer_brief(issue, required_changes=required),
+                implementer_brief(issue, required_changes=required,
+                                  approved_plan=approved_plan, learnings=learnings),
                 model=team.worker_model,
                 system=team.worker,
                 cwd=workspace.path,
@@ -507,7 +694,28 @@ def run_build(
                                     cost_usd=spent['total'], unmetered_runs=unmetered['n'],
                             judge_history=history)
 
-            # T0 self-judges via the tests alone; T1 runs the judge.
+            # Contracts-before-code, when the project asks for it. Checked HERE —
+            # after the work exists but before the judge scores it — rather than
+            # at ship time, for two reasons: the judge has to grade against the
+            # contract (that is what a contract is for), and a branch that never
+            # wrote one should not spend judge turns before it is told so.
+            contract_text: str | None = None
+            if require_contract:
+                ok_contract, why, contract_text = _check_contract(
+                    workspace, dev_branch, issue.id, contracts_dir)
+                if not ok_contract:
+                    source.add_labels(issue.id, ["blocked"])
+                    source.comment(issue.id, f"Contract gate: {why}")
+                    return BuildOutcome(issue.id, BuildStatus.BLOCKED, tier=tier,
+                                        reason=f"contract gate: {why}", revisions=revise,
+                                        cost_usd=spent['total'],
+                                        unmetered_runs=unmetered['n'],
+                                        judge_history=history)
+
+            # T0 is gated by the test suite alone; T1 and up run the judge. The
+            # doctrine's T0 also carries a self-review against the rubric — the
+            # autonomous loop does not run one, because a worker scoring its own
+            # work is not a gate and the tests are.
             if tier is Tier.T0:
                 break
 
@@ -521,14 +729,41 @@ def run_build(
             asks: list[str] = []
             for name, model in team.judges:
                 lens = "security" if name == _SECURITY_ROLE else "correctness"
-                jr = runner.run_agent(judge_brief(issue, lens=lens), model=model,
-                                      system=name, cwd=workspace.path)
+                judged = True
+                # `tools` is omitted entirely rather than passed as None when no
+                # allowlist is configured: the keyword is newer than the
+                # RunnerAdapter protocol, and passing it unconditionally means a
+                # third-party runner written before it dies with a TypeError —
+                # after the worker turn has already been spawned and charged.
+                extra = {"tools": _judge_tools} if _judge_tools else {}
+                jr = runner.run_agent(
+                    judge_brief(issue, lens=lens, contract=contract_text), model=model,
+                    system=name, cwd=workspace.path, **extra)
                 _charge(jr)
+                if not jr.ok:
+                    # The judge turn itself failed — a missing binary, a timeout,
+                    # a crash. It reviewed nothing. Parsing its output anyway is
+                    # how a crash log that happens to contain the word PASS ships
+                    # an unreviewed branch, so the gate fails closed on the run
+                    # before it ever looks at the text.
+                    source.add_labels(issue.id, ["blocked"])
+                    source.comment(issue.id,
+                                   f"Judge run failed ({name}); nothing was reviewed: "
+                                   f"{(jr.output or '')[:500]}")
+                    return BuildOutcome(issue.id, BuildStatus.BLOCKED, tier=tier,
+                                        reason=f"judge run failed ({name}): "
+                                               f"{(jr.output or '')[:200]}",
+                                        revisions=revise, cost_usd=spent['total'],
+                                        unmetered_runs=unmetered['n'],
+                                        judge_history=history)
                 try:
                     v, sb = parse_verdict(jr.output)
                 except ValueError:
-                    # An unparseable judge reply must never be read as PASS.
-                    v, sb = Verdict.REVISE, False
+                    # An unparseable judge reply must never be read as PASS. The
+                    # security flag is read SEPARATELY here rather than defaulted
+                    # to False: a formatting quirk on the verdict line is not a
+                    # reason to discard a veto stated plainly two lines below.
+                    v, sb = Verdict.REVISE, parse_security_block(jr.output)
                 verdicts.append(v)
                 sec = sec or sb
                 block_vote = block_vote or v is Verdict.BLOCK
@@ -553,6 +788,7 @@ def run_build(
                 block_vote=block_vote,
                 security_block=sec,
                 tier=tier,
+                revise_cap=max_revise,
             )
             history.append(overall.value)
 
@@ -564,6 +800,12 @@ def run_build(
                 restarts += 1
                 revise = 0
                 required = None
+                # The fresh worker knows nothing about the attempt just thrown
+                # away. Handing it the judge's reasoning is the difference
+                # between a second attempt and the same attempt again.
+                learnings = "\n\n".join(asks) if asks else (
+                    "The judge called the approach itself wrong but did not say why. "
+                    "Choose a materially different approach from the obvious one.")
                 workspace.reset()
                 source.comment(
                     issue.id,
@@ -586,29 +828,26 @@ def run_build(
                 "issue's expected outcome and address the most likely gap.")
             revise += 1
 
-        # Contracts-before-code, when the project asks for it. The doctrine
-        # treats the contract as the thing the work is measured against, so a
-        # branch that implements first and back-fills the contract afterwards has
-        # written its own acceptance criteria. The checker is pure; the git read
-        # is the only I/O, and a failure to read is not a pass.
-        if require_contract:
-            from software_factory.core.contracts.git_check import (
-                commits_from_git,
-                contract_precedes_implementation,
-            )
-            try:
-                commits = commits_from_git(str(workspace.path), dev_branch)
-                ok_contract, why = contract_precedes_implementation(
-                    commits, int(issue.id), contracts_dir=contracts_dir)
-            except Exception as e:               # fail closed: see below
-                ok_contract, why = False, f"could not read commit order: {e}"
-            if not ok_contract:
+        # The judges ran INSIDE the worktree, after the gate went green. A tool
+        # allowlist is the first line of defence and it is advisory — a runner is
+        # free to ignore the argument, and several do. So the objective gate is
+        # re-run against the tree that is actually about to be pushed. Without
+        # this, anything a judge wrote after the green run ships having never
+        # been tested, and the PR says the suite passed.
+        if judged:
+            passed, _out = workspace.run_tests()
+            if not passed:
                 source.add_labels(issue.id, ["blocked"])
-                source.comment(issue.id, f"Contract gate: {why}")
+                source.comment(
+                    issue.id,
+                    "The test suite was green when the judge was dispatched and is red "
+                    "now, so the reviewed tree was modified after it was verified. "
+                    "Nothing was pushed; the worktree is kept for inspection.")
                 return BuildOutcome(issue.id, BuildStatus.BLOCKED, tier=tier,
-                                    reason=f"contract gate: {why}", revisions=revise,
-                                    cost_usd=spent['total'], unmetered_runs=unmetered['n'],
-                                    judge_history=history)
+                                    reason="tests not green on re-verify after judging",
+                                    revisions=revise, cost_usd=spent['total'],
+                                    unmetered_runs=unmetered['n'], judge_history=history,
+                                    keep_workspace=_keep.setdefault("workspace", True))
 
         # PASS (or T0) → ship: commit, push, open the PR. Ceiling re-checked.
         assert_within_ceiling(pr_base=dev_branch, action="open_pr", **_ceiling_kw)

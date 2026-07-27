@@ -257,14 +257,21 @@ to watch:
 factory build 42     # EXPERIMENTAL
 ```
 
-Same loop, no human. It creates a worktree, runs the agent, gates on
-`verify_cmd`, judges, scans the produced diff for secrets, and opens a PR.
+A narrower version of the same loop, with no human. It creates a worktree, runs
+the agent, gates on `verify_cmd`, judges read-only, re-runs `verify_cmd` against
+the tree it is about to push, scans the produced diff for secrets, and opens a PR.
 
-Read [KNOWN_ISSUES.md](../KNOWN_ISSUES.md) before you use it. Four adversarial
+Read [KNOWN_ISSUES.md](../KNOWN_ISSUES.md) before you use it. Six adversarial
 review panels have examined this subsystem and each found real defects; they are
 fixed and pinned by tests, but it has never run unattended against a real
 repository for a sustained period. It is the only part of this package with no
 production behind it.
+
+**A T2 feature stops the same way it does on the doctrine path.** The plan is
+written to `.factory/plans/issue-<id>.md` and posted as a comment on the issue,
+and the build halts. Read it; if you agree, add the `plan-approved` label and run
+the build again — it implements *that* plan rather than re-reading the issue. If
+you disagree, close the issue. Nothing was written to the repository either way.
 
 If you do try it: your `dev_branch` must exist **locally** (nothing here fetches),
 one build runs per repo at a time, and budget caps only bind if your runner

@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-authors = [{ name = "BrainMatter Studio" }]
+authors = [{ name = "BrainMatterStudios" }]
 keywords = ["ai", "software-factory", "agents", "orchestration", "devops"]
 
 # The core (doctrine, helpers, loop, governance) has ZERO hard third-party deps —

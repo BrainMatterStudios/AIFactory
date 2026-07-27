@@ -19,8 +19,9 @@ OFFLINE = {
         "routing": {"thresholds": {"large_files": 3}},
         "budget": {"monthly_usd": 100, "per_task_usd": 25},
         "governance": {"require_branch_protection": False},
-        # Empty string skips the verify_cmd PATH check in `doctor`, which is
-        # unrelated to the offline-adapters smoke test this fixture is for.
+        # Empty so `doctor` does not fail on a `pytest` binary that happens
+        # not to be on PATH — the test is about config, not about this
+        # machine. Without it the suite is green by accident.
         "build": {"verify_cmd": ""},
     }
 }
