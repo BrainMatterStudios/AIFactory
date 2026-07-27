@@ -63,6 +63,14 @@ The manifest is the only thing that lives in your project. Every stack-specific
 value is in it; nothing is templated into the source. Full reference with
 comments: [`factory.config.example.yaml`](../factory.config.example.yaml).
 
+> **Manifest discovery scope.** `factory` finds its config by walking up from
+> your current directory to the filesystem root, stopping at the first
+> `factory.config.yaml` (or `.json` / `.yml`) it finds. This means running
+> `factory` anywhere inside a directory tree that contains a manifest higher up
+> will load that manifest — including its `plugins:` list, which the loader
+> imports. Keep your manifest at the project root and be aware of this if you
+> work across multiple projects on one machine.
+
 The three fields worth thinking about:
 
 ```yaml

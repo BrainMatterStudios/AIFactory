@@ -13,7 +13,7 @@ what went wrong, is docs/OPERATING.md):
                  (L1–L3), fed entirely through adapters.
 
 Governance rails (kill switch, budgets, the ceiling) live in core.governance;
-session memory is the Pyramid turn system under .ai/turns/.
+turn logs live under .ai/turns/.
 
 Nothing in the core has hard third-party dependencies — providers bring their
 own. The pieces that *must* be enforced by code rather than by an LLM
@@ -21,7 +21,13 @@ remembering a rule (tier floor, judge-verdict combination) are pure functions
 in software_factory.core.orchestrate.
 """
 
-__version__ = "0.1.0"
+from importlib.metadata import PackageNotFoundError as _PNF
+from importlib.metadata import version as _pkg_version
+
+try:
+    __version__ = _pkg_version("software-factory")
+except _PNF:
+    __version__ = "unknown"
 
 from software_factory.core.orchestrate import (
     REVISE_CAP,

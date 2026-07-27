@@ -12,8 +12,8 @@ Honest status, by subsystem. Read this before you rely on anything here.
 worktree, gates on your tests, submits to a judge, and opens a PR — with no human
 present. It is the newest code in this package and the only major subsystem with
 no production provenance: everything else was generalized from a factory that has
-run nightly against a live system (with one six-week gap nobody noticed — see
-and it is documented in docs/OPERATING.md), and this was written from scratch.
+run nightly against a live system (with one six-week gap nobody noticed,
+documented in docs/OPERATING.md), and this was written from scratch.
 
 Four independent adversarial review panels have examined it. Every one found
 defects, and every serious defect they found was here rather than in the ported

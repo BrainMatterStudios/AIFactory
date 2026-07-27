@@ -282,13 +282,16 @@ def crosses_prod_boundary(*, pr_base: str, action: str = "open_pr",
     naming its own release branch would silently stop protecting `main`. A knob
     documented as additive must be additive by construction, because the one
     thing nobody will test is whether configuring the ceiling removed it.
+
+    Unknown actions are denied. A typo in a call site or a newly introduced
+    action name should block rather than silently pass the ceiling check.
     """
     if action in ("merge", "deploy", "publish", "prod_write"):
         return True
     if action == "open_pr":
         guarded = {normalize_ref(r) for r in (*PROD_REFS, *extra_prod_refs)}
         return normalize_ref(pr_base) in guarded
-    return False
+    return True
 
 
 def assert_within_ceiling(*, pr_base: str, action: str = "open_pr",

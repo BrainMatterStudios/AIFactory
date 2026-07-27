@@ -160,7 +160,7 @@ class SourceAdapter(Protocol):
 
     def open_pr(self, draft: PRDraft) -> PullRequest:
         """Open a PR. MUST NOT merge — merging is never an adapter capability
-        exposed to the loop. Enforced again at the permission layer."""
+        exposed to the loop."""
 
 
 # --------------------------------------------------------------------------- #

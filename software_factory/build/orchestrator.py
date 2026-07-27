@@ -69,6 +69,9 @@ class BuildOutcome:
     #: tree a human must look at — reporting "secrets in these files" and then
     #: deleting the files is not a usable report.
     keep_workspace: bool = False
+    #: The planner's output for T2 features awaiting human approval. Empty for
+    #: all other statuses.
+    plan: str = ""
 
 
 def derive_signals(issue: Issue) -> dict[str, Any]:
@@ -305,10 +308,14 @@ def run_build(
             return BuildOutcome(issue.id, BuildStatus.HALTED, tier=tier,
                                 reason=f"budget: {e}", cost_usd=spent["total"],
                                 unmetered_runs=unmetered["n"])
+        plan_text = r.output if r.ok else ""
+        if plan_text:
+            source.comment(issue.id, f"**T2 plan (awaiting approval):**\n\n{plan_text}")
         return BuildOutcome(
             issue.id, BuildStatus.PLAN_PENDING, tier=tier,
             reason="T2 feature: plan produced; awaiting human approval before build.",
             cost_usd=spent['total'], unmetered_runs=unmetered['n'],
+            plan=plan_text,
         )
 
     # T0/T1 → build in an isolated workspace.

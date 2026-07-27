@@ -2,9 +2,8 @@
 `claude` CLI.
 
 The doctrine's tier→model policy is applied by the orchestrator; this adapter
-just runs one agent turn at the requested model. Permissions are passed through
-so the host's allowlist (which omits merge/deploy) governs the agent — the
-ceiling is enforced at the runner boundary too, not only by prose.
+just runs one agent turn at the requested model. When the caller passes a tool
+list, it is forwarded via --allowedTools.
 """
 from __future__ import annotations
 
@@ -18,8 +17,8 @@ from software_factory.adapters.registry import register
 # Default tier→model mapping (overridable in the manifest). These are the
 # doctrine's model tiers; concrete IDs live in config so they track new releases.
 DEFAULT_MODELS = {
-    "opus": "claude-opus-4-8",
-    "sonnet": "claude-sonnet-4-6",
+    "opus": "claude-opus-5",
+    "sonnet": "claude-sonnet-5",
     "haiku": "claude-haiku-4-5-20251001",
 }
 
