@@ -14,7 +14,8 @@ present. It is the newest code in this package and the only major subsystem with
 no production provenance: everything else was generalized from a factory that has
 run against a live system, and this was written from scratch.
 
-Eight independent adversarial review panels have examined it. Every one found
+Eight independent adversarial review panels have examined it, and the
+ninth change here is a redesign rather than another fix. Every one found
 defects, and every serious defect they found was here rather than in the ported
 subsystems. All of the following were reproduced, and are fixed — the list exists
 so you can judge the code's maturity, not because these are open:
@@ -29,6 +30,7 @@ so you can judge the code's maturity, not because these are open:
 | 6 | A panel run against the round-5 fixes found four more ways the same class of bug survives. The **security veto was still first-match** while the verdict had been hardened to most-severe, so a judge that wrote `security_block: false` in a checklist and `true` after finding the bug had its veto — the one channel `combine` treats as absolute — silently dropped. A judge that **filled in the response template** and then refused in prose still parsed as PASS, leaving its own contradicting `required_changes` behind. The judge's tool allowlist was materialised **inside** the dispatch loop, so a one-shot iterable was drained by the first judge and the second (always the security lens) ran unrestricted. And the T2 plan file was **overwritten by any later unapproved run**, so a human could approve the plan they read and get a different one built. Separately, the ceiling's `crosses_prod_boundary` returned False for any action name it did not recognise — an allowlist defaulting to permitted. |
 | 7 | Aimed at the surfaces rounds 5 and 6 never touched, plus a re-attack on the parser they had both rewritten. **The parser fix was itself a fail-open**: round 6's menu guard rejected any value followed by a separator and another value, which cannot tell `verdict: PASS\|REVISE\|BLOCK` from `verdict: BLOCK, PASS was premature.` — so a judge correcting itself in prose was read as PASS, and `security_block: yes, no mitigation is present` silently dropped the veto. **The secret gate read the wrong bytes, or none**: content was skipped on a NUL sniff and the skip was silent, so one leading NUL byte defeated every earlier round's fix; the credential pattern wrapped its keyword in `\b…\b`, which does not exist between `_` and a letter, so it missed `DATABASE_PASSWORD`, `STRIPE_SECRET_KEY` and all JSON config; and UTF-16 text was decoded to garbage before scanning. **The budget caps could be permanently disabled** by a single non-finite charge, which `json` then round-tripped into the ledger; a truncated ledger read as "$0 spent". **`factory doctor` exited 0 with the kill switch engaged.** **The git layer** could report SHIPPED over an empty PR when the agent moved HEAD, treat an empty `verify_cmd` as a passing gate, hang forever with no timeout, and re-ship a previous blocked attempt when the agent wrote nothing. |
 | 8 | A verification round aimed at round 7's own fixes, which found that round 7 had followed the pattern too. The new credential pattern was **quadratic** — 16 KB of base64url took 3.7s, inside the run lock, on content up to the newly-raised 50 MB limit — and dropping the quote requirement to reach dotenv lines produced false positives on `.env.example`, Terraform and this repo's own runbooks. Removing the binary NUL sniff removed the only bound on the working-tree read, so a symlink to `/dev/zero` hung the gate forever. The parser's new most-severe-on-the-line rule read ordinary approving prose (`verdict: PASS - nothing warrants a REVISE or BLOCK`) as a BLOCK, while a **vertical** template menu (`verdict:` then PASS/REVISE/BLOCK one per line) parsed as PASS — invisible to a line-level echo rule. `charge()` raising ValueError to close the NaN fail-open opened a crash, since `run_build` catches only RuntimeError; `cleanup()` raising did the same from inside `finally`, where the sibling handler cannot reach it. `state.py` still used `Path.exists()` — the exact anti-pattern removed from the kill switch in the same commit. And the judge brief's own `wrong_design` line parsed as `true`. |
+| — | **Not a round: the design changed.** Four rounds of hardening a prose parser produced four fail-opens, each introduced by the previous round's fix. The pattern was not any particular pattern — it was that a gate's input was an unbounded natural-language string. The judge now writes a JSON document to a fixed path and the loop reads that file; `parse_verdict` and its regex apparatus are deleted. `tests/test_judge_gate_integrity.py` replays every attack that ever beat the parser as the judge's *reply* and asserts the build does not ship, because the reply is not consulted. |
 
 The pattern across the first four: **fixes that were correct alone and destroyed
 each other in composition**, invisible to a test suite that exercised one at a
@@ -96,12 +98,20 @@ and leave running.
   (`briefs.quote_untrusted`), so a judge quoting it back cannot be read as a
   verdict — but neutralising a known field syntax is not the same as making
   untrusted text safe to put in a prompt. Treat board write access as trusted.
-- **The judge's read-only allowlist is advisory.** Judges are dispatched with a
-  read-only `tools` list, which the reference Claude runner forwards as
-  `--allowedTools`; a runner that ignores the argument enforces nothing. What
-  actually holds the line is the re-run of your `verify_cmd` against the tree
-  about to be pushed, which turns a mutation into a blocked build rather than an
-  untested PR.
+- **The judge's verdict is a file, not its reply.** The judge writes
+  `.factory/judge-verdict.json` and the loop reads only that; its prose carries
+  no authority and is never parsed. This replaced four rounds of trying to read a
+  verdict out of free text, each of which closed one misreading and opened
+  another. A missing, unreadable or invalid document is a REVISE, never a PASS.
+  The cost of the change is that a judge which cannot follow the protocol
+  produces no usable verdict and, after the revise budget, escalates to a human —
+  that is the intended failure, but it does mean the judge model has to be
+  capable of writing a small JSON file reliably.
+- **The judge's tool allowlist is advisory, and now includes `Write`.** It has to:
+  the verdict is a file the judge creates. A runner that ignores `tools` enforces
+  nothing either way. What actually holds the line is the re-run of your
+  `verify_cmd` against the tree about to be pushed, which turns any other
+  mutation into a blocked build rather than an untested PR.
 - **The runner deny list is pattern matching, not a sandbox.** The reference
   Claude runner refuses `git push`, `git merge`, `git tag`, `gh pr merge`,
   `gh release` and `gh workflow run` on every turn. A shell script or an

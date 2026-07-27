@@ -28,7 +28,14 @@ class FakeRunner:
         self.calls.append(system or ("judge" if "ROLE=judge" in prompt else "worker"))
         if "ROLE=judge" in prompt or system == "judge":
             reply = self.judge_replies.pop(0) if self.judge_replies else "verdict: PASS"
-            return RunResult(ok=True, output=reply, model=model, cost_usd=self.cost)
+            # A real judge writes the verdict FILE; its reply is log material the
+            # loop never reads. Fixtures stay written as short text because that
+            # is readable, and are translated here — the translation is the fake
+            # agent doing what a real one is told to do, not the loop parsing
+            # prose.
+            if cwd is not None and reply is not None:
+                write_verdict_fixture(cwd, reply)
+            return RunResult(ok=True, output=reply or "", model=model, cost_usd=self.cost)
         return RunResult(ok=True, output="done", model=model, cost_usd=self.cost)
 
     @property
@@ -42,6 +49,29 @@ class FakeRunner:
         # Judging is per-persona now: the security reviewer is its own dispatch
         # with its own verdict, so it counts as a judge call.
         return sum(1 for c in self.calls if c in ("judge", "security-specialist"))
+
+
+def write_verdict_fixture(cwd, reply: str) -> None:
+    """Translate a short fixture string into the verdict document a real judge
+    would write. `reply=None` means "the judge wrote nothing", which is a case
+    the loop must handle."""
+    import json
+    import re as _re
+
+    from software_factory.build.verdict_file import verdict_file
+
+    m = _re.search(r"\b(PASS|REVISE|BLOCK)\b", reply, _re.IGNORECASE)
+    doc = {
+        "verdict": m.group(1).upper() if m else "PASS",
+        "security_block": bool(_re.search(r"security_block:\s*(true|yes)", reply, _re.I)),
+        "wrong_design": bool(_re.search(r"wrong_design:\s*(true|yes)", reply, _re.I)),
+    }
+    ask = _re.search(r"required_changes:\s*(.+)", reply, _re.I | _re.S)
+    if ask:
+        doc["required_changes"] = ask.group(1).strip()
+    path = verdict_file(cwd)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(doc), encoding="utf-8")
 
 
 def _real_git_dir(tmp_path_factory=None):

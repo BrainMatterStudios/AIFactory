@@ -35,7 +35,7 @@ another, Postgres or Snowflake, Slack or Telegram. Adopting it is configuration
 and adapters, not a rewrite. The core has zero hard dependencies and ships a
 complete offline adapter set, so the whole loop runs in your tests and your CI.
 
-**Status:** 463 tests, CI on Python 3.10, 3.12–3.13, Apache-2.0. The observe→diagnose→
+**Status:** 441 tests, CI on Python 3.10, 3.12–3.13, Apache-2.0. The observe→diagnose→
 queue→verify loop and the deterministic gate helpers are generalized from a
 factory that has run against a production system, where the passes are invoked
 on demand rather than on a schedule. If you intend to automate that,
@@ -164,7 +164,7 @@ directory, so run it from anywhere inside your project. Real (non-offline) use n
 `gh` authenticated and your providers' secrets in env vars named by the manifest.
 
 `factory build` classifies the tier, runs a worker in an isolated git worktree, gates
-on your `verify_cmd`, runs the judge (revise ≤ 2) read-only, re-runs your gate against
+on your `verify_cmd`, runs the judge (revise ≤ 2), re-runs your gate against
 the tree it is about to push, and opens a PR into your dev branch — charging the budget
 and refusing any prod base. It never merges. A T2 feature halts after planning: the plan
 is written to `.factory/plans/` and posted on the issue, and adding the
@@ -176,7 +176,7 @@ another one.
 ```bash
 git clone https://github.com/BrainMatterStudios/AIFactory && cd AIFactory
 pip install -e ".[dev]"          # core has zero hard deps; this adds pytest + ruff + yaml
-python -m pytest -q              # 463 passing — deterministic core + full offline loop
+python -m pytest -q              # 441 passing — deterministic core + full offline loop
 ./scripts/ci-local.sh            # every CI job, with CI's pinned toolchain
 ```
 
@@ -203,7 +203,7 @@ where people get hurt:
 |---|---|---|
 | Loop code | Cannot merge, deploy, or target a prod ref. Structural — there is no method to call. | Says nothing about the agent process, and the workspace shells out to `git` directly for branch, commit and push. |
 | Runner deny list | The reference Claude runner refuses `git push`, `git merge`, `git tag`, `gh pr merge`, `gh release`, `gh workflow run` on **every** turn. | Pattern matching, not a sandbox: a script or an unmatched invocation reaches the same effect. |
-| Judge allowlist | Judges are dispatched read-only (`--allowedTools`). | Advisory — a runner may ignore the argument. |
+| Structured verdict | The judge writes `.factory/judge-verdict.json`; its prose is never parsed, so nothing it says — or quotes back from an issue — can be read as approval. | A judge that cannot write valid JSON produces no verdict, which is a REVISE. |
 | Re-verify | The suite is re-run after judging, so a tree modified after the gate went green cannot ship. | Catches the mutation; does not prevent it. |
 
 Unattended operation still needs a sandboxed runner and least-privilege

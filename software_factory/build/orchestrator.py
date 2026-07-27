@@ -32,11 +32,13 @@ from software_factory.adapters.base import (
 from software_factory.build.briefs import (
     implementer_brief,
     judge_brief,
-    parse_required_changes,
-    parse_security_block,
-    parse_verdict,
-    parse_wrong_design,
     planner_brief,
+)
+from software_factory.build.verdict_file import (
+    JudgeVerdict,
+    VerdictUnreadable,
+    clear_verdict,
+    read_verdict,
 )
 from software_factory.build.workspace import NothingToCommit, Workspace
 from software_factory.core.governance import (
@@ -154,7 +156,10 @@ _WORKER_MODEL = {Tier.T0: "haiku", Tier.T1: "sonnet"}
 #: loop ALSO re-runs the verify gate after judging: neither control is trusted on
 #: its own, and the one that catches a mutation is the test run, not the prompt.
 JUDGE_TOOLS: tuple[str, ...] = (
-    "Read", "Grep", "Glob", "LS", "NotebookRead",
+    # Write is required: the verdict is a file the judge creates. That is a
+    # deliberate trade — the judge holds a writable worktree, which is why the
+    # verify command is re-run against the exact tree about to be pushed.
+    "Read", "Grep", "Glob", "LS", "NotebookRead", "Write",
     "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(git status:*)",
 )
 
@@ -790,6 +795,12 @@ def run_build(
                 # third-party runner written before it dies with a TypeError —
                 # after the worker turn has already been spawned and charged.
                 extra = {"tools": _judge_tools} if _judge_tools else {}
+                # Remove any verdict left by an earlier dispatch. A judge that
+                # crashes or refuses writes nothing, and the previous judge's
+                # file would then be read as this review's answer — the same
+                # absence-read-as-approval failure, reached through the
+                # filesystem.
+                clear_verdict(workspace.path)
                 jr = runner.run_agent(
                     judge_brief(issue, lens=lens, contract=contract_text), model=model,
                     system=name, cwd=workspace.path, **extra)
@@ -810,24 +821,27 @@ def run_build(
                                         revisions=revise, cost_usd=spent['total'],
                                         unmetered_runs=unmetered['n'],
                                         judge_history=history)
+                # The verdict is the FILE, never the reply. `jr.output` is not
+                # consulted for any decision — it is log material. Three review
+                # rounds were spent hardening a prose parser, and each fix closed
+                # one misreading and opened another; the input was an unbounded
+                # natural-language string and no amount of pattern work changes
+                # that. A judge whose prose says PASS and whose file says BLOCK
+                # has said BLOCK.
                 try:
-                    v, sb = parse_verdict(jr.output)
-                except ValueError:
-                    # An unparseable judge reply must never be read as PASS. The
-                    # security flag is read SEPARATELY here rather than defaulted
-                    # to False: a formatting quirk on the verdict line is not a
-                    # reason to discard a veto stated plainly two lines below.
-                    v, sb = Verdict.REVISE, parse_security_block(jr.output)
-                verdicts.append(v)
-                sec = sec or sb
-                block_vote = block_vote or v is Verdict.BLOCK
-                wrong_design = wrong_design or parse_wrong_design(jr.output)
-                # The judge's actual asks. These used to be parsed out of the
-                # reply by nobody and replaced with a sentence telling the worker
-                # to address changes it had never been shown.
-                ask = parse_required_changes(jr.output)
-                if ask:
-                    asks.append(f"From the {lens} judge ({name}):\n{ask}")
+                    jv = read_verdict(workspace.path)
+                except VerdictUnreadable as e:
+                    # Fail closed, and say why — a judge that cannot follow the
+                    # protocol is a judge that reviewed nothing usable.
+                    jv = JudgeVerdict(verdict=Verdict.REVISE,
+                                      required_changes=f"(no usable verdict: {e})")
+                    history.append(f"unreadable:{name}")
+                verdicts.append(jv.verdict)
+                sec = sec or jv.security_block
+                block_vote = block_vote or jv.verdict is Verdict.BLOCK
+                wrong_design = wrong_design or jv.wrong_design
+                if jv.required_changes:
+                    asks.append(f"From the {lens} judge ({name}):\n{jv.required_changes}")
 
             overall = combine(verdicts, revise_count=revise, security_block=sec,
                               revise_cap=max_revise)
