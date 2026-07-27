@@ -8,6 +8,9 @@ Subcommands:
               adapters — no config, no external services.
   observe     run L1 verify + L2 harvest against the configured adapters.
   pickup      print the next Ready issue the build loop would pick.
+  init        scaffold a new factory.config.yaml for an existing repo.
+  build       pick the next Ready issue and run the autonomous build loop on it.
+  schedule    emit a cron entry (or GitHub Actions workflow) for the observe loop.
   version     print the version.
 
 Everything here is thin glue over the library; the logic lives in core/ and loop/.

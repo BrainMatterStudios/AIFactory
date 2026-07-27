@@ -13,7 +13,7 @@ what went wrong, is docs/OPERATING.md):
                  (L1–L3), fed entirely through adapters.
 
 Governance rails (kill switch, budgets, the ceiling) live in core.governance;
-session memory is the Pyramid turn system under .ai/turns/.
+turn logs live under .ai/turns/.
 
 Nothing in the core has hard third-party dependencies — providers bring their
 own. The pieces that *must* be enforced by code rather than by an LLM
