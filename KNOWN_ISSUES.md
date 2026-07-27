@@ -58,26 +58,20 @@ and leave running.
   says so, but cannot stop them.
 - **Not concurrency-safe across projects** sharing one state directory for spend
   accounting, beyond the per-project keys.
-- **It does not form a persona team.** The doctrine path assembles a proportional
-  team from `core/personas/`; the autonomous builder runs one implementer and one
-  correctness judge, adding a security lens when the issue looks security-flavoured.
-  It never loads the persona catalog.
-- **Judge feedback is not fed back.** `judge_brief` asks the judge for
-  `required_changes`, but `parse_verdict` returns only the verdict and the
-  security flag, so the revise pass tells the worker to "address the judge's
-  required_changes" without supplying them. Expect revisions to be weaker than
-  the doctrine path's.
-- **`decide_restart` is not wired in.** The helper is tested and used by the
-  doctrine, but the autonomous loop escalates on BLOCK rather than considering a
-  restart.
-- **The contract validator is not invoked** by the builder. Contracts-before-code
-  is a doctrine practice; nothing in `build/` enforces commit order.
-- **Tier signals are thin.** `classify_tier` accepts scope, risk and size signals;
-  `derive_signals` populates only `source` and `touches_security` from labels and
-  issue text. It does not read file counts, cross-cutting scope, production impact
-  or migration risk, so routing is coarser than the doctrine's.
-- **Every T2 halts, not only T2 features.** The doctrine gates T2 *features*; the
-  code gates all T2 classifications. Conservative, but broader than documented.
+- **`files_changed` is always 0 in autonomous tiering.** `derive_signals` reads an
+  issue, not a diff, so the size signal `classify_tier` accepts is unused there.
+  Scope and risk signals (production impact, migrations, cross-cutting work,
+  security) *are* derived from labels and issue text, but from keywords — expect
+  to tune them, and expect an unusually-worded issue to route one tier low.
+- **The contract gate is opt-in and off by default** (`build.require_contract`).
+  It only means something in a repo that writes `contracts/<issue>.json`; turned
+  on elsewhere it blocks every build for a missing file nobody agreed to write.
+  When on, it fails closed: a commit order it cannot read is a block, not a pass.
+- **A RESTART discards the branch.** `Workspace.reset()` hard-resets to the base
+  and runs `git clean -xdff` in the worktree. That is the intent — a restart
+  exists to throw the work away — but it is destructive, and a custom `Workspace`
+  implementation must honour the same contract or the second attempt inherits the
+  first one's tree.
 
 ---
 

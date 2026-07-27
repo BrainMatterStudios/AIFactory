@@ -467,6 +467,8 @@ def _run_build_locked(args, cfg, repo_dir: str) -> int:
         issue, runner=runner, source=source, workspace=workspace,
         dev_branch=cfg.build_cfg.dev_branch, budget=guard,
         max_revise=cfg.build_cfg.max_revise,
+        require_contract=cfg.build_cfg.require_contract,
+        contracts_dir=cfg.build_cfg.contracts_dir,
         killswitch_env=cfg.governance.killswitch_env,
         repo_root=repo_dir,
         prod_refs=cfg.governance.prod_refs or None,

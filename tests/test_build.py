@@ -32,12 +32,16 @@ class FakeRunner:
         return RunResult(ok=True, output="done", model=model, cost_usd=self.cost)
 
     @property
-    def judge_calls(self):
-        return self.calls.count("judge")
+    def worker_calls(self):
+        # The loop dispatches personas by name now, so "the worker" is whatever
+        # the catalog's implementer is called — not a literal "worker".
+        return sum(1 for c in self.calls if c in ("worker", "implementer"))
 
     @property
-    def worker_calls(self):
-        return sum(1 for c in self.calls if c == "worker")
+    def judge_calls(self):
+        # Judging is per-persona now: the security reviewer is its own dispatch
+        # with its own verdict, so it counts as a judge call.
+        return sum(1 for c in self.calls if c in ("judge", "security-specialist"))
 
 
 def _real_git_dir(tmp_path_factory=None):
@@ -71,11 +75,15 @@ class FakeWorkspace:
         self._tests_pass = tests_pass
         self.created = self.pushed = self.cleaned = False
         self.committed = None
+        self.resets = 0
 
     def changed_files(self):
         # Required by the Workspace Protocol: the secret gate scans this, and a
         # workspace that cannot report its diff fails closed.
         return ["src/app.py"]
+
+    def reset(self):
+        self.resets += 1
 
     def create(self):
         self.created = True
@@ -125,13 +133,44 @@ def test_revise_then_pass():
     assert out.judge_history == ["REVISE", "PASS"]
 
 
-def test_revise_cap_blocks_and_labels():
+def test_revise_cap_restarts_once_then_blocks():
+    """An exhausted revise budget with no explicit BLOCK vote is the recoverable
+    kind of failure: `decide_restart` upgrades it to RESTART, the branch is
+    discarded, and one fresh worker tries again. The restart budget is 1, so a
+    loop that keeps failing still reaches a human — it just does not do so
+    before the cheap second attempt."""
     src, issue = _issue()
-    rn = FakeRunner(judge_replies=["verdict: REVISE", "verdict: REVISE", "verdict: REVISE"])
-    out = _build(src, issue, rn, FakeWorkspace(), max_revise=2)
+    rn = FakeRunner(judge_replies=["verdict: REVISE"] * 8)
+    ws = FakeWorkspace()
+    out = _build(src, issue, rn, ws, max_revise=2)
     assert out.status is BuildStatus.BLOCKED
     assert "blocked" in src.get_issue("7").labels
     assert out.pr is None
+    assert "RESTART" in out.judge_history
+    assert ws.resets == 1, "the branch must actually be discarded on RESTART"
+
+
+def test_a_restart_discards_the_work_and_can_still_ship():
+    src, issue = _issue()
+    # cap=2, so the third REVISE exhausts the budget and becomes the RESTART.
+    rn = FakeRunner(judge_replies=["verdict: REVISE"] * 3 + ["verdict: PASS"])
+    ws = FakeWorkspace()
+    out = _build(src, issue, rn, ws, max_revise=2)
+    assert out.status is BuildStatus.SHIPPED
+    assert out.judge_history == ["REVISE", "REVISE", "RESTART", "PASS"]
+    assert ws.resets == 1
+
+
+def test_an_explicit_block_vote_is_never_restarted():
+    """A judge that deliberately votes BLOCK is making a human's decision, not
+    hitting a budget. Only budget-exhaustion and wrong-design are restartable."""
+    src, issue = _issue()
+    rn = FakeRunner(judge_replies=["verdict: BLOCK"])
+    ws = FakeWorkspace()
+    out = _build(src, issue, rn, ws, max_revise=2)
+    assert out.status is BuildStatus.BLOCKED
+    assert "RESTART" not in out.judge_history
+    assert ws.resets == 0
 
 
 def test_security_veto_blocks():
@@ -172,7 +211,7 @@ class _FailingPlanner(FakeRunner):
     """Planner turn fails; everything else behaves."""
 
     def run_agent(self, prompt, *, model, system=None, tools=None, cwd=None):
-        if system == "planner":
+        if system in ("planner", "product-manager"):
             self.calls.append("planner")
             return RunResult(ok=False, output="", model=model, cost_usd=self.cost)
         return super().run_agent(prompt, model=model, system=system, tools=tools, cwd=cwd)
@@ -198,7 +237,7 @@ def test_an_empty_plan_is_treated_as_no_plan():
     success code."""
     class _Empty(FakeRunner):
         def run_agent(self, prompt, *, model, system=None, tools=None, cwd=None):
-            if system == "planner":
+            if system in ("planner", "product-manager"):
                 self.calls.append("planner")
                 return RunResult(ok=True, output="   \n  ", model=model, cost_usd=self.cost)
             return super().run_agent(prompt, model=model, system=system, tools=tools, cwd=cwd)
@@ -246,3 +285,97 @@ def test_kill_switch_halts(monkeypatch):
     out = _build(src, issue, FakeRunner(), ws)
     assert out.status is BuildStatus.HALTED
     assert not ws.created
+
+
+# --------------------------------------------------------------------------- #
+# The judge's asks must reach the worker
+# --------------------------------------------------------------------------- #
+class _RecordingRunner(FakeRunner):
+    """Keeps every prompt so a test can assert what the worker was actually told."""
+
+    def __init__(self, judge_replies=None, cost=0.0):
+        super().__init__(judge_replies=judge_replies, cost=cost)
+        self.prompts = []
+
+    def run_agent(self, prompt, *, model, system=None, tools=None, cwd=None):
+        self.prompts.append((system, prompt))
+        return super().run_agent(prompt, model=model, system=system, tools=tools, cwd=cwd)
+
+
+def test_the_judges_required_changes_reach_the_next_worker():
+    """The revise pass used to tell the worker to "address the judge's
+    required_changes from the previous review" — instructions it had never been
+    shown, because parse_verdict returned only the verdict and the security flag
+    and the list was dropped on the floor."""
+    src, issue = _issue()
+    rn = _RecordingRunner(judge_replies=[
+        "verdict: REVISE\nrequired_changes:\n  - add a failing test for the empty input\n"
+        "  - rename thing() to parse_thing()",
+        "verdict: PASS",
+    ])
+    out = _build(src, issue, rn, FakeWorkspace())
+    assert out.status is BuildStatus.SHIPPED
+
+    worker_prompts = [p for sysname, p in rn.prompts if sysname == "implementer"]
+    assert len(worker_prompts) == 2, "expected an original pass and a revision"
+    revision = worker_prompts[1]
+    assert "add a failing test for the empty input" in revision
+    assert "rename thing() to parse_thing()" in revision
+
+
+def test_a_judge_that_lists_nothing_does_not_fabricate_instructions():
+    src, issue = _issue()
+    rn = _RecordingRunner(judge_replies=["verdict: REVISE", "verdict: PASS"])
+    _build(src, issue, rn, FakeWorkspace())
+    revision = [p for sysname, p in rn.prompts if sysname == "implementer"][1]
+    assert "required_changes" not in revision
+    assert "did not list them" in revision
+
+
+def test_the_security_reviewer_is_a_separate_dispatch_with_its_own_verdict():
+    """A veto that arrives as a flag on someone else's review can be outvoted.
+    The security persona is asked separately, so its BLOCK stands alone."""
+    src, issue = _issue(labels=("type:bug", "security"), title="fix an auth bypass")
+    rn = _RecordingRunner(judge_replies=["verdict: PASS", "verdict: BLOCK\nsecurity_block: true"])
+    out = _build(src, issue, rn, FakeWorkspace())
+    assert out.status is BuildStatus.BLOCKED
+    systems = [sysname for sysname, _ in rn.prompts]
+    assert "judge" in systems and "security-specialist" in systems
+
+
+def test_the_team_comes_from_the_catalog_not_from_hardcoded_roles():
+    from software_factory.build.orchestrator import form_team
+    from software_factory.core.orchestrate import Tier
+
+    t0 = form_team(Tier.T0, {})
+    t1 = form_team(Tier.T1, {})
+    t1sec = form_team(Tier.T1, {"touches_security": True})
+    assert t0.judges == (), "T0 is gated by the tests alone"
+    assert [n for n, _ in t1.judges] == ["judge"]
+    assert [n for n, _ in t1sec.judges] == ["judge", "security-specialist"]
+    # The floor personas must never be cheapened by the tier.
+    assert all(m == "opus" for _, m in t1sec.judges)
+
+
+def test_the_contract_gate_is_off_by_default():
+    """Most repos do not write contracts. Defaulting the gate on would block
+    every build for a missing file nobody agreed to write."""
+    src, issue = _issue()
+    out = _build(src, issue, FakeRunner(), FakeWorkspace())
+    assert out.status is BuildStatus.SHIPPED
+
+
+def test_the_contract_gate_blocks_when_it_cannot_read_the_commit_order():
+    """Fail closed: "I could not check" is not "the order was fine". The stub
+    workspace points at a tiny real repo with no contract commits, so the check
+    runs and refuses."""
+    from software_factory.build.orchestrator import run_build
+
+    src, issue = _issue()
+    out = run_build(
+        issue, runner=FakeRunner(), source=src, workspace=FakeWorkspace(),
+        dev_branch="HEAD", require_contract=True, repo_root=None,
+    )
+    assert out.status is BuildStatus.BLOCKED
+    assert "contract gate" in out.reason
+    assert "blocked" in src.get_issue("7").labels

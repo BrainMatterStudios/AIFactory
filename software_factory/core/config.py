@@ -81,6 +81,13 @@ class BuildConfig:
     verify_cmd: str = "pytest -q"
     workspace_root: str = ".factory-worktrees"
     max_revise: int = 2
+    #: Enforce contracts-before-code: the commit that writes
+    #: `<contracts_dir>/<issue>.json` must land at or before the first
+    #: implementation commit. Off by default because it only means anything in a
+    #: repo that actually writes contracts — turning it on elsewhere blocks every
+    #: build for a missing file nobody agreed to write.
+    require_contract: bool = False
+    contracts_dir: str = "contracts"
 
 
 @dataclass(frozen=True)

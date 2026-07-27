@@ -37,8 +37,8 @@ factory:
   runner:
     provider: claude_code     # reference: claude_code | echo (offline)
     models:
-      opus: claude-opus-5
-      sonnet: claude-sonnet-5
+      opus: claude-opus-4-8
+      sonnet: claude-sonnet-4-6
       haiku: claude-haiku-4-5-20251001
 
   # 3. OBSERVE — read-only run status + logs. Swap for your platform.
@@ -74,7 +74,13 @@ factory:
     dev_branch: develop       # the ONLY base the loop may target — never a prod ref
     verify_cmd: "pytest -q"   # YOUR project's test/lint gate; must pass before a PR
     workspace_root: .factory-worktrees
-    max_revise: 2             # judge revise cycles before it escalates to a human
+    max_revise: 2
+  # Contracts-before-code. Off by default: it only means something in a repo that
+  # writes contracts/<issue>.json, and turning it on elsewhere blocks every build
+  # for a file nobody agreed to write. When on it fails closed — a commit order
+  # the gate cannot read is a block, not a pass.
+  require_contract: false
+  contracts_dir: contracts             # judge revise cycles before it escalates to a human
 
   # ── policy ────────────────────────────────────────────────────────────────
   routing:

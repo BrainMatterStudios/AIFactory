@@ -30,7 +30,9 @@ from software_factory.adapters.base import (
 from software_factory.build.briefs import (
     implementer_brief,
     judge_brief,
+    parse_required_changes,
     parse_verdict,
+    parse_wrong_design,
     planner_brief,
 )
 from software_factory.build.workspace import NothingToCommit, Workspace
@@ -41,7 +43,14 @@ from software_factory.core.governance import (
     assert_live,
     assert_within_ceiling,
 )
-from software_factory.core.orchestrate import Tier, Verdict, classify_tier, combine
+from software_factory.core.orchestrate import (
+    RESTART_CAP,
+    Tier,
+    Verdict,
+    classify_tier,
+    combine,
+    decide_restart,
+)
 
 
 class BuildStatus(str, Enum):
@@ -75,9 +84,30 @@ class BuildOutcome:
     plan: str | None = None
 
 
+# Signal keywords. Deliberately broad: over-tiering costs an extra judge pass,
+# under-tiering routes real risk to a cheap model with no security lens.
+_PROD_WORDS = ("production", "prod ", "live site", "customer-facing", "outage",
+               "incident", "hotfix", "rollback", "deploy")
+_DATA_WORDS = ("migration", "migrate", "schema", "alembic", "backfill", "drop table",
+               "alter table", "reindex", "data loss", "truncate")
+_CROSS_WORDS = ("refactor", "rename across", "every module", "codebase-wide",
+                "all callers", "cross-cutting", "sweeping", "repo-wide")
+_MECHANICAL_WORDS = ("typo", "bump version", "update the changelog", "formatting",
+                     "lint fix", "dead link")
+
+
 def derive_signals(issue: Issue) -> dict[str, Any]:
-    """Read tier signals off an issue's labels + text. Conservative: unknown
-    source floors at T1, anything security-flavored stays at least T1."""
+    """Read tier signals off an issue's labels + text.
+
+    Conservative in both directions: an unknown source floors at T1, and every
+    risk signal only ever raises the tier. This used to return `source` and
+    `touches_security` alone, so `classify_tier`'s scope and risk inputs were
+    dead in the autonomous path — a migration and a typo routed identically.
+
+    It reads an issue, not a diff, so `files_changed` stays 0: the real count is
+    not knowable before the work is done, and guessing it would be worse than
+    leaving the signal off.
+    """
     labels = set(issue.labels)
     source = None
     for label in labels:
@@ -88,14 +118,102 @@ def derive_signals(issue: Issue) -> dict[str, Any]:
                 "data-quality": "data-quality", "task": "feature",
             }.get(t, source)
     text = f"{issue.title} {issue.body}".lower()
+
+    def _any(words):
+        return any(w in text for w in words)
+
     touches_security = (
         "security" in labels or "type:security" in labels
         or "security" in text or "vuln" in text or "cve" in text
     )
-    return {"source": source, "touches_security": touches_security}
+    return {
+        "source": source,
+        "touches_security": touches_security,
+        "touches_prod": "prod" in labels or "priority:p0" in labels or _any(_PROD_WORDS),
+        "touches_data_or_migration": "migration" in labels or _any(_DATA_WORDS),
+        "cross_cutting": "refactor" in labels or _any(_CROSS_WORDS),
+        # Only ever set when nothing risky fired: "mechanical" is what lets an
+        # issue drop to T0, so a keyword must never pull risk downward.
+        "mechanical": (
+            _any(_MECHANICAL_WORDS)
+            and not touches_security
+            and not _any(_PROD_WORDS) and not _any(_DATA_WORDS) and not _any(_CROSS_WORDS)
+        ),
+    }
 
 
 _WORKER_MODEL = {Tier.T0: "haiku", Tier.T1: "sonnet"}
+
+#: Roles the loop asks the catalog for, by job. Names must exist in
+#: `core/personas/catalog.yaml`; `form_team` fails loudly if one does not,
+#: because silently dropping the security reviewer is the failure that matters.
+_WORKER_ROLE = "implementer"
+_JUDGE_ROLE = "judge"
+_SECURITY_ROLE = "security-specialist"
+_PLANNER_ROLES = ("product-manager", "requirements-analyst")
+
+
+@dataclass(frozen=True)
+class Team:
+    """The personas dispatched for one issue, and the model each runs at.
+
+    The doctrine forms a team proportional to the tier. The autonomous loop used
+    to hardcode one worker and one judge and never open the catalog at all, so
+    editing the catalog changed the doctrine path and nothing else.
+    """
+    worker: str
+    worker_model: str
+    judges: tuple[tuple[str, str], ...] = ()      # (persona name, model)
+    planner: str | None = None
+    planner_model: str = "opus"
+
+    def describe(self) -> str:
+        parts = [f"{self.worker}@{self.worker_model}"] if self.worker else []
+        parts += [f"{n}@{m}" for n, m in self.judges]
+        if self.planner:
+            parts.insert(0, f"{self.planner}@{self.planner_model}")
+        return ", ".join(parts)
+
+
+def form_team(tier: Tier, signals: Mapping[str, Any], *, personas=None) -> Team:
+    """Assemble a proportional team from the persona catalog.
+
+    Proportional means: T0 is gated by the tests alone and gets no judge; T1 gets
+    an independent judge; a security-flavoured issue adds the security reviewer
+    as a *separate* lens, because a veto that can be outvoted is not a veto; a T2
+    feature gets a planner and stops there.
+
+    Each persona runs at the model the catalog declares. A `tier_lock: floor`
+    persona is never cheapened — the whole point of the floor is that judging and
+    the security veto cannot be quietly downgraded to save money.
+    """
+    from software_factory.core.personas.catalog import load_catalog
+
+    by_name = {p.name: p for p in (personas if personas is not None else load_catalog())}
+
+    def pick(name: str, *, allow_cheaper: str | None = None) -> tuple[str, str]:
+        p = by_name.get(name)
+        if p is None:
+            raise KeyError(
+                f"persona {name!r} is not in the catalog; the build loop needs it. "
+                "Run `factory personas` to see what is loaded."
+            )
+        model = p.model
+        if allow_cheaper and p.tier_lock != "floor":
+            model = allow_cheaper
+        return (p.name, model)
+
+    if tier is Tier.T2 and signals.get("source") == "feature":
+        planner, planner_model = pick(_PLANNER_ROLES[0])
+        return Team(worker="", worker_model="", planner=planner, planner_model=planner_model)
+
+    worker, worker_model = pick(_WORKER_ROLE, allow_cheaper=_WORKER_MODEL.get(tier))
+    judges: list[tuple[str, str]] = []
+    if tier is not Tier.T0:
+        judges.append(pick(_JUDGE_ROLE))
+        if signals.get("touches_security"):
+            judges.append(pick(_SECURITY_ROLE))
+    return Team(worker=worker, worker_model=worker_model, judges=tuple(judges))
 
 
 def _scannable_blobs(workspace) -> tuple[list[tuple[str, bytes]], list[str], str | None]:
@@ -251,6 +369,8 @@ def run_build(
     killswitch_env: str = "KILL_FACTORY",
     repo_root: str | None = None,
     prod_refs: Iterable[str] | None = None,
+    require_contract: bool = False,
+    contracts_dir: str = "contracts",
 ) -> BuildOutcome:
     """`repo_root` anchors the halt-file check; without it the durable kill switch
     is relative to the process cwd and a cron run that does not cd into the repo
@@ -290,6 +410,7 @@ def run_build(
         return BuildOutcome(issue.id, BuildStatus.HALTED, reason=str(e))
 
     tier = classify_tier(**sig)
+    team = form_team(tier, sig)
 
     # Before ANY spawn, including the T2 planner — which runs on the most
     # expensive model. Guarding only the T0/T1 loop meant an exhausted budget
@@ -300,10 +421,14 @@ def run_build(
         return BuildOutcome(issue.id, BuildStatus.HALTED, tier=tier,
                             reason=f"budget: {over}", unmetered_runs=unmetered["n"])
 
-    # T2 feature → produce a plan and STOP for human approval. No code.
-    if tier is Tier.T2:
+    # T2 *feature* → produce a plan and STOP for human approval. No code.
+    # The doctrine gates T2 features specifically; this used to halt every T2,
+    # so a large bug or chore stalled for an approval the doctrine never asked
+    # for. Anything T2 and not a feature builds under the same judge as T1.
+    if tier is Tier.T2 and sig.get("source") == "feature":
         try:
-            r = runner.run_agent(planner_brief(issue), model="opus", system="planner")
+            r = runner.run_agent(planner_brief(issue), model=team.planner_model,
+                                 system=team.planner or "planner")
             _charge(r)
         except BudgetExceeded as e:
             return BuildOutcome(issue.id, BuildStatus.HALTED, tier=tier,
@@ -329,6 +454,7 @@ def run_build(
 
     # T0/T1 → build in an isolated workspace.
     revise = 0
+    restarts = 0
     required: str | None = None
     history: list[str] = []
     created = False
@@ -355,7 +481,8 @@ def run_build(
             # worker pass
             r = runner.run_agent(
                 implementer_brief(issue, required_changes=required),
-                model=_WORKER_MODEL.get(tier, "sonnet"),
+                model=team.worker_model,
+                system=team.worker,
                 cwd=workspace.path,
             )
             _charge(r)
@@ -384,38 +511,104 @@ def run_build(
             if tier is Tier.T0:
                 break
 
-            lenses = ["correctness"] + (["security"] if sig.get("touches_security") else [])
+            # One judge per lens, each a separate dispatch: the security veto is
+            # its own reviewer with its own verdict, never a flag on a general
+            # review, because a veto that can be outvoted is not a veto.
             verdicts: list[Verdict] = []
             sec = False
-            for lens in lenses:
-                jr = runner.run_agent(judge_brief(issue, lens=lens), model="opus",
-                                      system="judge", cwd=workspace.path)
+            block_vote = False
+            wrong_design = False
+            asks: list[str] = []
+            for name, model in team.judges:
+                lens = "security" if name == _SECURITY_ROLE else "correctness"
+                jr = runner.run_agent(judge_brief(issue, lens=lens), model=model,
+                                      system=name, cwd=workspace.path)
                 _charge(jr)
                 try:
-                    v, s = parse_verdict(jr.output)
+                    v, sb = parse_verdict(jr.output)
                 except ValueError:
                     # An unparseable judge reply must never be read as PASS.
-                    v, s = Verdict.REVISE, False
+                    v, sb = Verdict.REVISE, False
                 verdicts.append(v)
-                sec = sec or s
+                sec = sec or sb
+                block_vote = block_vote or v is Verdict.BLOCK
+                wrong_design = wrong_design or parse_wrong_design(jr.output)
+                # The judge's actual asks. These used to be parsed out of the
+                # reply by nobody and replaced with a sentence telling the worker
+                # to address changes it had never been shown.
+                ask = parse_required_changes(jr.output)
+                if ask:
+                    asks.append(f"From the {lens} judge ({name}):\n{ask}")
 
             overall = combine(verdicts, revise_count=revise, security_block=sec,
                               revise_cap=max_revise)
+            # A BLOCK the judge calls an architectural dead-end is worth one
+            # fresh attempt before a human is paged. decide_restart holds the
+            # rules — including that a security block is never restartable.
+            overall = decide_restart(
+                combine_result=overall,
+                revise_count=revise,
+                restart_count=restarts,
+                wrong_design=wrong_design,
+                block_vote=block_vote,
+                security_block=sec,
+                tier=tier,
+            )
             history.append(overall.value)
 
             if overall is Verdict.PASS:
                 break
+            if overall is Verdict.RESTART:
+                # Discard the branch and re-dispatch against the same issue. The
+                # revise budget resets; the restart budget does not.
+                restarts += 1
+                revise = 0
+                required = None
+                workspace.reset()
+                source.comment(
+                    issue.id,
+                    f"Judge called the approach wrong; discarding the branch and "
+                    f"restarting once (restart {restarts}/{RESTART_CAP}).")
+                continue
             if overall is Verdict.BLOCK:
                 source.add_labels(issue.id, ["blocked"])
+                detail = ("\n\n" + "\n\n".join(asks)) if asks else ""
                 source.comment(issue.id,
-                               f"Judge BLOCK after {revise} revision(s); escalating to a human.")
+                               f"Judge BLOCK after {revise} revision(s) and {restarts} "
+                               f"restart(s); escalating to a human.{detail}")
                 return BuildOutcome(issue.id, BuildStatus.BLOCKED, tier=tier,
                                     reason="judge blocked", revisions=revise,
                                     cost_usd=spent['total'], unmetered_runs=unmetered['n'],
                             judge_history=history)
-            # REVISE → loop with the judge's asks
-            required = "Address the judge's required_changes from the previous review."
+            # REVISE → loop with the judge's actual asks, verbatim.
+            required = "\n\n".join(asks) if asks else (
+                "The judge asked for changes but did not list them. Re-read the "
+                "issue's expected outcome and address the most likely gap.")
             revise += 1
+
+        # Contracts-before-code, when the project asks for it. The doctrine
+        # treats the contract as the thing the work is measured against, so a
+        # branch that implements first and back-fills the contract afterwards has
+        # written its own acceptance criteria. The checker is pure; the git read
+        # is the only I/O, and a failure to read is not a pass.
+        if require_contract:
+            from software_factory.core.contracts.git_check import (
+                commits_from_git,
+                contract_precedes_implementation,
+            )
+            try:
+                commits = commits_from_git(str(workspace.path), dev_branch)
+                ok_contract, why = contract_precedes_implementation(
+                    commits, int(issue.id), contracts_dir=contracts_dir)
+            except Exception as e:               # fail closed: see below
+                ok_contract, why = False, f"could not read commit order: {e}"
+            if not ok_contract:
+                source.add_labels(issue.id, ["blocked"])
+                source.comment(issue.id, f"Contract gate: {why}")
+                return BuildOutcome(issue.id, BuildStatus.BLOCKED, tier=tier,
+                                    reason=f"contract gate: {why}", revisions=revise,
+                                    cost_usd=spent['total'], unmetered_runs=unmetered['n'],
+                                    judge_history=history)
 
         # PASS (or T0) → ship: commit, push, open the PR. Ceiling re-checked.
         assert_within_ceiling(pr_base=dev_branch, action="open_pr", **_ceiling_kw)

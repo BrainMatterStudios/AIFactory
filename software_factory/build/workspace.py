@@ -44,6 +44,14 @@ class Workspace(Protocol):
     def push(self) -> str:
         """Push the branch; return the head ref. MUST NOT merge."""
 
+    def reset(self) -> None:
+        """Discard everything this build did and return to the base.
+
+        Used by the RESTART verdict: the judge called the approach an
+        architectural dead-end, so a second worker starts from a clean tree
+        rather than trying to edit its way out of the first one's design.
+        """
+
     def preserve(self, message: str = "wip: factory build stopped here") -> str | None:
         """Snapshot uncommitted work somewhere recoverable but NOT pushable.
 
@@ -163,6 +171,29 @@ class GitWorktree:
             f"worktree at {self.path} is on branch {on!r}, not {self.branch!r} — "
             "refusing to build: the loop must never write to a branch it does not own"
         )
+
+    def reset(self) -> None:
+        """Hard-reset the branch to the base and remove untracked files.
+
+        Deliberately destructive, and only ever called on a factory-owned branch
+        in a factory-owned worktree: a RESTART exists to throw the work away. The
+        base is re-resolved to a SHA first for the same reason `create()` does it
+        — a bare branch name lets git pick something you did not mean.
+        """
+        r = self._git("rev-parse", "--verify", "--quiet", f"{self.base}^{{commit}}")
+        base_sha = r.stdout.strip()
+        if r.returncode != 0 or not base_sha:
+            raise RuntimeError(
+                f"cannot resolve base {self.base!r} to reset the workspace; "
+                "refusing to discard work against an unknown base"
+            )
+        self._assert_on_branch()
+        hard = self._git("reset", "--hard", base_sha, cwd=self.path)
+        if hard.returncode != 0:
+            raise RuntimeError(f"reset failed: {hard.stderr.strip()}")
+        # -x as well as -d: a build's own artefacts are frequently gitignored,
+        # and leaving them behind is how a "fresh" attempt inherits stale state.
+        self._git("clean", "-xdff", cwd=self.path)
 
     def _reanchor(self) -> None:
         """Make sure a reused worktree is not building against stale code.

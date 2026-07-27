@@ -14,6 +14,14 @@ from software_factory.core.orchestrate import Verdict
 
 _VERDICT_RE = re.compile(r"verdict\s*[:=]\s*(PASS|REVISE|BLOCK)", re.IGNORECASE)
 _SECBLOCK_RE = re.compile(r"security_block\s*[:=]\s*(true|false|yes|no)", re.IGNORECASE)
+_WRONGDESIGN_RE = re.compile(r"wrong_design\s*[:=]\s*(true|false|yes|no)", re.IGNORECASE)
+# required_changes runs to the next top-level key or the end of the reply. The
+# judge is asked for a list, so keep the text verbatim rather than normalising:
+# the worker reads it, not a parser.
+_REQUIRED_RE = re.compile(
+    r"required_changes\s*[:=]\s*(.*?)(?=\n\s*(?:verdict|security_block|wrong_design)\s*[:=]|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def implementer_brief(issue: Issue, *, required_changes: str | None = None) -> str:
@@ -39,7 +47,10 @@ def judge_brief(issue: Issue, *, lens: str = "general") -> str:
         "simplicity) and reply with:\n"
         "  verdict: PASS|REVISE|BLOCK\n"
         "  security_block: true|false\n"
-        "  required_changes: <list, if REVISE>\n"
+        "  wrong_design: true|false   (BLOCK only: is the approach itself wrong,\n"
+        "                              such that a fresh attempt would do better?)\n"
+        "  required_changes: <list, if REVISE or BLOCK — be specific and actionable;\n"
+        "                     the next worker sees this text and nothing else>\n"
         f"\nIssue: {issue.title}\n{issue.body}"
     )
 
@@ -66,3 +77,27 @@ def parse_verdict(text: str) -> tuple[Verdict, bool]:
     if sm:
         sec = sm.group(1).lower() in ("true", "yes")
     return verdict, sec
+
+
+def parse_required_changes(text: str) -> str | None:
+    """The judge's `required_changes` block, verbatim, or None.
+
+    Split from `parse_verdict` rather than folded into it because the verdict is
+    a gate and this is a message: a missing verdict must raise, a missing list
+    must not. The build loop used to discard this entirely and tell the next
+    worker to "address the judge's required_changes" — instructions the worker
+    had never been shown.
+    """
+    m = _REQUIRED_RE.search(text or "")
+    if not m:
+        return None
+    body = m.group(1).strip()
+    return body or None
+
+
+def parse_wrong_design(text: str) -> bool:
+    """Whether the judge called the approach itself wrong. Feeds `decide_restart`:
+    a wrong-design BLOCK is the recoverable kind, worth one fresh attempt before
+    escalating to a human."""
+    m = _WRONGDESIGN_RE.search(text or "")
+    return bool(m) and m.group(1).lower() in ("true", "yes")
