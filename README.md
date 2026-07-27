@@ -31,7 +31,7 @@ another, Postgres or Snowflake, Slack or Telegram. Adopting it is configuration
 and adapters, not a rewrite. The core has zero hard dependencies and ships a
 complete offline adapter set, so the whole loop runs in your tests and your CI.
 
-**Status:** 384 tests, CI on Python 3.10–3.13, Apache-2.0. The observe→diagnose→
+**Status:** 387 tests, CI on Python 3.10–3.13, Apache-2.0. The observe→diagnose→
 queue→verify loop and the deterministic gate helpers are generalized from a
 factory that has run nightly against a production system — including six weeks
 when that schedule silently stopped and nobody noticed, which is why
@@ -165,9 +165,9 @@ plan-approval before any code.
 ## Develop the factory itself (contributors)
 
 ```bash
-git clone https://github.com/BrainMatterStudios/AIFactory && cd software-factory
+git clone https://github.com/BrainMatterStudios/AIFactory && cd AIFactory
 pip install -e ".[dev]"          # core has zero hard deps; this adds pytest + ruff + yaml
-python -m pytest -q              # 384 passing — deterministic core + full offline loop
+python -m pytest -q              # 387 passing — deterministic core + full offline loop
 ./scripts/ci-local.sh            # every CI job, with CI's pinned toolchain
 ```
 
@@ -182,9 +182,8 @@ Observe(🤖) → Diagnose(🤖) → Queue(🤖) → Triage(🧑) → Fix+PR(�
 ```
 
 The autonomy ceiling holds **by construction and by check**: the loop exposes no
-merge/deploy capability (the Source adapter has no `merge`; the permission
-allowlist omits it), and `core.governance.assert_within_ceiling` refuses any
-action that targets a prod ref. A complex feature (tier **T2**) additionally halts
+merge/deploy capability (the Source adapter has no `merge`), and
+`core.governance.assert_within_ceiling` refuses any action that targets a prod ref. A complex feature (tier **T2**) additionally halts
 after planning for human approval. Nothing the loop can do reaches production.
 
 ## Extending it
