@@ -263,7 +263,7 @@ def cmd_doctor(args) -> int:
     src_opts = cfg.adapters["source"].options if "source" in cfg.adapters else {}
     repo = src_opts.get("repo")
     if repo in PLACEHOLDER_REPOS:
-        print(f"  source    : NOT CONFIGURED — repo is still the scaffold placeholder "
+        print(f"  repo      : NOT CONFIGURED — still the scaffold placeholder "
               f"{repo!r}; set it to your own repository before running any loop")
         ok = False
 
