@@ -15,6 +15,12 @@ on:
 permissions:
   contents: read
 
+# Actions are pinned to a commit SHA, not a tag. A tag is a mutable pointer in
+# somebody else's repository, and the same argument this file already makes about
+# the linter applies with more force here: an action that can change under us
+# turns "CI is green" into a statement about what upstream shipped this week. The
+# trailing comment is the human-readable version; the SHA is what runs.
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -23,8 +29,8 @@ jobs:
       matrix:
         python-version: ["3.10", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1    # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install
@@ -35,8 +41,8 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1    # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
       # Pinned deliberately: an unpinned linter turns "CI is green" into a
@@ -49,8 +55,8 @@ jobs:
     # If these fail, the frontier floor has been edited away.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1    # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
@@ -64,8 +70,8 @@ jobs:
     # run the deterministic core in an environment with nothing else installed.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1    # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
       - run: pip install .
