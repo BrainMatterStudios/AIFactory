@@ -17,6 +17,7 @@ Pure-ish (env + filesystem reads); no third-party deps.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -56,8 +57,20 @@ def kill_requested(
     for rel in halt_files:
         p = Path(rel)
         path = p if p.is_absolute() else base / p
-        if path.exists():
+        try:
+            os.stat(path)
             return f"{rel} present"
+        except FileNotFoundError:
+            continue                      # genuinely not there
+        except NotADirectoryError:
+            continue                      # a parent is a file; the halt file cannot exist
+        except OSError as e:
+            # NOT `Path.exists()`: it catches OSError internally and answers
+            # False, so a halt file under an unreadable directory, on a failing
+            # mount, or behind a dangling symlink reported "clear" — and wrapping
+            # it in a try/except does nothing, because it never raises. A stop
+            # control that cannot read its own input must not answer "permitted".
+            return f"{rel} could not be checked ({e}) — refusing to run"
     return None
 
 
@@ -74,12 +87,21 @@ def resolve_repo_root(cfg=None, explicit: str | None = None) -> Path:
     lock — two invocations from different directories would otherwise take
     *different* lock files, both succeed, and then collide on the same git branch.
     """
+    root = None
     if explicit:
-        return Path(explicit).resolve()
-    src = getattr(cfg, "source_path", None)
-    if src:
-        return Path(src).resolve().parent
-    return Path.cwd()
+        root = Path(explicit).resolve()
+    else:
+        src = getattr(cfg, "source_path", None)
+        root = Path(src).resolve().parent if src else Path.cwd()
+    # A root that does not exist anchors every safety control to nothing: the
+    # halt file is looked for under it and never found, and `kill_requested`
+    # cheerfully reports "clear" for a switch it never looked at. A typo in
+    # `--repo` should be an error, not a silently disarmed kill switch.
+    if not root.is_dir():
+        raise FactoryHalted(
+            f"repo root {root} does not exist or is not a directory; safety "
+            "controls (the halt file, the run lock) would anchor to nothing")
+    return root
 
 
 def assert_live(
@@ -232,6 +254,15 @@ class BudgetGuard:
         Use `would_exceed(0.0)` before spawning to avoid the turn in the first
         place; this raise is the backstop for the turn already taken.
         """
+        # `NaN < 0` is False, so the only validation here used to admit NaN —
+        # and NaN poisons everything downstream: `nan + x` is nan, every
+        # comparison against it is False, so both caps became permanent no-ops.
+        # It was then written to the ledger, where `json` emits and re-reads a
+        # bare `NaN`, so the poisoning survived the process and disabled the cap
+        # for every future run of that project. A runner reporting a non-finite
+        # cost is a broken runner; refuse the number rather than absorb it.
+        if not math.isfinite(amount):
+            raise ValueError(f"charge amount must be a finite number, got {amount!r}")
         if amount < 0:
             raise ValueError("charge amount must be >= 0")
         self._task_spent += amount

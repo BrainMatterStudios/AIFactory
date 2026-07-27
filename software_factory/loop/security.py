@@ -45,9 +45,37 @@ DEFAULT_SECRET_PATTERNS: tuple[str, ...] = (
     r"\b(?:sk-ant-|sk-or-v1-|gsk_|sk-)[A-Za-z0-9-]{20,}",      # common LLM-provider keys
     r"eyJ[A-Za-z0-9\-_=]+\.[A-Za-z0-9\-_=]+\.[A-Za-z0-9\-_=]+",  # JWT
     r"\b\w+(?:ql)?://[^\s:/]+:[^\s@]+@",                       # any DSN carrying a password
-    # a hardcoded credential literal: keyword = "value", not an env/interpolation ref
-    r"""(?i)\b(?:password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)\b"""
-    r"""\s*[:=]\s*['"][^'"\s${}]{8,}['"]""",
+    r"\bsk_live_[A-Za-z0-9]{16,}",                             # Stripe live key
+    r"\bAIza[A-Za-z0-9_\-]{30,}",                              # Google API key
+    r"\bSG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}",         # SendGrid
+    r"\bnpm_[A-Za-z0-9]{30,}",                                 # npm token
+    r"\bgithub_pat_[A-Za-z0-9_]{20,}",                         # GitHub fine-grained PAT
+    # A hardcoded credential literal. Three properties, each of which cost a
+    # review round:
+    #
+    #   * the keyword may be EMBEDDED in a longer identifier — `STRIPE_SECRET_KEY`,
+    #     `DATABASE_PASSWORD`, `db_password`. Wrapping it in `\b…\b` matched only
+    #     a keyword standing entirely alone, which is almost no real credential.
+    #   * the surrounding runs are BOUNDED and the left edge is a fixed boundary
+    #     rather than a wildcard. An unbounded `[a-z0-9_\-]*` before an
+    #     alternation is quadratic: every position in a long hyphenated token is a
+    #     start candidate that backtracks through the whole alternation. A 16 KB
+    #     base64url asset took 3.7s, and this runs inside the run lock on content
+    #     up to MAX_PUSH_SCAN_BYTES.
+    #   * the value must be QUOTED. Dropping that requirement to catch dotenv
+    #     lines flagged `API_KEY=your_api_key_here`, `db_password = var.db_password`,
+    #     `std::env::var("API_KEY")` and this repo's own runbooks — and a gate that
+    #     blocks ordinary builds is a gate that gets switched off.
+    r"""(?i)(?:^|[^A-Za-z0-9_\-])[A-Za-z0-9_\-]{0,40}?"""
+    r"""(?:password|passwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token|access[_-]?token)"""
+    r"""[A-Za-z0-9_\-]{0,40}["']?[^\S\n]*[:=]{1,2}>?[^\S\n]*"""
+    # …to a quoted literal that is not an obvious placeholder. Placeholders are
+    # what documentation, .env.example files and test fixtures are full of.
+    r"""["'`](?!(?:[^"'`]*(?:replace|changeme|change_me|example|placeholder|redacted"""
+    r"""|your[_-]|my[_-]|xxx|todo|dummy|sample|insert[_-]|<[^>]*>))?["'`])"""
+    r"""(?![^"'`]*(?:replace|changeme|change_me|placeholder|redacted|your[_-]|xxx"""
+    r"""|todo|dummy|sample|insert[_-]))"""
+    r"""[^\s'"`${}<>()\[\],;]{8,}["'`]""",
 )
 
 # Never scanned: binary, vendored, generated, and the baseline itself.
@@ -56,6 +84,14 @@ SKIP_EXTENSIONS = frozenset({
     ".woff", ".woff2", ".ttf", ".eot", ".pyc", ".so", ".dylib", ".dll", ".lock", ".map",
 })
 MAX_SCAN_BYTES = 1_000_000
+#: Per-file budget for the BUILD gate, which sees only one branch's diff — as
+#: opposed to MAX_SCAN_BYTES, the budget for the nightly posture scan that walks
+#: every tracked file in the repo. The two jobs have very different shapes and
+#: the build gate was inheriting the wrong one: at 1 MB an ordinary 1.6 MB PNG
+#: was refused, and a gate that makes normal builds unbuildable gets switched
+#: off. Scanning is cheap and refusing is not, so the build gate scans anything
+#: it plausibly can and refuses only what it genuinely cannot.
+MAX_PUSH_SCAN_BYTES = 50_000_000
 
 
 # --------------------------------------------------------------------------- #

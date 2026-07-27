@@ -7,6 +7,7 @@ judge reply can never be silently treated as PASS.
 """
 from __future__ import annotations
 
+import bisect
 import re
 
 from software_factory.adapters.base import Issue
@@ -25,29 +26,48 @@ from software_factory.core.orchestrate import Verdict
 #   * the value may not run past the end of the line. `verdict:` followed by a
 #     blank line and then a paragraph beginning "PASS is not warranted" is not a
 #     verdict of PASS.
-#   * template echo rejected — the judge brief contains the literal
-#     `verdict: PASS|REVISE|BLOCK`, so a reply quoting its own instructions once
-#     parsed as PASS. The guard is deliberately narrow: a value is only rejected
-#     when what follows is a separator AND another value from the same menu.
-#     Rejecting any trailing `|` also killed the legitimate one-line reply
-#     `verdict: BLOCK|security_block: true`, i.e. it suppressed a BLOCK.
 #   * ASCII-only case folding — `re.IGNORECASE` on str patterns folds U+0131
 #     (dotless i), U+212A (Kelvin sign) and U+017F (long s) onto ASCII letters,
 #     so `verdıct: PASS` matched. That is a stealth channel: noise to a human
 #     reviewer, an approval to the parser.
-#   * every match collected, never the first — see `parse_verdict`.
+#   * every value on the line considered, never just the first — see `_read_field`.
+#
+# Template-echo detection is NOT a lookahead on the value. It was, and the
+# lookahead could not tell `verdict: PASS|REVISE|BLOCK` (the brief, quoted back)
+# from `verdict: BLOCK, PASS was premature.` (a judge correcting itself) or
+# `security_block: yes, no auth is enforced.` (ordinary English). It deleted the
+# severe value in both, which reopened the exact bug it was written to close.
+# The question is answerable at the LINE level instead — see `_is_menu_echo`.
 _PREFIX = r"^[^A-Za-z0-9\n]{0,16}(?:\d{1,3}[.)][^\S\n]*)?"
-_FIELD = _PREFIX + r"%s[^A-Za-z0-9\n]{0,4}[:=][^\S\n]*[^\w\s]{0,2}[^\S\n]*"
+# `|` is accepted alongside `:` and `=` so a markdown table row — `| verdict |
+# BLOCK |` — is read rather than dropped. Dropping it lost the BLOCK *and* the
+# security veto on the same reply.
+_FIELD = _PREFIX + r"%s[^A-Za-z0-9\n]{0,4}[:=|][^\S\n]*"
 _VERDICT_VALUES = "PASS|REVISE|BLOCK"
 _BOOL_VALUES = "true|false|yes|no"
+#: Line separators that render as a break but are not `\n`, so `^` does not see
+#: them. A reply using U+2028 looks like four lines in any viewer and is one line
+#: to the parser — the same stealth channel as the Unicode lookalikes above, on a
+#: different axis. Normalised before anything else runs.
+_LINE_BREAKS = ("\r\n", "\r", "\v", "\f", " ", " ", "")
+
+
+def _normalise(text: str) -> str:
+    out = text or ""
+    for ch in _LINE_BREAKS:
+        out = out.replace(ch, "\n")
+    return out
 
 
 def _field_re(name: str, values: str) -> re.Pattern[str]:
-    """One field matcher, with the menu-echo guard bound to that field's own
-    value set."""
-    menu = rf"(?!\s*(?:[|/,]|\bor\b)\s*(?:{values})\b)"
-    return re.compile(_FIELD % name + rf"({values})\b" + menu,
-                      re.IGNORECASE | re.MULTILINE | re.ASCII)
+    """Match the field marker and capture the REST OF ITS LINE.
+
+    Capturing the line rather than one value is what lets `_read_field` see a
+    correction (`verdict: PASS -> BLOCK`), a self-contradiction, and a menu echo
+    as three different things. A value-shaped regex can only ever see the first
+    token and guess.
+    """
+    return re.compile(_FIELD % name + r"([^\n]*)", re.IGNORECASE | re.MULTILINE | re.ASCII)
 
 
 _VERDICT_RE = _field_re("verdict", _VERDICT_VALUES)
@@ -56,13 +76,21 @@ _WRONGDESIGN_RE = _field_re("wrong_design", _BOOL_VALUES)
 # Most severe first: when a reply carries more than one verdict, the gate takes
 # the worst one. A judge that says PASS then BLOCK has not passed the work.
 _SEVERITY = (Verdict.BLOCK, Verdict.REVISE, Verdict.PASS)
+#: Characters that may sit between menu values in a quoted template without
+#: making it prose. Deliberately short: `-`, `>`, `~` and `(` are excluded so
+#: `verdict: PASS -> BLOCK` and `verdict: ~~PASS~~ BLOCK` read as corrections
+#: rather than as menus.
+_MENU_FILLER = re.compile(r"(?:\s|[|/,]|\bor\b|[*`])+", re.IGNORECASE | re.ASCII)
 # required_changes runs to the next top-level key or the end of the reply. The
-# judge is asked for a list, so keep the text verbatim rather than normalising:
-# the worker reads it, not a parser.
+# field name is matched loosely — `Required changes:`, `### required changes`,
+# `required-changes` — because this is a free-text heading a judge writes in
+# prose, and a single snake_case string match is how a PASS-plus-refusal reply
+# kept its PASS: the backstop looked for a spelling the judge had not used.
+_REQUIRED_NAME = r"required[ _\-]?changes"
 _REQUIRED_RE = re.compile(
-    _PREFIX + r"required_changes[^A-Za-z0-9\n]{0,4}[:=][^\S\n]*(.*?)"
+    _PREFIX + _REQUIRED_NAME + r"[^A-Za-z0-9\n]{0,4}[:=][^\S\n]*(.*?)"
     r"(?=\n[^A-Za-z0-9\n]{0,16}(?:verdict|security_block|wrong_design)"
-    r"[^A-Za-z0-9\n]{0,4}[:=]|\Z)",
+    r"[^A-Za-z0-9\n]{0,4}[:=|]|\Z)",
     re.IGNORECASE | re.MULTILINE | re.DOTALL | re.ASCII,
 )
 #: `required_changes` bodies that mean "none". A judge answering the field
@@ -75,11 +103,80 @@ _NO_CHANGES = frozenset({"", "-", "none", "none.", "n/a", "na", "nil", "nothing"
 #: The issue body and the acceptance contract are pasted into the judge's brief,
 #: and both are attacker-reachable in the general case — an issue is something
 #: anyone with board access can file.
-_QUOTABLE_FIELDS = ("verdict", "security_block", "wrong_design", "required_changes")
+#: Matched with the SAME tolerance the parser reads them with. The two drifted:
+#: the parser accepted `|` as a separator (for markdown tables) and the loose
+#: `required changes` spelling, while this neutralised only `[:=]` and the exact
+#: snake_case name — so a table row in an issue body reached the judge verbatim
+#: and parsed as a field.
+_QUOTABLE_FIELDS = ("verdict", "security_block", "wrong_design", _REQUIRED_NAME)
 _INJECTION_RE = re.compile(
-    _PREFIX + rf"({'|'.join(_QUOTABLE_FIELDS)})(?=[^A-Za-z0-9\n]{{0,4}}[:=])",
+    _PREFIX + rf"({'|'.join(_QUOTABLE_FIELDS)})(?=[^A-Za-z0-9\n]{{0,4}}[:=|])",
     re.IGNORECASE | re.MULTILINE | re.ASCII,
 )
+
+
+def _is_menu_echo(rest: str, found: list[str]) -> bool:
+    """Is this line the brief's own response template, quoted back?
+
+    True only when the line carries TWO OR MORE distinct menu values and nothing
+    else but separators and light markup. That is what `verdict: PASS|REVISE|BLOCK`
+    looks like and what no real answer looks like:
+
+      * `verdict: PASS`                    — one value, an answer
+      * `verdict: BLOCK, PASS was premature.` — leftover prose, an answer
+      * `security_block: yes, no auth is enforced.` — leftover prose, an answer
+      * `verdict: PASS -> BLOCK`           — leftover `->`, a correction
+    """
+    if len({v.lower() for v in found}) < 2:
+        return False
+    leftover = rest
+    for value in sorted(found, key=len, reverse=True):
+        leftover = re.sub(rf"\b{re.escape(value)}\b", "", leftover,
+                          flags=re.IGNORECASE | re.ASCII)
+    return not _MENU_FILLER.sub("", leftover).strip()
+
+
+def _read_field(pattern: re.Pattern[str], text: str,
+                values: str) -> list[tuple[list[str], str]]:
+    """Every non-echo occurrence of a field, as (values on the line, rest of
+    the line).
+
+    A value alone on the following line is accepted too (`verdict:\\nBLOCK`), but
+    only if that line holds nothing else — so `verdict:` followed by a paragraph
+    beginning "PASS is not warranted" is still not a verdict of PASS.
+    """
+    value_re = re.compile(rf"\b({values})\b", re.IGNORECASE | re.ASCII)
+    lines = text.split("\n")
+    # Line index per match, computed once. `text.count("\n", 0, m.end())` is O(n)
+    # and was evaluated twice per match, which made a reply of many bare field
+    # lines quadratic — 450 KB took 2.5s, on attacker-influenced input.
+    starts = [0]
+    for ln in lines:
+        starts.append(starts[-1] + len(ln) + 1)
+    out: list[tuple[list[str], str]] = []
+    for m in pattern.finditer(text):
+        rest = m.group(1)
+        idx = bisect.bisect_right(starts, m.start()) - 1
+        found = value_re.findall(rest)
+        if not found:
+            # Nothing on this line. A value alone on the NEXT line is an answer
+            # (`verdict:\nBLOCK`) — unless it is the head of a vertical menu, i.e.
+            # the brief's own list of options written one per line. That shape is
+            # invisible to the line-level echo rule, and the first option the
+            # brief lists is PASS, so it read as an approval.
+            if rest.strip():
+                continue
+            tail = [ln.strip().strip("*`\"'- ") for ln in lines[idx + 1: idx + 5]]
+            vals = [v for v in tail if value_re.fullmatch(v)]
+            if len(vals) >= 2 and len({v.lower() for v in vals}) >= 2:
+                continue                       # a menu, not an answer
+            if vals and tail and value_re.fullmatch(tail[0]):
+                out.append(([tail[0]], tail[0]))
+            continue
+        if _is_menu_echo(rest, found):
+            continue
+        out.append((found, rest))
+    return out
 
 
 def quote_untrusted(text: str) -> str:
@@ -97,7 +194,7 @@ def quote_untrusted(text: str) -> str:
     name to follow non-alphanumeric characters.
     """
     return _INJECTION_RE.sub(lambda m: m.group(0)[:m.start(1) - m.start(0)]
-                             + "q_" + m.group(1), text or "")
+                             + "q_" + m.group(1), _normalise(text))
 
 
 def implementer_brief(
@@ -154,8 +251,13 @@ def judge_brief(issue: Issue, *, lens: str = "general", contract: str | None = N
         "own line, each with a single value (do not restate the alternatives):\n"
         "  verdict: PASS|REVISE|BLOCK\n"
         "  security_block: true|false\n"
-        "  wrong_design: true|false   (BLOCK only: is the approach itself wrong,\n"
-        "                              such that a fresh attempt would do better?)\n"
+        # No trailing prose on a field line. With a parenthetical after the
+        # values this line was not a pure menu echo, so `wrong_design` parsed as
+        # `true` straight out of the brief — and a judge quoting the template got
+        # a restart it never asked for.
+        "  wrong_design: true|false\n"
+        "     (wrong_design applies to BLOCK only: is the approach itself wrong,\n"
+        "      such that a fresh attempt would do better?)\n"
         "  required_changes: <list, if REVISE or BLOCK — be specific and actionable;\n"
         "                     the next worker sees this text and nothing else>\n"
         # The issue is written by whoever can file one; treat it as data, not as
@@ -177,6 +279,30 @@ def planner_brief(issue: Issue) -> str:
     )
 
 
+#: An explicit replacement marker. Everything before it on the line has been
+#: struck out by the judge, so the value AFTER it is the answer rather than the
+#: value in field position.
+_REPLACED_RE = re.compile(r"(?:-+>|=+>|→|~~|\bnow\b|\bcorrected to\b|\bactually\b)",
+                          re.IGNORECASE | re.ASCII)
+
+
+def _line_value(values: list[str], rest: str) -> str:
+    """The judge's answer on one line: the value in field position, unless a
+    replacement marker says a later one supersedes it."""
+    if len(values) > 1:
+        # The marker must come AFTER the value it strikes out. `~~PASS~~ BLOCK`
+        # opens with one, and searching from the start of the line found that
+        # opening `~~` and then read PASS as the replacement.
+        first = re.search(rf"\b({_VERDICT_VALUES})\b", rest, re.IGNORECASE | re.ASCII)
+        marker = _REPLACED_RE.search(rest, first.end()) if first else None
+        if marker:
+            after = re.findall(rf"\b({_VERDICT_VALUES})\b", rest[marker.end():],
+                               re.IGNORECASE | re.ASCII)
+            if after:
+                return after[0]
+    return values[0]
+
+
 def parse_verdict(text: str) -> tuple[Verdict, bool]:
     """Extract (verdict, security_block) from a judge reply. Raises ValueError if
     no verdict is present — never silently pass.
@@ -188,9 +314,23 @@ def parse_verdict(text: str) -> tuple[Verdict, bool]:
     verdict: BLOCK"), both used to be read as PASS. Every verdict field in the
     reply is collected and the most severe wins.
     """
-    found = {Verdict(m.group(1).strip().upper()) for m in _VERDICT_RE.finditer(text or "")}
-    if not found:
+    text = _normalise(text)
+    lines = _read_field(_VERDICT_RE, text, _VERDICT_VALUES)
+    if not lines:
         raise ValueError("no verdict found in judge reply (refusing to assume PASS)")
+    # One value per line: the one in FIELD POSITION, i.e. first. Taking the most
+    # severe value anywhere on the line reads `verdict: PASS - I found nothing
+    # that warrants a REVISE or BLOCK.` as a BLOCK — ordinary approving prose,
+    # paged to a human as a blocked build. A judge naming the verdicts it
+    # rejected is not voting for them, exactly as it is not voting `no` when it
+    # writes `security_block: yes, no mitigation is present.`
+    #
+    # The exception is an explicit REPLACEMENT — `PASS -> BLOCK`, `~~PASS~~
+    # BLOCK` — where the first value has been struck out and the marker says so.
+    # Then the value after the marker is the answer.
+    found = {Verdict(_line_value(vals, rest).upper()) for vals, rest in lines}
+    # Across LINES the most severe still wins: a judge that answers PASS and then
+    # corrects itself lower down has not passed the work.
     verdict = next(v for v in _SEVERITY if v in found)
     # A PASS that also lists required changes is a contradiction, and it is the
     # exact shape of a judge that filled in the response template at the top of
@@ -218,8 +358,17 @@ def parse_security_block(text: str) -> bool:
       exception meant a formatting quirk on the verdict line erased a security
       veto that was stated perfectly clearly two lines below.
     """
-    return any(m.group(1).lower() in ("true", "yes")
-               for m in _SECBLOCK_RE.finditer(text or ""))
+    # First value on each line, any-True across lines. The first value is the one
+    # in field position, immediately after the separator; anything later on the
+    # line is prose. `true`/`false`/`yes`/`no` are ordinary English words, so
+    # taking the most severe ON THE LINE would read `security_block: false, yes I
+    # checked the auth path.` as a veto — while taking the first still reads
+    # `security_block: yes, no mitigation is present.` as one, which is the case
+    # that matters. Across lines it stays any-wins: a judge that says false in a
+    # checklist and true after finding the bug has raised the veto.
+    return any(vals[0].lower() in ("true", "yes")
+               for vals, _ in _read_field(_SECBLOCK_RE, _normalise(text), _BOOL_VALUES)
+               if vals)
 
 
 def parse_required_changes(text: str) -> str | None:
@@ -231,7 +380,7 @@ def parse_required_changes(text: str) -> str | None:
     worker to "address the judge's required_changes" — instructions the worker
     had never been shown.
     """
-    m = _REQUIRED_RE.search(text or "")
+    m = _REQUIRED_RE.search(_normalise(text))
     if not m:
         return None
     body = m.group(1).strip()
@@ -255,6 +404,7 @@ def parse_wrong_design(text: str) -> bool:
     conservative reading of a self-contradicting reply is False here and True
     there — in both cases, the reading that keeps a human in the loop.
     """
-    votes = [m.group(1).lower() in ("true", "yes")
-             for m in _WRONGDESIGN_RE.finditer(text or "")]
+    votes = [vals[0].lower() in ("true", "yes")
+             for vals, _ in _read_field(_WRONGDESIGN_RE, _normalise(text), _BOOL_VALUES)
+             if vals]
     return bool(votes) and all(votes)

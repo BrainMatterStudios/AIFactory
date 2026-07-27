@@ -190,7 +190,11 @@ def test_a_run_that_writes_nothing_after_a_stop_does_not_ship_the_old_work(tmp_p
 
     outcome, _ = _build(repo, "true", {})          # the agent writes nothing
     assert outcome.status is BuildStatus.BLOCKED
-    assert "no file changes" in outcome.reason
+    # Caught by the produced-anything check rather than by NothingToCommit. The
+    # distinction matters: NothingToCommit only fires when the *index* is empty,
+    # so it missed the same failure when the previous agent had committed its own
+    # work. This check compares against where the run started, and catches both.
+    assert "previous attempt" in outcome.reason
     assert not _remote_contains(bare, "failed the gate")
 
 

@@ -15,6 +15,8 @@ It opens a PR; it never merges, deploys, or writes prod.
 """
 from __future__ import annotations
 
+import math
+import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -252,7 +254,7 @@ def _scannable_blobs(workspace) -> tuple[list[tuple[str, bytes]], list[str], str
     import subprocess
     from pathlib import Path
 
-    from software_factory.loop.security import MAX_SCAN_BYTES
+    from software_factory.loop.security import MAX_PUSH_SCAN_BYTES
 
     root = getattr(workspace, "path", None)
     if not root:
@@ -298,19 +300,25 @@ def _scannable_blobs(workspace) -> tuple[list[tuple[str, bytes]], list[str], str
                 if oid in seen or oid not in sizes:
                     continue
                 seen.add(oid)
+                # Size FIRST, before the blob is read. Reading a multi-GB blob to
+                # find out it is too big raises MemoryError, which is neither
+                # OSError nor SubprocessError, so it escaped every handler and
+                # crashed the build instead of blocking it.
+                if sizes[oid] > MAX_PUSH_SCAN_BYTES:
+                    return [], skipped, (
+                        f"{path} is {sizes[oid]} bytes, over the "
+                        f"{MAX_PUSH_SCAN_BYTES}-byte scan limit — refusing to push content "
+                        "that was never inspected. Raise the limit or remove the file")
                 content = git("cat-file", "blob", oid, text=False)
                 if content.returncode != 0:
                     return [], [], f"could not read blob {oid[:8]} ({path})"
-                blob = content.stdout
-                if b"\x00" in blob[:8192]:
-                    skipped.append(f"{path} (binary)")
-                    continue
-                if sizes[oid] > MAX_SCAN_BYTES:
-                    return [], skipped, (
-                        f"{path} is {sizes[oid]} bytes of text, over the "
-                        f"{MAX_SCAN_BYTES}-byte scan limit — refusing to push content "
-                        "that was never inspected. Raise the limit or remove the file")
-                out.append((path, blob))
+                # Binary content is NOT skipped. git pushes those bytes either
+                # way, and a NUL sniff was a free bypass: one leading NUL byte
+                # turned any file into "binary", and the skip was silent — the
+                # caller got the same tuple a clean scan produces. `_decodings`
+                # strips NULs and tries UTF-16, so a key in a PowerShell or
+                # UTF-16 file is read rather than waved through.
+                out.append((path, content.stdout))
     except (OSError, subprocess.SubprocessError) as e:
         return [], [], f"could not read the commit range: {e}"
 
@@ -325,20 +333,28 @@ def _scannable_blobs(workspace) -> tuple[list[tuple[str, bytes]], list[str], str
 
     for rel in changed:
         path = Path(root, rel)
+        if path.is_symlink():
+            # git stores the TARGET PATH as the blob, not the target's contents.
+            # Following the link was wrong twice over: a dangling link read as a
+            # deletion and shipped unscanned, a live one made the gate read a
+            # file outside the repo, and a link to /dev/zero or a FIFO read
+            # forever — `stat` reports size 0, so the size guard passed. Scan
+            # what git will actually push: the path string.
+            try:
+                out.append((rel, os.readlink(path).encode("utf-8", errors="replace")))
+            except OSError as e:
+                return [], skipped, f"could not read the symlink {rel}: {e}"
+            continue
         if not path.exists():
             continue                  # deleted on the branch: contributes no blob
         try:
             size = path.stat().st_size
+            if size > MAX_PUSH_SCAN_BYTES:
+                return [], skipped, (
+                    f"{rel} is {size} bytes, over the {MAX_PUSH_SCAN_BYTES}-byte "
+                    "scan limit — refusing to push content that was never inspected")
             with open(path, "rb") as fh:
-                head = fh.read(8192)
-                if b"\x00" in head:
-                    skipped.append(f"{rel} (binary)")
-                    continue
-                if size > MAX_SCAN_BYTES:
-                    return [], skipped, (
-                        f"{rel} is {size} bytes of text, over the {MAX_SCAN_BYTES}-byte "
-                        "scan limit — refusing to push content that was never inspected")
-                out.append((rel, head + fh.read()))
+                out.append((rel, fh.read()))
         except OSError as e:
             # git listed it and it exists, so a read failure is a real problem,
             # not a deletion. Silently skipping here is how a token shipped.
@@ -365,12 +381,43 @@ def _scan_for_secrets(workspace) -> tuple[list[str], int, str | None]:
     blobs, skipped, error = _scannable_blobs(workspace)
     if error:
         return [], 0, error
+    if skipped:
+        # `skipped` used to be computed here and thrown away, so "I could not
+        # look at three of these files" and "I looked at everything and found
+        # nothing" returned a byte-identical tuple. Nothing is skipped by the
+        # scanner any more, so a non-empty list means a caller changed that —
+        # refuse rather than inherit the old silence.
+        return [], len(blobs), ("content this build would push was not scanned: "
+                                + ", ".join(skipped))
 
     hits: list[str] = []
     for rel, blob in blobs:
-        if scan_text(blob.decode("utf-8", errors="ignore")) and rel not in hits:
+        if any(scan_text(text) for text in _decodings(blob)) and rel not in hits:
             hits.append(rel)
     return hits, len(blobs), None
+
+
+def _decodings(blob: bytes) -> tuple[str, ...]:
+    """The plausible readings of a blob, for scanning.
+
+    A single `blob.decode("utf-8", errors="ignore")` was the whole encoding
+    story, and it silently destroys the credential it is looking for: UTF-16 text
+    decodes to NUL-interleaved garbage, so every `\b`-anchored pattern dies while
+    the file reaches the remote perfectly readable. Scanning a few cheap readings
+    costs microseconds and closes that.
+    """
+    readings = [blob.decode("utf-8", errors="ignore")]
+    if b"\x00" in blob:
+        # NUL-stripped: catches UTF-16-ish content and anything with an embedded
+        # NUL used to look "binary".
+        readings.append(blob.replace(b"\x00", b"").decode("utf-8", errors="ignore"))
+        for codec in ("utf-16", "utf-16-le", "utf-16-be"):
+            try:
+                readings.append(blob.decode(codec, errors="ignore"))
+            except (UnicodeDecodeError, LookupError):
+                pass
+    readings.append(blob.decode("latin-1", errors="ignore"))
+    return tuple(dict.fromkeys(readings))
 
 
 def _check_contract(workspace, dev_branch: str, issue_id: str,
@@ -489,6 +536,13 @@ def run_build(
         turn whose cost was never measured — charging 0.0 for those silently
         defeats the cap, so they are counted and surfaced."""
         amount = getattr(result, "cost_usd", 0.0) or 0.0
+        # A runner that reports a non-finite cost is a broken runner. Left alone,
+        # NaN propagates into the reported total (printed as `$nan`) and, with a
+        # budget configured, `charge` raises ValueError — which `run_build` does
+        # not catch, so the build died with the board never told anything.
+        if not math.isfinite(amount):
+            unmetered["n"] += 1
+            amount = 0.0
         if getattr(result, "meta", None) and result.meta.get("cost_known") is False:
             unmetered["n"] += 1
         # Accumulate BEFORE the guard can raise. `cost += r.cost_usd` at the call
@@ -855,10 +909,19 @@ def run_build(
         # Scan the agent's OWN output before it leaves the machine. The factory
         # treats every other repo's code as untrusted and its own agent's code as
         # trusted, which is backwards: `git add -A` stages whatever the agent left
-        # behind. High-signal patterns only (see loop.security) — a key literal or
-        # a DSN with a password is caught; an unquoted dotenv line is not, so this
+        # behind. High-signal patterns only (see loop.security): a credential
+        # literal — including one assigned to a prefixed identifier like
+        # DATABASE_PASSWORD — and a DSN carrying a password are caught; a novel
+        # credential format with no keyword and no known prefix is not. This
         # narrows the blast radius rather than eliminating it.
         leaked, scanned, scan_error = _scan_for_secrets(workspace)
+        # No `scanned == 0` guard here, deliberately. Zero blobs is the correct
+        # and safe result for a build that only DELETES files — deletions
+        # contribute no blob, and treating that as "looked at nothing" would
+        # block the single most valuable change a factory can ship. The hole the
+        # count was proposed to cover (content silently skipped and reported as
+        # clean) is closed at its source instead: nothing is skipped, and
+        # `_scan_for_secrets` errors if anything ever is.
         if scan_error or leaked:
             detail = (f"possible secrets in the produced diff: {', '.join(leaked)}"
                       if leaked else f"the diff could not be scanned — {scan_error}")
@@ -869,6 +932,22 @@ def run_build(
                                 reason=detail, revisions=revise, cost_usd=spent['total'], unmetered_runs=unmetered['n'],
                                 judge_history=history, keep_workspace=_keep.setdefault(
                                     "workspace", True))
+
+        # Did THIS run produce anything? The branch is kept across runs by
+        # design, so a blocked run's commits survive; without this check a pass
+        # in which the agent wrote nothing at all re-ships the previous, rejected
+        # tree and reports it as a fresh build.
+        if not getattr(workspace, "produced_anything", lambda: True)():
+            source.add_labels(issue.id, ["blocked"])
+            source.comment(issue.id,
+                           "This run produced no changes. The branch still carries a "
+                           "previous attempt, which will not be shipped as if it were "
+                           "new work.")
+            return BuildOutcome(issue.id, BuildStatus.BLOCKED, tier=tier,
+                                reason="this run produced no changes; the branch "
+                                       "carries a previous attempt",
+                                revisions=revise, cost_usd=spent['total'],
+                                unmetered_runs=unmetered['n'], judge_history=history)
 
         workspace.commit(f"fix: {issue.title} (#{issue.id})")
         head = workspace.push()
@@ -926,4 +1005,13 @@ def run_build(
                     workspace.preserve()
                 except Exception:
                     pass                # a Workspace without preserve(); best effort
-            workspace.cleanup()
+            try:
+                workspace.cleanup()
+            except Exception:
+                # `cleanup` refusing is worth knowing about, but it is not worth
+                # destroying the outcome: an exception raised in `finally`
+                # replaces the return value, and the sibling `except RuntimeError`
+                # above belongs to the same try statement so it cannot catch it.
+                # A failed teardown after a successful push turned SHIPPED into a
+                # traceback, and the re-run opened a duplicate PR.
+                pass

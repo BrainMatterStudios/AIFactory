@@ -220,6 +220,11 @@ def cmd_doctor(args) -> int:
     reason = kill_requested(_kill_env, root=_root)
     print(f"kill switch     : {'ENGAGED — ' + reason if reason else 'clear'}  "
           f"(env: {_kill_env}, root: {_root})")
+    # An engaged kill switch is a finding, not a status line. `doctor` printed it
+    # and still exited 0 with "verdict: healthy" — and this command's own
+    # docstring calls it what a scheduler runs to decide whether to fire. It
+    # fired.
+    ok = ok and not reason
 
     # persona drift
     drift = validate_against_files()
@@ -273,6 +278,14 @@ def cmd_doctor(args) -> int:
     if repo in PLACEHOLDER_REPOS:
         print(f"  source    : NOT CONFIGURED — repo is still the scaffold placeholder "
               f"{repo!r}; set it to your own repository before running any loop")
+        ok = False
+
+    from software_factory.core.governance import crosses_prod_boundary
+    if crosses_prod_boundary(pr_base=cfg.build_cfg.dev_branch,
+                             extra_prod_refs=cfg.governance.prod_refs):
+        print(f"  build     : dev_branch is {cfg.build_cfg.dev_branch!r}, which the "
+              "ceiling treats as production — every build would halt. Point it at "
+              "an integration branch.")
         ok = False
 
     verify_cmd = cfg.build_cfg.verify_cmd

@@ -81,6 +81,8 @@ class GitWorktree:
         self.base = base
         self.verify_cmd = verify_cmd
         self.path = str((self.repo_dir / workspace_root / branch).resolve())
+        #: Where this run started, captured by create(). See produced_anything().
+        self._start_state: tuple[str, tuple[str, ...]] | None = None
 
     def _git(self, *args: str, cwd: str | Path | None = None) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -110,6 +112,7 @@ class GitWorktree:
             # landed on whatever branch it happened to be on.
             self._assert_on_branch()
             self._reanchor()
+            self._snapshot_start()
             return                                   # worktree already checked out
         # Resolve the base to a commit BEFORE creating anything. `git worktree add
         # -b X <path> <base>` silently ignores -b when <base> names no local
@@ -152,6 +155,10 @@ class GitWorktree:
         self._assert_on_branch(created_here=not reusing)
         if reusing:
             self._reanchor()
+        self._snapshot_start()
+
+    def _snapshot_start(self) -> None:
+        self._start_state = self._state()
 
     def _assert_on_branch(self, *, created_here: bool = False) -> None:
         """Refuse a worktree that is not on the branch we own.
@@ -193,7 +200,14 @@ class GitWorktree:
             raise RuntimeError(f"reset failed: {hard.stderr.strip()}")
         # -x as well as -d: a build's own artefacts are frequently gitignored,
         # and leaving them behind is how a "fresh" attempt inherits stale state.
-        self._git("clean", "-xdff", cwd=self.path)
+        clean = self._git("clean", "-xdff", cwd=self.path)
+        if clean.returncode != 0:
+            # A RESTART exists to throw the work away. Reporting success while
+            # leftovers survive hands the "fresh" worker the dead-end attempt's
+            # tree, which then gets `git add -A`'d and shipped.
+            raise RuntimeError(
+                f"reset could not discard the previous attempt: "
+                f"{clean.stderr.strip() or clean.stdout.strip()}")
 
     def _reanchor(self) -> None:
         """Make sure a reused worktree is not building against stale code.
@@ -262,14 +276,65 @@ class GitWorktree:
         )
 
     def has_changes(self) -> bool:
-        """True when this build produced anything at all — including work the
-        agent already committed, which `git status` alone would call clean."""
+        """True when the BRANCH differs from the base — including work the agent
+        already committed, which `git status` alone would call clean.
+
+        Note what this does NOT answer: whether *this run* produced it. A branch
+        kept from a previous blocked run answers True here forever. Use
+        `produced_anything()` for that question.
+        """
         return bool(self.changed_files())
 
-    def run_tests(self) -> tuple[bool, str]:
-        proc = subprocess.run(
-            self.verify_cmd, cwd=self.path, shell=True, capture_output=True, text=True
-        )
+    def _state(self) -> tuple[str, tuple[str, ...]]:
+        """Branch tip plus the dirty-file list — enough to tell whether anything
+        moved."""
+        tip = self._git("rev-parse", "HEAD", cwd=self.path)
+        return (tip.stdout.strip() if tip.returncode == 0 else "",
+                tuple(sorted(self.changed_files())))
+
+    def produced_anything(self) -> bool:
+        """Did THIS run change anything, as opposed to inheriting it?
+
+        `cleanup()` deliberately keeps the branch, so a run that the judge blocked
+        leaves its commits behind. On the next run `has_changes()` is true from
+        those old commits alone, `commit()` swallows git's "nothing to commit",
+        and a pass in which the agent wrote nothing at all shipped the previous,
+        rejected tree. The snapshot is taken in `create()`, after re-anchoring, so
+        this compares against where this run actually started.
+        """
+        if self._start_state is None:
+            return True          # no snapshot (a custom create()) — do not block
+        return self._state() != self._start_state
+
+    def run_tests(self, timeout_s: float = 3600.0) -> tuple[bool, str]:
+        """Run the project's own gate. Green ONLY if a real command really ran
+        and really exited 0.
+
+        An empty or whitespace `verify_cmd` is refused rather than executed: the
+        shell runs "" happily and exits 0, so the one objective gate between an
+        agent's opinion and a pull request reported green having run nothing.
+        `None` (a YAML `verify_cmd:` with no value) used to reach
+        `subprocess.run(None, shell=True)` and raise TypeError, which no caller
+        catches, so the build died with the issue never labelled.
+
+        The timeout exists because this is the only unbounded subprocess in an
+        unattended loop: a hung test suite held the run lock for its full six-hour
+        staleness window, and the kill switch is only read between iterations, so
+        nothing could stop it.
+        """
+        cmd = (self.verify_cmd or "").strip()
+        if not cmd:
+            return False, ("verify_cmd is empty — refusing to treat 'no gate' as a "
+                           "passing gate. Set build.verify_cmd to your test command.")
+        try:
+            proc = subprocess.run(
+                cmd, cwd=self.path, shell=True, capture_output=True, text=True,
+                timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"verify_cmd exceeded {timeout_s}s and was killed"
+        except OSError as e:
+            return False, f"verify_cmd could not be run: {e}"
         return proc.returncode == 0, (proc.stdout + proc.stderr)
 
     def commit(self, message: str) -> None:
@@ -281,6 +346,12 @@ class GitWorktree:
                 "the build produced no file changes — nothing to commit "
                 "(the agent ran but wrote nothing; check the runner and the brief)"
             )
+        # The branch was checked in create(); the agent has had a shell since.
+        # `git checkout -b`, a detached HEAD, or an interrupted rebase moves HEAD,
+        # and then the commit lands off-branch while `push` pushes the unchanged
+        # branch ref, exits 0 ("Everything up-to-date"), and the loop reports
+        # SHIPPED over an empty PR.
+        self._assert_on_branch()
         self._git("add", "-A", cwd=self.path)
         r = self._git("commit", "-m", message, cwd=self.path)
         if r.returncode != 0:
@@ -291,9 +362,27 @@ class GitWorktree:
             raise RuntimeError(f"git commit failed: {r.stderr.strip() or r.stdout.strip()}")
 
     def push(self) -> str:
+        """Push the branch and confirm the remote actually has this build's work.
+
+        `git push` exits 0 for "Everything up-to-date", so a successful exit says
+        nothing about whether anything was transferred. The remote tip is compared
+        against the local branch tip afterwards, because "the push succeeded" and
+        "the commit I just made is on the remote" turned out to be different
+        facts — and the PR is opened on the strength of the second one.
+        """
+        self._assert_on_branch()
+        local = self._git("rev-parse", self.branch, cwd=self.path)
         r = self._git("push", "-u", "origin", self.branch, cwd=self.path)
         if r.returncode != 0:
             raise RuntimeError(f"git push failed: {r.stderr.strip()}")
+        remote = self._git("rev-parse", f"origin/{self.branch}", cwd=self.path)
+        if (local.returncode == 0 and remote.returncode == 0
+                and local.stdout.strip() != remote.stdout.strip()):
+            raise RuntimeError(
+                f"push reported success but origin/{self.branch} is at "
+                f"{remote.stdout.strip()[:8]} while the local branch is at "
+                f"{local.stdout.strip()[:8]} — refusing to open a PR for work "
+                "the remote does not have")
         return self.branch
         # NOTE: there is intentionally no merge() — the ceiling.
 
@@ -348,4 +437,16 @@ class GitWorktree:
         """Remove the worktree directory. The BRANCH is deliberately kept: it
         carries the work, a pushed PR points at it, and a re-run resumes from it
         (see `create`). Deleting it here would throw away a shipped build."""
-        self._git("worktree", "remove", "--force", self.path)
+        r = self._git("worktree", "remove", "--force", self.path)
+        if r.returncode != 0:
+            # git may unregister the worktree and still leave the directory (a
+            # read-only build/ dir is enough). The next run then finds a stale
+            # .git file, takes the reuse path, and fails forever with a message
+            # naming a branch that does not exist. Try harder, then say so.
+            r = self._git("worktree", "remove", "-f", "-f", self.path)
+        self._git("worktree", "prune")
+        if r.returncode != 0 and Path(self.path).exists():
+            raise RuntimeError(
+                f"could not remove the worktree at {self.path}: "
+                f"{r.stderr.strip() or r.stdout.strip()}. Delete it by hand, then "
+                "run `git worktree prune`, or the next build will fail on it.")

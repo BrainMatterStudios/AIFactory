@@ -35,7 +35,7 @@ another, Postgres or Snowflake, Slack or Telegram. Adopting it is configuration
 and adapters, not a rewrite. The core has zero hard dependencies and ships a
 complete offline adapter set, so the whole loop runs in your tests and your CI.
 
-**Status:** 439 tests, CI on Python 3.10, 3.12–3.13, Apache-2.0. The observe→diagnose→
+**Status:** 463 tests, CI on Python 3.10, 3.12–3.13, Apache-2.0. The observe→diagnose→
 queue→verify loop and the deterministic gate helpers are generalized from a
 factory that has run against a production system, where the passes are invoked
 on demand rather than on a schedule. If you intend to automate that,
@@ -55,7 +55,7 @@ carry production behind them.
 | [Writing a plugin](docs/WRITING_A_PLUGIN.md) | New providers and custom adapters, without forking. |
 | [The doctrine](software_factory/core/doctrine.md) | The orchestration procedure itself — the artifact with production behind it. |
 | [Conventions](software_factory/core/conventions.md) | The portable rules the loop is built on. |
-| [Known issues](KNOWN_ISSUES.md) | Honest status by subsystem, including what six review panels found. |
+| [Known issues](KNOWN_ISSUES.md) | Honest status by subsystem, including what eight review panels found. |
 
 ---
 
@@ -176,7 +176,7 @@ another one.
 ```bash
 git clone https://github.com/BrainMatterStudios/AIFactory && cd AIFactory
 pip install -e ".[dev]"          # core has zero hard deps; this adds pytest + ruff + yaml
-python -m pytest -q              # 439 passing — deterministic core + full offline loop
+python -m pytest -q              # 463 passing — deterministic core + full offline loop
 ./scripts/ci-local.sh            # every CI job, with CI's pinned toolchain
 ```
 
@@ -240,7 +240,7 @@ policy, the deterministic gate helpers (`classify_tier`, `combine`,
 (`software_factory/build/`) — the autonomous, unattended L3 loop. The system this
 package came from does not have one. It builds with a **human-supervised agent
 session** following the doctrine, which is why the doctrine is the proven artifact
-and the autonomous builder is not. Six adversarial review panels have gone at
+and the autonomous builder is not. Eight adversarial review panels have gone at
 `build/`; see [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for exactly what they found.
 
 Maintainer: BrainMatterStudios.
