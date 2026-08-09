@@ -42,12 +42,12 @@ demand. The *autonomous* build loop (`factory build`) is newer, remains
 experimental, and is not scientifically or production validated. See
 [KNOWN_ISSUES.md](KNOWN_ISSUES.md) and §Provenance for the exact boundary.
 
-> **Release-candidate gate:** the `findings_v2` parser, authenticated sensor
-> reports, deterministic router, authority replay, and adversarial tests are now
-> implemented and locally verified. Version 0.2.0 is still unreleased: the exact
-> candidate must pass the [release checklist](docs/RELEASE_CHECKLIST.md), including
-> sanitized-history review, and each push, merge, tag, release, and publication
-> remains a separate approved shared-state action.
+> **0.2.0 release:** the `findings_v2` parser, authenticated sensor reports,
+> deterministic router, authority replay, all-exit scratch cleanup, and
+> adversarial tests passed the documented release gates. The source release is
+> distributed through the protected GitHub tag and release; it is not published
+> on PyPI. Future pushes, merges, tags, releases, and package publication remain
+> separately approved shared-state actions.
 
 ## Documentation
 
