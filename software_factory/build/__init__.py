@@ -7,6 +7,14 @@ Four adversarial review panels have found defects here; see KNOWN_ISSUES.md.
 Prefer the doctrine path for work you care about.
 """
 from software_factory.build.orchestrator import BuildOutcome, BuildStatus, run_build
+from software_factory.build.review_findings import (
+    EvidenceLocation,
+    Finding,
+    FindingsReport,
+    FindingsUnreadable,
+    SensorIdentity,
+)
+from software_factory.build.review_policy import FindingOverride, ReviewDecision
 from software_factory.build.workspace import (
     GitWorktree,
     NothingToCommit,
@@ -16,8 +24,15 @@ from software_factory.build.workspace import (
 __all__ = [
     "BuildOutcome",
     "BuildStatus",
+    "EvidenceLocation",
+    "Finding",
+    "FindingOverride",
+    "FindingsReport",
+    "FindingsUnreadable",
     "GitWorktree",
     "NothingToCommit",
+    "ReviewDecision",
+    "SensorIdentity",
     "Workspace",
     "run_build",
 ]

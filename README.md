@@ -35,15 +35,19 @@ another, Postgres or Snowflake, Slack or Telegram. Adopting it is configuration
 and adapters, not a rewrite. The core has zero hard dependencies and ships a
 complete offline adapter set, so the whole loop runs in your tests and your CI.
 
-**Status:** 441 tests, CI on Python 3.10, 3.12–3.13, Apache-2.0. The observe→diagnose→
-queue→verify loop and the deterministic gate helpers are generalized from a
-factory that has run against a production system, where the passes are invoked
-on demand rather than on a schedule. If you intend to automate that,
-[OPERATING.md](docs/OPERATING.md) is about the failure modes that introduces.
-The *autonomous*
-build loop (`factory build`) is newer and marked experimental — see
-[KNOWN_ISSUES.md](KNOWN_ISSUES.md), and §Provenance below for exactly which parts
-carry production behind them.
+**Status:** 0.2.0, CI on Python 3.10 and 3.12–3.13, Apache-2.0. The
+observe→diagnose→queue→verify loop and deterministic gate helpers are generalized
+from a factory used against a production system, where passes are invoked on
+demand. The *autonomous* build loop (`factory build`) is newer, remains
+experimental, and is not scientifically or production validated. See
+[KNOWN_ISSUES.md](KNOWN_ISSUES.md) and §Provenance for the exact boundary.
+
+> **Release-candidate gate:** the `findings_v2` parser, authenticated sensor
+> reports, deterministic router, authority replay, and adversarial tests are now
+> implemented and locally verified. Version 0.2.0 is still unreleased: the exact
+> candidate must pass the [release checklist](docs/RELEASE_CHECKLIST.md), including
+> sanitized-history review, and each push, merge, tag, release, and publication
+> remains a separate approved shared-state action.
 
 ## Documentation
 
@@ -51,6 +55,9 @@ carry production behind them.
 |---|---|
 | **[Adopting the factory](docs/ADOPTING.md)** | The working guide: install → your first collector → running a build under the doctrine. **Start here.** |
 | **[Operating it](docs/OPERATING.md)** | Scheduling it unattended, arming a dead-man's switch, and the ways an observe loop lies to you. |
+| **[0.2.0 release notes](docs/releases/0.2.0.md)** | Architecture-first rationale, authority model, migration, threat model, and limits. |
+| [Public content policy](docs/PUBLIC_CONTENT_POLICY.md) | What may enter the public package and how current and historical content is inspected. |
+| [Release checklist](docs/RELEASE_CHECKLIST.md) | Local verification, protected `main`, provenance, and separate publication approvals. |
 | [Model tiering](docs/MODEL_TIERING.md) | Which model each role runs on, why the gate has a floor, and how to re-derive it for your repo. |
 | [Writing a plugin](docs/WRITING_A_PLUGIN.md) | New providers and custom adapters, without forking. |
 | [The doctrine](software_factory/core/doctrine.md) | The orchestration procedure itself — the artifact with production behind it. |
@@ -64,6 +71,10 @@ carry production behind them.
 ```
 software_factory/            ← the product (installable Python package)
   core/
+    contracts/               ← Contract v1 compatibility + strict Contract v2,
+                               intent policy, and canonical artifact digests
+    approvals.py             ← exact contract/plan authority outside worktrees
+    publication.py           ← current-tree and history-range public scanner
     orchestrate/             ← classify_tier + combine — the gate rules that
                                MUST be code, not an LLM remembering them
     doctrine.md              ← the orchestration doctrine (orchestrator→tier→
@@ -91,7 +102,7 @@ software_factory/            ← the product (installable Python package)
                                closed) + recurrence-not-refile + the mandatory
                                expected-outcome field
     pickup.py                ← L3 fix (selection): top Ready issue, stop-switches
-    collectors.py            ← the generic {name, verdict, evidence} contract
+    collectors.py            ← the generic {name, verdict, evidence} observe contract
                                + ratio / floor / delta verdict helpers
     ratchet.py               ← net-new-only checks against a committed baseline
     security.py              ← scheduled posture: secret scan, dependency audit,
@@ -99,7 +110,11 @@ software_factory/            ← the product (installable Python package)
     spend.py                 ← where the factory's own token budget goes, and
                                how much of it is re-routable
   cli.py                     ← `factory init | doctor | personas | demo | observe |
-                               pickup | build | schedule | version`
+                               pickup | build | approve | schedule | version`
+
+  build/                     ← experimental contract→checkpoint→implementation→
+                               findings sensor→deterministic routing lifecycle
+  trace/decisions.py         ← redacted, digest-chained controller evidence
 
 scripts/ci-local.sh          ← every CI job, locally, with CI's pinned toolchain
 factory.config.example.yaml  ← copy to factory.config.yaml and fill in
@@ -135,10 +150,12 @@ factory pickup                   # the next Ready issue a build loop would take
   `factory pickup` chose. The agent classifies the tier, forms a persona team,
   and submits to an independent judge; you are at the controls. This is how the
   factory this package came from actually runs.
-* **`factory build 42` — autonomous, and experimental.** Same loop with no human
-  present. It is the newest code here and the only part with no production
+* **`factory build 42` — autonomous, and experimental.** Contract v2 freezes
+  declared intent before code; exact digest approvals bind human-owned decisions
+  and T2 plans; `findings_v2` reviewers report observations while deterministic
+  code owns disposition. It is still the only major subsystem with no production
   provenance. Read [KNOWN_ISSUES.md](KNOWN_ISSUES.md) before pointing it at a repo
-  you care about, and do not schedule it unattended yet.
+  you care about, and do not schedule it unattended.
 
 ```bash
 factory build 42                 # experimental — see KNOWN_ISSUES.md
@@ -149,7 +166,7 @@ factory build 42                 # experimental — see KNOWN_ISSUES.md
 | | `0` | `1` | `2` |
 |---|---|---|---|
 | `observe` | PASS or WARN | overall FAIL | the board could not be searched — nothing filed |
-| `build` | shipped, or T2 halted for plan approval | every other outcome (judge BLOCK, tests red, secrets found, budget, ceiling, kill switch) | another build already holds the lock |
+| `build` | shipped; deprecated compatibility plan-pending also returns 0 | specification/approval pending, deterministic BLOCK/REVISE, tests red, secrets found, budget, ceiling, or kill switch | another build holds the lock, controller state cannot be isolated, or a canonical repository identity is missing |
 
 An engaged kill switch stops `observe` with exit **0** (nothing ran, nothing is
 wrong) and `build` with exit **1** (the requested work did not happen).
@@ -163,20 +180,49 @@ The `factory` command finds your `factory.config.yaml` by walking up from the cu
 directory, so run it from anywhere inside your project. Real (non-offline) use needs
 `gh` authenticated and your providers' secrets in env vars named by the manifest.
 
-`factory build` classifies the tier, runs a worker in an isolated git worktree, gates
-on your `verify_cmd`, runs the judge (revise ≤ 2), re-runs your gate against
-the tree it is about to push, and opens a PR into your dev branch — charging the budget
-and refusing any prod base. It never merges. A T2 feature halts after planning: the plan
-is written to `.factory/plans/` and posted on the issue, and adding the
-`plan-approved` label makes the next run implement *that* plan rather than produce
-another one.
+`factory build` classifies the tier and, for T1/T2 work, gives a contract author
+one writable contract path. Deterministic intent policy must accept that Contract
+v2 document before the controller checkpoints it. A T2 plan is hashed with its
+parent contract digest and waits for exact operator approval. Only then does an
+implementer run in the isolated worktree. Objective verification, frozen
+`findings_v2` reports, deterministic review routing, re-verification, and the
+objective secret scan must all pass before a PR can be opened into the configured
+development branch. It never merges. The full public-content boundary is a
+separate CI and release gate over the current tree and candidate history; it is
+not run inside every `factory build`.
+
+The build prints the exact approval command when authority is required. That
+command is directly copyable when Git has `user.email` or `user.name`; otherwise
+add `--approver <operator-identity>`. Issue labels are informational only. For
+example, using deliberately synthetic digests:
+
+```bash
+factory approve contract demo-42 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --approver demo-operator --reason "synthetic intent review"
+factory approve plan demo-42 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  --parent aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --approver demo-operator --reason "synthetic plan review"
+```
+
+An approval-pending contract is persisted as an exact controller record. A later
+run materializes those same bytes without dispatching the contract author and
+re-checks current approval. Once accepted, the exact record is retained and the
+approval is still checked on every run: deleting approval returns the same digest
+to `APPROVAL_PENDING`, while replacing it with a different digest blocks.
+
+Approval and decision state must resolve outside the repository and registered
+worktrees. Pending/accepted contract records and plan envelopes are
+controller-owned, ignored local state under the canonical checkout's `.factory`
+directory, outside the disposable runner worktree. See
+[ADOPTING.md](docs/ADOPTING.md) for migration and
+[OPERATING.md](docs/OPERATING.md) for precedence, backup, and recovery.
 
 ## Develop the factory itself (contributors)
 
 ```bash
 git clone https://github.com/BrainMatterStudios/AIFactory && cd AIFactory
 pip install -e ".[dev]"          # core has zero hard deps; this adds pytest + ruff + yaml
-python -m pytest -q              # 441 passing — deterministic core + full offline loop
+python -m pytest -q              # deterministic core + full offline loop
 ./scripts/ci-local.sh            # every CI job, with CI's pinned toolchain
 ```
 
@@ -203,8 +249,10 @@ where people get hurt:
 |---|---|---|
 | Loop code | Cannot merge, deploy, or target a prod ref. Structural — there is no method to call. | Says nothing about the agent process, and the workspace shells out to `git` directly for branch, commit and push. |
 | Runner deny list | The reference Claude runner refuses `git push`, `git merge`, `git tag`, `gh pr merge`, `gh release`, `gh workflow run` on **every** turn. | Pattern matching, not a sandbox: a script or an unmatched invocation reaches the same effect. |
-| Structured verdict | The judge writes `.factory/judge-verdict.json`; its prose is never parsed, so nothing it says — or quotes back from an issue — can be read as approval. | A judge that cannot write valid JSON produces no verdict, which is a REVISE. |
-| Re-verify | The suite is re-run after judging, so a tree modified after the gate went green cannot ship. | Catches the mutation; does not prevent it. |
+| Frozen intent | Contract v2 is validated, gated, separately committed, and digest-checked after later turns. | Schema conformance does not prove the declared intent is true or complete. |
+| Exact approval | Controller records bind repository, issue, artifact digest, and plan parent digest. | The local operator identity is not a cryptographic signature. |
+| Findings-only review | Models emit typed observations bound to the reviewed fingerprint; deterministic code owns disposition. | A model may still miss a defect or report a false positive. |
+| Re-verify and objective secret scan | Tests are rerun and produced Git blobs are checked for high-signal secret shapes before a PR. | This is not the full public-content policy; CI, history-range scanning, protected `main`, and human release review remain separate requirements. |
 
 Unattended operation still needs a sandboxed runner and least-privilege
 credentials, which are yours to supply. What changed is that ignoring that advice
@@ -237,10 +285,21 @@ policy, the deterministic gate helpers (`classify_tier`, `combine`,
 `decide_restart`), the contract validator, and the governance rails.
 
 **Written fresh for this package, and NOT production-proven:** `factory build`
-(`software_factory/build/`) — the autonomous, unattended L3 loop. The system this
-package came from does not have one. It builds with a **human-supervised agent
-session** following the doctrine, which is why the doctrine is the proven artifact
-and the autonomous builder is not. Eight adversarial review panels have gone at
-`build/`; see [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for exactly what they found.
+(`software_factory/build/`) — including the v0.2 Contract v2 lifecycle,
+hash-bound approvals, decision log, and findings-only review routing. The origin
+system builds with a **human-supervised agent session** following the doctrine,
+which is why the doctrine is the proven artifact and the autonomous builder is
+not. Adversarial review has found serious defects in successive build-loop
+iterations; [KNOWN_ISSUES.md](KNOWN_ISSUES.md) preserves that history and the
+current limits.
+
+The v0.2 design adapts ideas from Stanislav Rumega's 2026
+[*Tell Your Coding Agent to Work as an Architect First*](https://github.com/styrumg/Architect-First-Article):
+declare intent and design before code, use deterministic gates and existing code
+scanners, and keep a decision diary. Rumega's paper and examples are CC BY 4.0.
+AIFactory adapts ideas, not source implementation; its implementation code and
+fixtures are original Apache-2.0 work. See the
+[0.2.0 release notes](docs/releases/0.2.0.md) for the licensing boundary and the
+parts deliberately deferred.
 
 Maintainer: BrainMatterStudios.

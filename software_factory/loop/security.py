@@ -50,6 +50,7 @@ DEFAULT_SECRET_PATTERNS: tuple[str, ...] = (
     r"\bSG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}",         # SendGrid
     r"\bnpm_[A-Za-z0-9]{30,}",                                 # npm token
     r"\bgithub_pat_[A-Za-z0-9_]{20,}",                         # GitHub fine-grained PAT
+    r"(?i)\bAuthorization\s*:\s*Bearer\s+[A-Za-z0-9._~+/=-]{16,}",
     # A hardcoded credential literal. Three properties, each of which cost a
     # review round:
     #

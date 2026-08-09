@@ -16,11 +16,17 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import ipaddress
+import os
+import re
 import shlex
 import shutil
+import subprocess
 import sys
 from collections.abc import Sequence
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from software_factory import __version__
 from software_factory.adapters.base import RunStatus, Severity
@@ -70,23 +76,198 @@ PLACEHOLDER_REPOS = frozenset({"your-org/your-repo", "my-org/my-repo"})
 
 _LOADED_PLUGINS: list[str] = []
 
+_REPOSITORY_SEGMENT_RE = re.compile(r"[A-Za-z0-9._-]+\Z")
+_REPOSITORY_USERINFO_RE = re.compile(
+    r"[A-Za-z0-9._-]+(?::[A-Za-z0-9._-]+)?\Z"
+)
+_SCP_REPOSITORY_RE = re.compile(
+    r"(?:(?P<user>[A-Za-z0-9._-]+)@)?"
+    r"(?P<host>[A-Za-z0-9.-]+):(?P<path>.+)\Z"
+)
+_CANONICAL_PORT_REPOSITORY_RE = re.compile(
+    r"(?P<host>[A-Za-z0-9.-]+):(?P<port>[0-9]+)/(?P<path>.+)\Z"
+)
+_REPOSITORY_URL_SCHEMES = frozenset({"git", "http", "https", "ssh"})
+
 
 def _detect_repo(directory) -> str | None:
     """Best-effort owner/name from the git origin remote."""
-    import subprocess
-
-    r = subprocess.run(
-        ["git", "-C", str(directory), "remote", "get-url", "origin"],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(directory), "remote", "get-url", "origin"],
+            capture_output=True,
+        )
+    except (OSError, TypeError, UnicodeError, ValueError):
         return None
-    url = r.stdout.strip()
-    for sep in ("github.com:", "github.com/"):
-        if sep in url:
-            tail = url.split(sep, 1)[1]
-            return tail[:-4] if tail.endswith(".git") else tail
-    return None
+    if (
+        r.returncode != 0
+        or not isinstance(r.stdout, bytes)
+        or not r.stdout.endswith(b"\n")
+    ):
+        return None
+    try:
+        origin = r.stdout[:-1].decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    # Remove Git's byte-level record terminator only. Text mode and `strip()`
+    # would erase or translate an origin's own CR, LF, or tab before validation.
+    return _normalize_git_origin(origin)
+
+
+def _normalize_git_origin(origin: str) -> str | None:
+    """Normalize a network Git origin without inventing a basename identity."""
+    repository = _normalize_repository_identity(origin, allow_canonical=False)
+    return None if _is_placeholder_repository(repository) else repository
+
+
+def _is_placeholder_repository(repository: str | None) -> bool:
+    """Match only complete normalized placeholder identities."""
+    return repository is not None and repository.casefold() in PLACEHOLDER_REPOS
+
+
+def _normalize_repository_host(host: str) -> str | None:
+    """Return one unambiguous lowercase DNS/IP host, without userinfo."""
+    if ":" in host:
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            return None
+        return address.compressed.lower() if address.version == 6 else None
+    lowered = host.lower()
+    if not lowered or len(lowered) > 253 or ".." in lowered:
+        return None
+    labels = lowered.split(".")
+    if any(
+        not label
+        or len(label) > 63
+        or not label[0].isalnum()
+        or not label[-1].isalnum()
+        or any(not (character.isalnum() or character == "-") for character in label)
+        for label in labels
+    ):
+        return None
+    return lowered
+
+
+def _normalize_repository_path(path: str, *, absolute: bool) -> str | None:
+    """Normalize a slash path whose segments cannot carry delimiters."""
+    if absolute:
+        if not path.startswith("/") or path.startswith("//"):
+            return None
+        path = path[1:]
+    elif path.startswith("/"):
+        return None
+    if not path or path.endswith("/"):
+        return None
+    parts = path.split("/")
+    if len(parts) < 2:
+        return None
+    if parts[-1].endswith(".git"):
+        parts[-1] = parts[-1][:-4]
+    if any(
+        not part
+        or part in {".", ".."}
+        or _REPOSITORY_SEGMENT_RE.fullmatch(part) is None
+        for part in parts
+    ):
+        return None
+    return "/".join(parts)
+
+
+def _render_network_repository(host: str, port: int | None, path: str) -> str:
+    rendered_host = f"[{host}]" if ":" in host else host
+    if port is not None:
+        rendered_host = f"{rendered_host}:{port}"
+    return path if rendered_host == "github.com" else f"{rendered_host}/{path}"
+
+
+def _normalize_repository_identity(
+    candidate: str, *, allow_canonical: bool
+) -> str | None:
+    """Parse URL, SCP, or configured canonical identity without delimiter ambiguity."""
+    try:
+        if (
+            not isinstance(candidate, str)
+            or not candidate
+            or not candidate.isascii()
+            or any(not 0x21 <= ord(character) <= 0x7E for character in candidate)
+            or "?" in candidate
+            or "#" in candidate
+        ):
+            return None
+
+        if "://" in candidate:
+            parsed = urlsplit(candidate)
+            scheme = parsed.scheme.lower()
+            if (
+                scheme not in _REPOSITORY_URL_SCHEMES
+                or not parsed.netloc
+                or parsed.query
+                or parsed.fragment
+                or "%" in candidate
+                or parsed.netloc.count("@") > 1
+            ):
+                return None
+            authority = parsed.netloc.rsplit("@", 1)[-1]
+            if authority.endswith(":"):
+                return None
+            if "@" in parsed.netloc:
+                userinfo, _authority = parsed.netloc.split("@", 1)
+                if _REPOSITORY_USERINFO_RE.fullmatch(userinfo) is None:
+                    return None
+            host = _normalize_repository_host(parsed.hostname or "")
+            if host is None:
+                return None
+            port = parsed.port
+            if port is not None and not 1 <= port <= 65535:
+                return None
+            default_port = {
+                "git": 9418,
+                "http": 80,
+                "https": 443,
+                "ssh": 22,
+            }[scheme]
+            if port == default_port:
+                port = None
+            path = _normalize_repository_path(parsed.path, absolute=True)
+            return _render_network_repository(host, port, path) if path else None
+
+        if allow_canonical:
+            canonical_port = _CANONICAL_PORT_REPOSITORY_RE.fullmatch(candidate)
+            if canonical_port is not None:
+                host = _normalize_repository_host(canonical_port["host"])
+                port = int(canonical_port["port"])
+                path = _normalize_repository_path(
+                    canonical_port["path"], absolute=False
+                )
+                if host is None or not 1 <= port <= 65535 or path is None:
+                    return None
+                return f"{host}:{port}/{path}"
+
+        scp = _SCP_REPOSITORY_RE.fullmatch(candidate)
+        if scp is not None:
+            host = _normalize_repository_host(scp["host"])
+            path = _normalize_repository_path(scp["path"], absolute=False)
+            if host is None or path is None:
+                return None
+            return _render_network_repository(host, None, path)
+
+        if not allow_canonical or ":" in candidate or "@" in candidate:
+            return None
+        path = _normalize_repository_path(candidate, absolute=False)
+        if path is None:
+            return None
+        parts = path.split("/")
+        if len(parts) >= 3 and ("." in parts[0] or parts[0].lower() == "localhost"):
+            host = _normalize_repository_host(parts[0])
+            if host is None:
+                return None
+            return _render_network_repository(host, None, "/".join(parts[1:]))
+        return path
+    except (TypeError, UnicodeError, ValueError):
+        # Parser diagnostics can include attacker-controlled authority text.
+        # Collapse them to an invalid result; callers own the constant message.
+        return None
 
 
 _STARTER_MANIFEST = """\
@@ -116,6 +297,8 @@ factory:
     dev_branch: {dev}          # the ONLY base the loop may target — never prod
     verify_cmd: "{verify}"     # YOUR test/lint gate; must pass before a PR
     max_revise: 2
+    require_contract: true
+    review_protocol: findings_v2
 
   budget:
     per_task_usd: 50
@@ -438,6 +621,13 @@ def cmd_build(args) -> int:
     from software_factory.core.governance import AlreadyRunning, RunLock
 
     cfg = _load_config(args.config)
+    repository = _configured_build_repository(cfg)
+    if cfg.build_cfg.require_contract and repository is None:
+        print(
+            "build → contract lifecycle requires an explicit canonical repository "
+            "identity in factory.source.repo"
+        )
+        return 2
     # Anchor to the manifest, not the cwd: `--repo` is optional and a cron entry
     # rarely cds anywhere, so defaulting to "." would leave the halt file
     # unfindable AND give two invocations from different directories two
@@ -452,14 +642,221 @@ def cmd_build(args) -> int:
         print(f"build → {e}")
         return 2
     try:
-        return _run_build_locked(args, cfg, repo_dir)
+        return _run_build_locked(args, cfg, repo_dir, repository)
     finally:
         lock.release()
 
 
-def _run_build_locked(args, cfg, repo_dir: str) -> int:
-    from software_factory.build import GitWorktree, run_build
+def _configured_build_repository(cfg) -> str | None:
+    """Return configured provider identity, never a filesystem-derived fallback."""
+    _present, repository = _configured_repository_identity(cfg)
+    return repository
+
+
+def _configured_repository_identity(cfg) -> tuple[bool, str | None]:
+    """Distinguish an absent source identity from a configured invalid one."""
+    source = cfg.adapters.get("source")
+    if source is None or "repo" not in source.options:
+        return False, None
+    candidate = source.options["repo"]
+    if not isinstance(candidate, str):
+        return True, None
+    repository = _normalize_repository_identity(candidate, allow_canonical=True)
+    if _is_placeholder_repository(repository):
+        return True, None
+    return True, repository
+
+
+def _registered_worktrees(repo_root: str | Path) -> tuple[Path, ...]:
+    """Read Git's NUL-delimited worktree registry or fail closed."""
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "worktree",
+                "list",
+                "--porcelain",
+                "-z",
+            ],
+            capture_output=True,
+            check=False,
+        )
+    except (OSError, TypeError) as exc:
+        raise ValueError("registered Git worktrees could not be enumerated") from exc
+    if result.returncode != 0 or not isinstance(result.stdout, bytes):
+        raise ValueError("registered Git worktrees could not be enumerated")
+    payload = result.stdout
+    if not payload or not payload.endswith(b"\0\0"):
+        raise ValueError("registered Git worktree output is malformed")
+    records = payload[:-2].split(b"\0\0")
+    worktrees = []
+    for record in records:
+        fields = record.split(b"\0")
+        if (
+            not fields
+            or not fields[0].startswith(b"worktree ")
+            or not fields[0][len(b"worktree ") :]
+            or any(not field for field in fields)
+            or any(field.startswith(b"worktree ") for field in fields[1:])
+        ):
+            raise ValueError("registered Git worktree output is malformed")
+        seen_metadata: set[bytes] = set()
+        for field in fields[1:]:
+            name, separator, value = field.partition(b" ")
+            if name in seen_metadata:
+                raise ValueError("registered Git worktree output is malformed")
+            seen_metadata.add(name)
+            if name == b"HEAD":
+                if (
+                    not separator
+                    or len(value) not in (40, 64)
+                    or any(byte not in b"0123456789abcdefABCDEF" for byte in value)
+                ):
+                    raise ValueError("registered Git worktree output is malformed")
+            elif name == b"branch":
+                if not separator or not value:
+                    raise ValueError("registered Git worktree output is malformed")
+            elif name in (b"locked", b"prunable"):
+                # Git emits either a bare marker or a marker plus a reason.
+                if separator and not value:
+                    raise ValueError("registered Git worktree output is malformed")
+            elif name in (b"bare", b"detached"):
+                if separator:
+                    raise ValueError("registered Git worktree output is malformed")
+            else:
+                raise ValueError("registered Git worktree output is malformed")
+        if (b"HEAD" in seen_metadata) == (b"bare" in seen_metadata):
+            raise ValueError("registered Git worktree output is malformed")
+        path = Path(os.fsdecode(fields[0][len(b"worktree ") :]))
+        if not path.is_absolute():
+            raise ValueError("registered Git worktree output is malformed")
+        worktrees.append(path.resolve())
+    return tuple(worktrees)
+
+
+def _controller_state_root(cfg, repo_root: str | Path) -> Path:
+    """Resolve controller authority state and refuse a runner-visible location."""
+    from software_factory.loop.state import default_state_dir
+
+    configured = getattr(cfg.build_cfg, "state_dir", None)
+    if configured is None:
+        root = default_state_dir()
+    else:
+        root = Path(configured).expanduser()
+        if not root.is_absolute():
+            source_path = getattr(cfg, "source_path", None)
+            base = Path(source_path).resolve().parent if source_path else Path.cwd()
+            root = base / root
+    root = root.resolve()
+    checkout = Path(repo_root).resolve()
+    workspace_root = Path(getattr(cfg.build_cfg, "workspace_root", ".factory-worktrees"))
+    if not workspace_root.is_absolute():
+        workspace_root = checkout / workspace_root
+    workspace_root = workspace_root.resolve()
+
+    def overlaps(first: Path, second: Path) -> bool:
+        return first == second or first in second.parents or second in first.parents
+
+    registered_worktrees = _registered_worktrees(checkout)
+    if (
+        overlaps(root, checkout)
+        or overlaps(root, workspace_root)
+        or any(overlaps(root, worktree) for worktree in registered_worktrees)
+    ):
+        raise ValueError("factory.build.state_dir must resolve outside the repository worktree")
+    return root
+
+
+def _git_operator_identity(repo_root: str | Path) -> str | None:
+    for key in ("user.email", "user.name"):
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "config", "--get", key],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        value = result.stdout.strip() if result.returncode == 0 else ""
+        if value:
+            return value
+    return None
+
+
+def cmd_approve(args) -> int:
+    """Persist exact operator authority outside the repository worktree."""
+    from software_factory.core.approvals import (
+        SCHEMA_VERSION,
+        ApprovalError,
+        ApprovalRecord,
+        ApprovalStore,
+        ArtifactKind,
+    )
+
+    try:
+        cfg = _load_config(args.config)
+        repo_root = resolve_repo_root(cfg)
+        configured, repository = _configured_repository_identity(cfg)
+        if configured and repository is None:
+            raise ApprovalError("configured source repository identity is invalid")
+        if not configured:
+            repository = _detect_repo(repo_root)
+        if repository is None:
+            raise ApprovalError(
+                "approval requires a configured source repository identity or normalized Git origin"
+            )
+        state_root = _controller_state_root(cfg, repo_root)
+        if args.approver is not None:
+            approver = args.approver.strip()
+        else:
+            approver = _git_operator_identity(repo_root)
+        if not approver:
+            raise ApprovalError(
+                "approval requires --approver or git config user.email/user.name"
+            )
+        rationale = args.reason.strip()
+        if not rationale:
+            raise ApprovalError("approval requires a non-empty reason")
+        artifact_kind = ArtifactKind(args.artifact_kind)
+        store = ApprovalStore(state_root / "approvals")
+        store.approve(
+            ApprovalRecord(
+                schema_version=SCHEMA_VERSION,
+                repository=repository,
+                issue=args.issue,
+                artifact_kind=artifact_kind,
+                artifact_digest=args.digest,
+                parent_digest=getattr(args, "parent", None),
+                approver=approver,
+                approved_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                rationale=rationale,
+            )
+        )
+    except (ApprovalError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        print(f"approve failed: {exc}")
+        return 2
+
+    print(f"approved artifact : {artifact_kind.value}")
+    print(f"issue             : {args.issue}")
+    print(f"digest            : {args.digest}")
+    print(f"repository        : {repository}")
+    print(f"state             : {store.root}")
+    return 0
+
+
+def _run_build_locked(
+    args, cfg, repo_dir: str, repository: str | None = None
+) -> int:
+    from software_factory.build import BuildStatus, GitWorktree, run_build
+    from software_factory.core.approvals import ApprovalStore
     from software_factory.core.governance import BudgetGuard, SpendLedger
+    from software_factory.trace.decisions import DecisionLog
+
+    try:
+        state_root = _controller_state_root(cfg, repo_dir)
+    except ValueError as exc:
+        print(f"build → {exc}")
+        return 2
 
     source = cfg.build("source")
     runner = cfg.build("runner")
@@ -496,6 +893,13 @@ def _run_build_locked(args, cfg, repo_dir: str) -> int:
         plan_approved_label=cfg.build_cfg.plan_approved_label,
         killswitch_env=cfg.governance.killswitch_env,
         repo_root=repo_dir,
+        repository=repository,
+        approval_store=ApprovalStore(state_root / "approvals"),
+        decision_log=DecisionLog(state_root / "decisions"),
+        review_protocol=getattr(cfg.build_cfg, "review_protocol", "verdict_v1"),
+        contract_author_role=getattr(
+            cfg.build_cfg, "contract_author_role", "contract-author"
+        ),
         prod_refs=cfg.governance.prod_refs or None,
     )
     print(f"  tier      : {outcome.tier.value if outcome.tier else '—'}")
@@ -512,6 +916,11 @@ def _run_build_locked(args, cfg, repo_dir: str) -> int:
               "spend caps did not bind on those. Check the runner's output format.")
     if outcome.keep_workspace:
         print("  workspace : kept on disk for inspection")
+    if outcome.status is BuildStatus.SPEC_PENDING:
+        print("\n  specification questions:")
+        for question, proposed_default in outcome.pending_questions:
+            print(f"  - {question}")
+            print(f"    proposed default: {proposed_default}")
     if outcome.plan:
         # The T2 gate halts for a human to approve a plan. Printing only
         # "plan-pending" makes that approval impossible from the CLI, so the
@@ -520,10 +929,28 @@ def _run_build_locked(args, cfg, repo_dir: str) -> int:
         for line in outcome.plan.splitlines():
             print(f"  {line}")
         print("  " + "─" * 74)
-        print(f"  Approve: label the issue `{cfg.build_cfg.plan_approved_label}` and "
-              "re-run this build — it will\n  implement the plan above, which is stored "
-              f"at .factory/plans/issue-{issue.id}.md\n  and posted on the issue. Reject: "
-              "close the issue. Nothing was written to\n  the repo.")
+        if outcome.status is BuildStatus.PLAN_PENDING:
+            print(
+                f"  Legacy v1 approval: label the issue "
+                f"`{cfg.build_cfg.plan_approved_label}` and re-run this build."
+            )
+    if outcome.status is BuildStatus.APPROVAL_PENDING:
+        command_prefix = "factory"
+        config_path = getattr(args, "config", None)
+        if config_path:
+            command_prefix += f" --config {shlex.quote(config_path)}"
+        if outcome.artifact_kind == "plan":
+            command = (
+                f"{command_prefix} approve plan {shlex.quote(issue.id)} "
+                f"{outcome.artifact_digest} --parent {outcome.parent_digest}"
+            )
+        else:
+            command = (
+                f"{command_prefix} approve contract {shlex.quote(issue.id)} "
+                f"{outcome.artifact_digest}"
+            )
+        print(f"\n  Approve: {command}")
+        print("  Issue labels are informational only; they do not grant approval authority.")
     # Non-zero exit for the states a human needs to look at.
     return 0 if outcome.status.value in ("shipped", "plan-pending") else 1
 
@@ -606,6 +1033,24 @@ def build_parser() -> argparse.ArgumentParser:
     bd.add_argument("issue", help="issue id to build")
     bd.add_argument("--repo", help="path to the target git repo (default: cwd)")
     bd.set_defaults(func=cmd_build)
+
+    approve = sub.add_parser("approve", help="approve an exact contract or plan digest")
+    approval_kind = approve.add_subparsers(dest="artifact_kind", required=True)
+    approve_contract = approval_kind.add_parser("contract", help="approve a contract digest")
+    approve_contract.add_argument("issue")
+    approve_contract.add_argument("digest")
+    approve_contract.add_argument("--approver")
+    approve_contract.add_argument(
+        "--reason", default="operator approved exact artifact"
+    )
+    approve_contract.set_defaults(func=cmd_approve)
+    approve_plan = approval_kind.add_parser("plan", help="approve a plan digest")
+    approve_plan.add_argument("issue")
+    approve_plan.add_argument("digest")
+    approve_plan.add_argument("--parent", required=True)
+    approve_plan.add_argument("--approver")
+    approve_plan.add_argument("--reason", default="operator approved exact artifact")
+    approve_plan.set_defaults(func=cmd_approve)
 
     sc = sub.add_parser("schedule", help="render/install/uninstall the unattended observe schedule")
     sc.add_argument("action", choices=["render", "install", "uninstall"])

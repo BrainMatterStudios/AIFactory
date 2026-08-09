@@ -123,7 +123,7 @@ Schedule the command so these are visible, not swallowed.
 | | `0` | `1` | `2` |
 |---|---|---|---|
 | `observe` | PASS or WARN | overall FAIL | the board could not be searched — **nothing was filed** |
-| `build` | shipped, or T2 halted for approval | every other outcome | another build holds the lock |
+| `build` | shipped; deprecated compatibility plan-pending also returns 0 | specification/approval pending, deterministic review stop, failed gates, or governance stop | another build holds the lock, controller state cannot be isolated, or Contract v2 lacks a canonical repository identity |
 
 Exit `2` from `observe` deserves attention: it means dedup could not be trusted,
 so the pass deliberately filed nothing rather than duplicating every open ticket.
@@ -231,3 +231,103 @@ you are going to schedule it anyway:
 - Watch the first ten runs. Not the first one — the first ten. The defects that
   matter in this subsystem appeared on the *second* run against the same issue,
   not the first.
+
+The architecture-first controls reduce who can authorize progress; they do not
+make the autonomous builder production-ready. `findings_v2` is current guidance.
+The `verdict_v1` protocol is a deprecated v0.x compatibility path only.
+
+---
+
+## 9. Protect and recover controller state
+
+Controller state has two roots:
+
+- Approval records and decision events use `factory.build.state_dir` when it is
+  set. That manifest value takes precedence over `FACTORY_STATE_DIR`. When the
+  field is absent, the environment value is used; when both are absent, the
+  controller default is used. This root must resolve outside the source
+  repository, its workspace root, and all registered Git worktrees.
+- Exact pending/accepted contract records and contract-bound T2 plan envelopes
+  live under the canonical checkout's ignored `.factory` controller directory,
+  outside the disposable agent worktree. Pending and accepted are exclusive
+  states; conflicting or manually replaced records block.
+
+Give the controller write access to both roots and keep the agent runner
+sandboxed away from them. A different directory on an unrestricted shared host
+is organization, not an OS security boundary.
+
+Back up approvals, decision logs, pending/accepted contracts, and stored plans on
+the same retention schedule as the repository they govern. Preserve permissions
+and take a consistent snapshot of both roots. An exact approval remains
+independently checkable when a decision log is missing; the log does not
+cryptographically validate the approval. But that backup has lost audit
+continuity and cannot support claims about the complete prior lifecycle. State
+completeness and exact approval validity are separate properties. Test restoration
+in isolation, authenticate every envelope, and replay every decision chain that
+is present before relying on the result.
+
+The factory fails closed on missing, unreadable, corrupt, stale, or mismatched
+authority. Recovery is intentionally manual:
+
+1. Stop builds and preserve the unreadable state for investigation without
+   copying its contents into public logs or issues.
+2. Restore the complete last known-good approvals, decisions, contract records,
+   and plan envelopes to their controller-owned roots.
+3. Authenticate pending/accepted records and stored plans, then replay available
+   event chains before restarting work. Record any continuity gap honestly.
+4. If no trustworthy complete snapshot exists, preserve the damaged state,
+   select fresh controller state, and re-author or deliberately re-establish
+   pending/accepted contract and plan state before reissuing approvals for the
+   current exact digests. Do not truncate, hand-edit, or splice an old decision
+   log into a seemingly continuous history.
+
+Approval is exact state, not a durable boolean. Running `factory approve`
+atomically replaces the repository/issue/kind approval record. Deleting a
+matching approval revokes authority: an accepted human-owned contract remains
+the exact stored artifact, but the next run returns its same digest as
+`APPROVAL_PENDING` without re-running the contract author. Replacing the approval
+with a different digest does **not** cleanly revoke-and-continue; it mismatches the
+accepted artifact and blocks. Never edit an approval digest in place.
+
+Pending and accepted contract records are a separate lifecycle state. Accepted
+records are immutable during normal operation. To change accepted intent, stop
+all builds, back up both state roots, preserve the old record for audit, remove or
+replace the exact contract and dependent plan state through a controlled manual
+procedure, and then let the lifecycle author/checkpoint new intent and issue new
+approvals. A file replacement while a run is active is detected and blocks.
+
+Review-finding overrides follow a different path. They are append-only decision
+events bound to the exact reviewed fingerprint and finding ID, with operator
+authority and rationale. A changed artifact makes an old override stale. Do not
+turn overrides into untracked config switches.
+
+---
+
+## 10. Protect `main` and inspect public releases
+
+The package can refuse configured production refs, but only the hosting provider
+can stop a credentialed process from pushing directly. Before any unattended use
+or public release, verify an effective protected `main` ruleset requires CI and
+review and rejects unreviewed direct pushes. `require_branch_protection: true`
+and `factory doctor` are reminders, not evidence that the server enforces it.
+
+Public release inspection has two machine gates and one human gate:
+
+```bash
+uv run --extra dev python scripts/check-public-boundary.py
+uv run --extra dev python scripts/check-public-boundary.py \
+  --base-ref "$REVIEWED_PUBLIC_BASE"
+git diff "$REVIEWED_PUBLIC_BASE..HEAD"
+git ls-files
+```
+
+The current scan cannot prove that intermediate commits are safe. If the range
+scan finds prohibited content, do not push that feature history; create sanitized
+publication history and scan the range again. A human then reviews the exact
+diff and tracked-file list for private facts and third-party provenance the
+patterns cannot understand.
+
+Use [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md). Push, tag, GitHub release, and
+package-registry publication are four separate shared-state actions and each
+requires its own explicit operator approval after the relevant evidence is
+current.

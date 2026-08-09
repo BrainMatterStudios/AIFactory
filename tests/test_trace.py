@@ -1,30 +1,37 @@
 """Trace redaction + divergence-review tests (#138)."""
 from software_factory.trace import Divergence, redact, review_trace
+from tests.fixtures.synthetic_sensitive_values import (
+    AUTHORIZATION_HEADER,
+    BEARER_VALUE,
+    JWT,
+    LLM_PROVIDER_KEY,
+    REDACT_PASSWORD_ASSIGNMENT,
+    TRACE_DSN,
+)
 
 # --- redaction ---------------------------------------------------------------
 
 def test_redacts_credential_dsn():
-    assert "secret" not in redact("postgres://user:secret@db.example.com:5432/app")
+    assert "secret" not in redact(TRACE_DSN)
 
 
 def test_redacts_bearer_but_keeps_keyword():
-    out = redact("Bearer abcdef0123456789ABCDEF")
+    out = redact(BEARER_VALUE)
     assert "Bearer" in out and "abcdef0123456789ABCDEF" not in out
 
 
 def test_redacts_authorization_header_value():
-    assert "topsecret" not in redact("Authorization: topsecret0123456789abcd")
+    assert "topsecret" not in redact(AUTHORIZATION_HEADER)
 
 
 def test_redacts_jwt():
-    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w"
-    assert jwt not in redact(f"token={jwt}")
+    assert JWT not in redact(f"token={JWT}")
 
 
 def test_redacts_sensitive_assignment_keeps_name():
-    out = redact("OPENROUTER_API_KEY=sk-or-v1-0123456789abcdef0123456789abcdef")
+    out = redact("OPENROUTER_API_KEY=" + LLM_PROVIDER_KEY)
     assert out.startswith("OPENROUTER_API_KEY=")
-    assert "sk-or-v1-0123456789abcdef0123456789abcdef" not in out
+    assert LLM_PROVIDER_KEY not in out
 
 
 def test_redacts_long_hex():
@@ -40,7 +47,7 @@ def test_keeps_prices_and_small_numbers():
 
 
 def test_redact_is_idempotent():
-    once = redact("PASSWORD=hunter2hunter2hunter2")
+    once = redact(REDACT_PASSWORD_ASSIGNMENT)
     assert redact(once) == once
 
 

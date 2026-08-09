@@ -9,7 +9,11 @@ Source adapter's job; merging is never exposed anywhere in this path.
 """
 from __future__ import annotations
 
+import hashlib
+import os
+import stat
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
@@ -35,14 +39,22 @@ class Workspace(Protocol):
     def run_tests(self) -> tuple[bool, str]:
         """Run the project's verify command. Returns (passed, output)."""
 
-    def commit(self, message: str) -> None:
-        """Stage and commit. Raise `NothingToCommit` if there is nothing to."""
+    def commit(self, message: str) -> str:
+        """Stage and commit; return the exact resulting commit object name."""
 
     def changed_files(self) -> list[str]:
         """Paths this build touched, relative to the tree."""
 
-    def push(self) -> str:
-        """Push the branch; return the head ref. MUST NOT merge."""
+    def remote_tip(self) -> str | None:
+        """Return the exact remote branch tip, or ``None`` when it is absent."""
+
+    def push(
+        self,
+        revision: str | None = None,
+        *,
+        expected_remote_tip: str | object | None = ...,
+    ) -> str:
+        """Push an exact revision under a remote-tip lease. MUST NOT merge."""
 
     def reset(self) -> None:
         """Discard everything this build did and return to the base.
@@ -51,6 +63,21 @@ class Workspace(Protocol):
         architectural dead-end, so a second worker starts from a clean tree
         rather than trying to edit its way out of the first one's design.
         """
+
+    def head_revision(self) -> str:
+        """Return the exact commit currently checked out in this workspace."""
+
+    def checkpoint(self, message: str) -> str:
+        """Commit the current surface and return the resulting exact revision."""
+
+    def reset_to(self, revision: str) -> None:
+        """Discard later work and return to an owned, ancestral checkpoint."""
+
+    def review_fingerprint(self) -> str:
+        """Hash the exact branch tip and pushable working surface."""
+
+    def publication_fingerprint(self, revision: str | None = None) -> str:
+        """Hash the projected commit tree, or an exact committed revision tree."""
 
     def preserve(self, message: str = "wip: factory build stopped here") -> str | None:
         """Snapshot uncommitted work somewhere recoverable but NOT pushable.
@@ -88,6 +115,23 @@ class GitWorktree:
         return subprocess.run(
             ["git", *args], cwd=str(cwd or self.repo_dir),
             capture_output=True, text=True,
+        )
+
+    def _git_bytes(
+        self,
+        *args: str | bytes,
+        cwd: str | bytes | Path | None = None,
+    ) -> subprocess.CompletedProcess[bytes]:
+        """Run Git without decoding path-bearing output.
+
+        Git paths are byte strings on POSIX. Decoding a `-z` stream before the
+        filesystem sees it either raises or changes the name, so review-surface
+        commands keep both arguments and output as bytes end to end.
+        """
+        command = [b"git", *(os.fsencode(argument) for argument in args)]
+        working_directory = self.repo_dir if cwd is None else cwd
+        return subprocess.run(
+            command, cwd=os.fsencode(working_directory), capture_output=True
         )
 
     def _branch_exists(self) -> bool:
@@ -208,6 +252,255 @@ class GitWorktree:
             raise RuntimeError(
                 f"reset could not discard the previous attempt: "
                 f"{clean.stderr.strip() or clean.stdout.strip()}")
+
+    def head_revision(self) -> str:
+        """Return HEAD as a verified commit object name, never a symbolic ref."""
+        resolved = self._git(
+            "rev-parse", "--verify", "--quiet", "HEAD^{commit}", cwd=self.path
+        )
+        revision = resolved.stdout.strip()
+        if resolved.returncode != 0 or not revision:
+            raise RuntimeError(
+                "workspace HEAD does not resolve to a commit; refusing to create "
+                "an unverifiable checkpoint"
+            )
+        return revision
+
+    def checkpoint(self, message: str) -> str:
+        """Commit the current allowed change and verify the resulting checkpoint."""
+        self.commit(message)
+        return self.head_revision()
+
+    def reset_to(self, revision: str) -> None:
+        """Reset to an ancestral checkpoint after validating every destructive target.
+
+        Resolution and ancestry are checked against the owned branch ref before
+        inspecting the checked-out branch. Only after all three checks succeed do
+        reset/clean get a chance to discard bytes.
+        """
+        resolved_result = self._git(
+            "rev-parse", "--verify", "--quiet", "--end-of-options",
+            f"{revision}^{{commit}}", cwd=self.path,
+        )
+        resolved = resolved_result.stdout.strip()
+        if resolved_result.returncode != 0 or not resolved:
+            raise RuntimeError(
+                f"checkpoint revision {revision!r} does not resolve to a commit; "
+                "refusing to discard workspace changes"
+            )
+
+        owned_ref = f"refs/heads/{self.branch}"
+        ancestor = self._git(
+            "merge-base", "--is-ancestor", resolved, owned_ref, cwd=self.path
+        )
+        if ancestor.returncode != 0:
+            raise RuntimeError(
+                f"checkpoint revision {revision!r} is not an ancestor of owned "
+                f"branch {self.branch!r}; refusing to discard workspace changes"
+            )
+
+        self._assert_on_branch()
+        hard = self._git("reset", "--hard", resolved, cwd=self.path)
+        if hard.returncode != 0:
+            raise RuntimeError(f"reset failed: {hard.stderr.strip()}")
+        clean = self._git("clean", "-xdff", cwd=self.path)
+        if clean.returncode != 0:
+            raise RuntimeError(
+                f"reset could not discard work after checkpoint {resolved}: "
+                f"{clean.stderr.strip() or clean.stdout.strip()}"
+            )
+
+    @staticmethod
+    def _fingerprint_frame(digest, value: bytes) -> None:
+        """Hash one collision-safe field (length first, then uninterpreted bytes)."""
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+
+    def _review_paths(self) -> list[bytes]:
+        """Strictly enumerate the complete push/working surface as raw paths."""
+        commands = (
+            ("diff", "--name-only", "-z", f"{self.base}...HEAD"),
+            ("diff", "--name-only", "-z", "HEAD"),
+            ("ls-files", "-z", "--others", "--exclude-standard"),
+        )
+        paths: set[bytes] = set()
+        for command in commands:
+            result = self._git_bytes(*command, cwd=self.path)
+            if result.returncode != 0:
+                detail = os.fsdecode(result.stderr).strip() or "unknown Git error"
+                rendered = "git " + " ".join(command)
+                raise RuntimeError(
+                    f"could not enumerate review surface with {rendered}: {detail}"
+                )
+            if result.stdout and not result.stdout.endswith(b"\0"):
+                raise RuntimeError(
+                    "could not enumerate review surface: Git returned a malformed "
+                    f"NUL-delimited path stream for {' '.join(command)}"
+                )
+            paths.update(path for path in result.stdout.split(b"\0") if path)
+        return sorted(paths)
+
+    def _index_entry(self, path: bytes) -> tuple[bytes, bytes] | None:
+        """Return (Git mode, object id) for a stage-zero index entry."""
+        result = self._git_bytes(
+            "ls-files", "--stage", "-z", "--", path, cwd=self.path
+        )
+        if result.returncode != 0:
+            detail = os.fsdecode(result.stderr).strip() or "unknown Git error"
+            raise RuntimeError(
+                f"could not enumerate review surface index entry for "
+                f"{os.fsdecode(path)!r}: {detail}"
+            )
+        if not result.stdout:
+            return None
+        metadata, separator, _ = result.stdout.partition(b"\t")
+        if not separator:
+            return None
+        fields = metadata.split()
+        if len(fields) != 3 or fields[2] != b"0":
+            return None
+        return fields[0], fields[1]
+
+    def _embedded_repository_head(self, path: bytes) -> bytes:
+        """Resolve an untracked embedded repo exactly as `git add -A` stages it."""
+        result = self._git_bytes(
+            "-C", path, "rev-parse", "--verify", "--quiet", "HEAD^{commit}",
+            cwd=self.path,
+        )
+        head = result.stdout.strip()
+        if result.returncode != 0 or not head:
+            detail = os.fsdecode(result.stderr).strip() or "HEAD is not a commit"
+            raise RuntimeError(
+                f"could not fingerprint embedded repository {os.fsdecode(path)!r}: "
+                f"{detail}"
+            )
+        return head
+
+    def review_fingerprint(self) -> str:
+        """Hash HEAD and every path exactly as a subsequent ``git add -A`` sees it.
+
+        Each record carries a raw filesystem path, Git mode/type, an explicit
+        deletion marker, and content bytes. Symlink content is the link target
+        itself, read with ``readlink``; it is never the target file's content.
+        Length-framing every field makes odd paths and arbitrary bytes
+        unambiguous without relying on a delimiter that Git permits in a name.
+        """
+        digest = hashlib.sha256()
+        self._fingerprint_frame(digest, b"software-factory-review-v1")
+        self._fingerprint_frame(digest, self.head_revision().encode("ascii"))
+
+        root = os.fsencode(self.path)
+        for reported_path in self._review_paths():
+            raw_path = reported_path.rstrip(b"/") if reported_path.endswith(b"/") \
+                else reported_path
+            if (not raw_path or os.path.isabs(reported_path) or b"\0" in raw_path
+                    or b".." in raw_path.split(os.sep.encode())):
+                raise RuntimeError(
+                    f"Git reported unsafe review path {os.fsdecode(raw_path)!r}"
+                )
+            full_path = os.path.join(root, reported_path)
+            index_entry = self._index_entry(raw_path)
+
+            try:
+                info = os.lstat(full_path)
+            except FileNotFoundError:
+                mode = b"000000"
+                kind = b"deleted"
+                deleted = b"1"
+                content = b""
+            else:
+                deleted = b"0"
+                if stat.S_ISLNK(info.st_mode):
+                    mode = b"120000"
+                    kind = b"symlink"
+                    content = os.readlink(full_path)
+                    if isinstance(content, str):
+                        content = os.fsencode(content)
+                elif stat.S_ISREG(info.st_mode):
+                    mode = b"100755" if info.st_mode & 0o111 else b"100644"
+                    kind = b"file"
+                    with open(full_path, "rb") as source:
+                        content = source.read()
+                elif stat.S_ISDIR(info.st_mode) and (
+                    reported_path.endswith(b"/")
+                    or (index_entry and index_entry[0] == b"160000")
+                ):
+                    mode = b"160000"
+                    kind = b"gitlink"
+                    if reported_path.endswith(b"/"):
+                        content = self._embedded_repository_head(full_path)
+                    elif os.path.lexists(os.path.join(full_path, b".git")):
+                        submodule_head = self._git_bytes(
+                            "-C", full_path, "rev-parse", "--verify", "--quiet",
+                            "HEAD^{commit}", cwd=self.path,
+                        )
+                        content = (submodule_head.stdout.strip()
+                                   if submodule_head.returncode == 0
+                                   and submodule_head.stdout.strip()
+                                   else index_entry[1])
+                    else:
+                        content = index_entry[1]
+                else:
+                    # Git cannot add sockets/FIFOs/devices, but including their
+                    # exact filesystem type keeps the review sensor fail-closed
+                    # until the normal commit gate rejects them.
+                    mode = f"{stat.S_IFMT(info.st_mode):06o}".encode("ascii")
+                    kind = b"special"
+                    content = b""
+
+            self._fingerprint_frame(digest, b"record")
+            self._fingerprint_frame(digest, raw_path)
+            self._fingerprint_frame(digest, mode)
+            self._fingerprint_frame(digest, kind)
+            self._fingerprint_frame(digest, deleted)
+            self._fingerprint_frame(digest, content)
+
+        return digest.hexdigest()
+
+    def publication_fingerprint(self, revision: str | None = None) -> str:
+        """Hash the exact Git tree that publication would create or already created."""
+        if revision is not None:
+            result = self._git(
+                "rev-parse", "--verify", "--quiet", "--end-of-options",
+                f"{revision}^{{tree}}", cwd=self.path,
+            )
+            tree = result.stdout.strip()
+        else:
+            with tempfile.TemporaryDirectory(
+                prefix="software-factory-index-"
+            ) as temporary:
+                index = Path(temporary) / "index"
+                environment = {**os.environ, "GIT_INDEX_FILE": str(index)}
+                commands = (
+                    ("read-tree", "HEAD"),
+                    ("add", "-A", "--", "."),
+                    ("write-tree",),
+                )
+                result = None
+                for command in commands:
+                    result = subprocess.run(
+                        ["git", *command],
+                        cwd=self.path,
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    if result.returncode != 0:
+                        raise RuntimeError(
+                            "could not compute the exact publication surface"
+                        )
+                assert result is not None
+                tree = result.stdout.strip()
+        if (
+            result.returncode != 0
+            or len(tree) not in {40, 64}
+            or any(character not in "0123456789abcdef" for character in tree)
+        ):
+            raise RuntimeError("could not resolve the exact publication tree")
+        return hashlib.sha256(
+            b"software-factory-publication-v1\0" + tree.encode("ascii")
+        ).hexdigest()
 
     def _reanchor(self) -> None:
         """Make sure a reused worktree is not building against stale code.
@@ -337,7 +630,7 @@ class GitWorktree:
             return False, f"verify_cmd could not be run: {e}"
         return proc.returncode == 0, (proc.stdout + proc.stderr)
 
-    def commit(self, message: str) -> None:
+    def commit(self, message: str) -> str:
         """Stage and commit. Raises `NothingToCommit` when the build produced no
         change — the likeliest first-run outcome for a misconfigured runner, and
         one that used to escape as a bare `git commit failed:` with empty stderr."""
@@ -352,16 +645,68 @@ class GitWorktree:
         # branch ref, exits 0 ("Everything up-to-date"), and the loop reports
         # SHIPPED over an empty PR.
         self._assert_on_branch()
-        self._git("add", "-A", cwd=self.path)
-        r = self._git("commit", "-m", message, cwd=self.path)
-        if r.returncode != 0:
-            # Nothing staged, but has_changes() was true — the agent committed its
-            # own work. That is a complete build, not a failure.
-            if "nothing to commit" in (r.stdout + r.stderr).lower():
-                return
-            raise RuntimeError(f"git commit failed: {r.stderr.strip() or r.stdout.strip()}")
+        # Repository-controlled hooks run arbitrary code in the controller's
+        # process. In particular, a pre-commit hook can stage new bytes after the
+        # review/secret gates. Override *all* hook discovery with a freshly made,
+        # controller-owned empty directory for both index and commit operations.
+        hooks_path = Path(tempfile.mkdtemp(prefix="software-factory-hooks-"))
+        hooks_path.chmod(0o700)
+        try:
+            add = self._git(
+                "-c", f"core.hooksPath={hooks_path}", "add", "-A", cwd=self.path
+            )
+            if add.returncode != 0:
+                raise RuntimeError(
+                    f"git add failed: {add.stderr.strip() or add.stdout.strip()}"
+                )
+            r = self._git(
+                "-c", f"core.hooksPath={hooks_path}",
+                "commit", "--no-verify", "-m", message, cwd=self.path,
+            )
+        finally:
+            try:
+                hooks_path.rmdir()
+            except OSError:
+                pass
+        if (
+            r.returncode != 0
+            and "nothing to commit" not in (r.stdout + r.stderr).lower()
+        ):
+            raise RuntimeError(
+                f"git commit failed: {r.stderr.strip() or r.stdout.strip()}"
+            )
+        return self.head_revision()
 
-    def push(self) -> str:
+    def remote_tip(self) -> str | None:
+        """Read the authoritative remote ref without trusting tracking state."""
+        ref = f"refs/heads/{self.branch}"
+        result = self._git("ls-remote", "--heads", "origin", ref, cwd=self.path)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"could not read remote branch tip: "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        if not lines:
+            return None
+        if len(lines) != 1:
+            raise RuntimeError("remote returned an ambiguous branch tip")
+        fields = lines[0].split()
+        if (
+            len(fields) != 2
+            or fields[1] != ref
+            or len(fields[0]) not in {40, 64}
+            or any(character not in "0123456789abcdef" for character in fields[0])
+        ):
+            raise RuntimeError("remote returned a malformed branch tip")
+        return fields[0]
+
+    def push(
+        self,
+        revision: str | None = None,
+        *,
+        expected_remote_tip: str | object | None = ...,
+    ) -> str:
         """Push the branch and confirm the remote actually has this build's work.
 
         `git push` exits 0 for "Everything up-to-date", so a successful exit says
@@ -371,17 +716,53 @@ class GitWorktree:
         facts — and the PR is opened on the strength of the second one.
         """
         self._assert_on_branch()
-        local = self._git("rev-parse", self.branch, cwd=self.path)
-        r = self._git("push", "-u", "origin", self.branch, cwd=self.path)
+        if revision is None:
+            revision = self.head_revision()
+        resolved = self._git(
+            "rev-parse", "--verify", "--quiet", "--end-of-options",
+            f"{revision}^{{commit}}", cwd=self.path,
+        )
+        exact_revision = resolved.stdout.strip()
+        if resolved.returncode != 0 or not exact_revision or exact_revision != revision:
+            raise RuntimeError("publication revision does not resolve to the exact commit")
+        if expected_remote_tip is ...:
+            expected_remote_tip = self.remote_tip()
+        elif expected_remote_tip is not None and (
+            not isinstance(expected_remote_tip, str)
+            or len(expected_remote_tip) not in {40, 64}
+            or any(
+                character not in "0123456789abcdef"
+                for character in expected_remote_tip
+            )
+        ):
+            raise RuntimeError("expected remote tip is not an exact commit SHA")
+        remote_ref = f"refs/heads/{self.branch}"
+        lease = f"--force-with-lease={remote_ref}:{expected_remote_tip or ''}"
+        refspec = f"{exact_revision}:{remote_ref}"
+        hooks_path = Path(tempfile.mkdtemp(prefix="software-factory-hooks-"))
+        hooks_path.chmod(0o700)
+        try:
+            r = self._git(
+                "-c", f"core.hooksPath={hooks_path}",
+                "push", "--no-verify", "-u", lease, "origin", refspec,
+                cwd=self.path,
+            )
+        finally:
+            try:
+                hooks_path.rmdir()
+            except OSError:
+                pass
         if r.returncode != 0:
-            raise RuntimeError(f"git push failed: {r.stderr.strip()}")
-        remote = self._git("rev-parse", f"origin/{self.branch}", cwd=self.path)
-        if (local.returncode == 0 and remote.returncode == 0
-                and local.stdout.strip() != remote.stdout.strip()):
+            raise RuntimeError(
+                "git push failed under the remote-tip lease: "
+                f"{r.stderr.strip() or r.stdout.strip()}"
+            )
+        remote = self.remote_tip()
+        if remote != exact_revision:
             raise RuntimeError(
                 f"push reported success but origin/{self.branch} is at "
-                f"{remote.stdout.strip()[:8]} while the local branch is at "
-                f"{local.stdout.strip()[:8]} — refusing to open a PR for work "
+                f"{(remote or '<absent>')[:8]} while the verified revision is at "
+                f"{exact_revision[:8]} — refusing to open a PR for work "
                 "the remote does not have")
         return self.branch
         # NOTE: there is intentionally no merge() — the ceiling.

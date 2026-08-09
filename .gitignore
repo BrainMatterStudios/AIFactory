@@ -28,6 +28,7 @@ factory.config.json
 .factory/
 # agent isolation worktrees
 .claude/worktrees/
+.worktrees/
 
 # setuptools output — committed by accident once; never again.
 # Root-anchored: a bare `build/` also matches software_factory/build/,

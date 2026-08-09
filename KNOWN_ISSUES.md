@@ -14,11 +14,14 @@ present. It is the newest code in this package and the only major subsystem with
 no production provenance: everything else was generalized from a factory that has
 run against a live system, and this was written from scratch.
 
-Eight independent adversarial review panels have examined it, and the
-ninth change here is a redesign rather than another fix. Every one found
-defects, and every serious defect they found was here rather than in the ported
-subsystems. All of the following were reproduced, and are fixed — the list exists
-so you can judge the code's maturity, not because these are open:
+Eight independent adversarial review panels examined the pre-0.2 builder, and the
+ninth change was a redesign rather than another parser fix. Every panel found
+defects, and every serious defect it found was here rather than in the ported
+subsystems. The table is retained as historical v0.1.x evidence: references to
+the old judge file, label authority, Contract v1, or `verdict_v1` describe
+deprecated compatibility behavior and are not current guidance. The defects were
+reproduced and fixed; the list exists so you can judge maturity, not because each
+item remains open.
 
 | Round | Found |
 |---|---|
@@ -53,81 +56,60 @@ and leave running.
 
 **Specific limitations, current:**
 
-- **Your dev branch must exist locally.** Nothing here runs `git fetch`. On a
-  fresh clone where `develop` is only `origin/develop`, the build refuses with the
-  fetch command to run. This is deliberate — resolving it automatically is how git
-  silently checks out the wrong branch.
-- **The secret gate is a backstop, not a guarantee.** It uses high-signal
-  patterns (`loop/security.py`): a credential literal — including one assigned to
-  a prefixed identifier like `DATABASE_PASSWORD`, and including unquoted values —
-  a DSN carrying a password, and the common provider key prefixes. A novel
-  credential format with no keyword and no known prefix will not match, and a
-  value that looks like indirection (`os.environ[...]`, `${VAR}`) is deliberately
-  ignored. Content is never skipped for looking binary — one leading NUL byte
-  used to be a complete bypass — and the build gate scans up to 50 MB per file,
-  refusing anything larger rather than passing it through unscanned.
-- **One build per repo at a time**, enforced by a lock under `.factory/`. The
-  stale-lock reclaim took three attempts to get right; the third was prompted by
-  a CI runner handing the lock to two of six racers on a test that had passed
-  locally for days. If a process is killed *during* a reclaim it leaves a
-  `.reclaim.*` marker, and that one abandoned lock can no longer be reclaimed
-  until the marker is deleted by hand. That is the deliberate trade: refusing to
-  run is a safe failure, running twice is not.
-- **Budget caps bind only when your runner reports a cost.** A runner that leaves
-  `RunResult.cost_usd` at 0 makes them advisory; the loop counts those turns and
-  says so, but cannot stop them.
-- **Not concurrency-safe across projects** sharing one state directory for spend
-  accounting, beyond the per-project keys.
-- **`files_changed` is always 0 in autonomous tiering.** `derive_signals` reads an
-  issue, not a diff, so the size signal `classify_tier` accepts is unused there.
-  Scope and risk signals (production impact, migrations, cross-cutting work,
-  security) *are* derived from labels and issue text, but from keywords — expect
-  to tune them, and expect an unusually-worded issue to route one tier low.
-- **The contract gate is opt-in and off by default** (`build.require_contract`).
-  It only means something in a repo that writes `contracts/<issue>.json`; turned
-  on elsewhere it blocks every build for a missing file nobody agreed to write.
-  When on, it fails closed: a commit order it cannot read is a block, not a pass.
-  It checks commit order, document shape, and that no criterion carries an
-  instruction aimed at the judge — but there is **no negotiation round** in the
-  autonomous loop, so it cannot require the evidence of one, and a contract that
-  lands in the same commit as its implementation satisfies "at or before". The
-  doctrine's version of this gate is stronger than the autonomous one.
-- **The issue body reaches the judge's prompt.** Anyone who can file an issue can
-  put text in it, and the judge brief includes the issue and (when enabled) the
-  contract. Field syntax in that text is neutralised before it is pasted in
-  (`briefs.quote_untrusted`), so a judge quoting it back cannot be read as a
-  verdict — but neutralising a known field syntax is not the same as making
-  untrusted text safe to put in a prompt. Treat board write access as trusted.
-- **The judge's verdict is a file, not its reply.** The judge writes
-  `.factory/judge-verdict.json` and the loop reads only that; its prose carries
-  no authority and is never parsed. This replaced four rounds of trying to read a
-  verdict out of free text, each of which closed one misreading and opened
-  another. A missing, unreadable or invalid document is a REVISE, never a PASS.
-  The cost of the change is that a judge which cannot follow the protocol
-  produces no usable verdict and, after the revise budget, escalates to a human —
-  that is the intended failure, but it does mean the judge model has to be
-  capable of writing a small JSON file reliably.
-- **The judge's tool allowlist is advisory, and now includes `Write`.** It has to:
-  the verdict is a file the judge creates. A runner that ignores `tools` enforces
-  nothing either way. What actually holds the line is the re-run of your
-  `verify_cmd` against the tree about to be pushed, which turns any other
-  mutation into a blocked build rather than an untested PR.
-- **The runner deny list is pattern matching, not a sandbox.** The reference
-  Claude runner refuses `git push`, `git merge`, `git tag`, `gh pr merge`,
-  `gh release` and `gh workflow run` on every turn. A shell script or an
-  unmatched spelling reaches the same effect. It narrows the surface; unattended
-  operation still wants a sandboxed runner and least-privilege credentials.
-- **T2 plan approval is a label and a file.** The plan is stored under
-  `.factory/plans/issue-<id>.md` and posted on the issue; adding
-  `build.plan_approved_label` (default `plan-approved`) makes the next run
-  implement it. The approval is therefore only as strong as who can add a label
-  to your issues, and the stored plan is not signed — an editable file plus a
-  label is a workflow, not a cryptographic control.
-- **A RESTART discards the branch.** `Workspace.reset()` hard-resets to the base
-  and runs `git clean -xdff` in the worktree. That is the intent — a restart
-  exists to throw the work away — but it is destructive, and a custom `Workspace`
-  implementation must honour the same contract or the second attempt inherits the
-  first one's tree.
+- **Schema conformance is not semantic truth.** Contract v2 validates structure,
+  references, declared risk, bounds, mechanisms, and coverage. It cannot prove
+  that facts were not omitted, the scope is correct, or an acceptance expression
+  actually demonstrates the invariant it names.
+- **Deterministic routing does not make observations correct.** `findings_v2`
+  prevents a model from granting authority through prose, but sensors can miss a
+  real problem or report a false positive. Overrides must be exact,
+  authority-bearing decision events so their rate can be audited.
+- **There is no separate general design gate.** A general design intermediate
+  representation, universal third-party analyzer adapters, code-to-intent
+  re-extraction, and automatic policy discovery are deferred. Existing scanners
+  can provide evidence, but AIFactory does not make their coverage universal.
+- **Directory separation is not an OS security boundary.** Approval and decision
+  state lives outside worktrees, but an unrestricted runner on the same host may
+  still reach it. Sandbox agents and use least-privilege controller and release
+  credentials.
+- **Approval identity is not cryptographic.** Records prove which exact artifact
+  the local controller accepted using explicit or local Git identity. They are
+  not signed identity assertions. The decision chain is tamper-evident on replay,
+  not an externally witnessed transparency log.
+- **The secret and public-content gates are backstops, not guarantees.** Pattern
+  checks can miss novel credentials, private facts, or provenance problems. The
+  public current-tree scan also cannot certify intermediate commits; every public
+  candidate needs a clean history-range scan and exact-diff human review.
+- **The runner deny list is pattern matching, not a sandbox.** A script or
+  unmatched spelling can reach an action the reference runner intended to deny.
+  Protected `main` and least-privilege credentials must enforce the real ceiling.
+- **Untrusted issue and contract text still reaches models.** Quoting makes it
+  inert to controller parsers; it does not make prompt injection impossible.
+  Deterministic gates constrain authority, not model behavior.
+- **Your development branch must exist locally.** Nothing here runs `git fetch`.
+  The build refuses rather than guessing at a remote branch.
+- **One build runs per repository.** If a process dies during stale-lock reclaim,
+  the abandoned reclaim marker requires human inspection before removal. Refusal
+  is preferred to two simultaneous writers.
+- **Budget caps depend on reported cost** and spend accounting is not
+  concurrency-safe across projects that share one state directory. An unmetered
+  runner cannot be capped accurately.
+- **Autonomous tier size is incomplete.** Issue-derived scope and risk are
+  heuristic, and `files_changed` is unavailable before implementation. Unusual
+  wording can route work one tier low.
+- **Restarts are destructive by design.** The v2 path validates the target and
+  resets to the accepted contract checkpoint, then removes implementation files.
+  Custom workspaces without required checkpoint semantics are refused. The old
+  base-reset behavior exists only in deprecated `verdict_v1` compatibility.
+- **Controller-state corruption stops progress.** Recovery requires a complete
+  known-good backup or fresh state with approvals reissued against current
+  digests. Hand-editing or truncating an authority record is not recovery.
+- **Server-side protection is external.** `factory doctor` can warn about
+  configuration but cannot prove the hosting provider protects `main`.
+- **This is engineering, not scientific validation.** The project does not claim
+  structured intent reliably improves software, and the autonomous builder
+  remains experimental. Do not schedule it unattended on an important
+  repository.
 
 ---
 

@@ -60,9 +60,9 @@ def test_bool_is_not_int_for_issue():
     assert any("expected int, got bool" in e for e in errors)
 
 
-def test_schema_version_must_be_one():
-    errors = validate_contract(_valid_contract(schema_version=2))
-    assert any("schema_version must be 1" in e for e in errors)
+def test_schema_version_must_be_supported():
+    errors = validate_contract(_valid_contract(schema_version=3))
+    assert any("schema_version must be 1 or 2" in e for e in errors)
 
 
 def test_tier_must_be_t1_or_t2():

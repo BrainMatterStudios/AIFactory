@@ -22,6 +22,23 @@ permissions:
 # trailing comment is the human-readable version; the SHA is what runs.
 
 jobs:
+  public-boundary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1    # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Reject private or unsafe tracked content
+        run: python scripts/check-public-boundary.py
+      - name: Reject private content from every pull-request commit
+        if: github.event_name == 'pull_request'
+        env:
+          PUBLIC_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python scripts/check-public-boundary.py --base-ref "$PUBLIC_BASE_SHA"
+
   test:
     runs-on: ubuntu-latest
     strategy:
