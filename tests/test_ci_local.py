@@ -37,7 +37,7 @@ allocation="$(allocate_toolchain_dir)"
 toolchain="${allocation%%|*}"
 identity="${allocation#*|}"
 case "$toolchain" in "$2"/software-factory-ci-local.*) ;; *) exit 8 ;; esac
-test "$(/usr/bin/stat -f '%Lp' "$toolchain" 2>/dev/null || /usr/bin/stat -c '%a' "$toolchain")" = 700
+test "$("$BOOTSTRAP_PYTHON" -c 'import os, stat, sys; print(f"{stat.S_IMODE(os.lstat(sys.argv[1]).st_mode):o}")' "$toolchain")" = 700
 test ! -e "$2/executed"
 cleanup_toolchain "$toolchain" "$identity"
 test ! -e "$toolchain"
