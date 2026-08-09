@@ -87,7 +87,7 @@ factory:
   plugins: [mycompany_factory.dokploy]     # imported before any adapter is built
   observe:
     provider: dokploy
-    base_url: https://dokploy.internal
+    base_url: https://dokploy.example.test
     app_ids: [api, worker]
 ```
 

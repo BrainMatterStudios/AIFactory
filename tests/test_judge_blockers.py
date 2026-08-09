@@ -5,15 +5,19 @@ which is the point: each failure mode was invisible to the suite that existed.
 The import-cycle test in particular has to spawn a subprocess, because pytest's
 collection order imports the package in an order that hides the cycle.
 """
+import errno
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
+import software_factory.core.governance as governance_module
 from software_factory.core.config import FactoryConfig
 from software_factory.core.governance import (
     AlreadyRunning,
@@ -21,6 +25,7 @@ from software_factory.core.governance import (
     crosses_prod_boundary,
     resolve_repo_root,
 )
+from tests.fixtures.synthetic_sensitive_values import GITHUB_TOKEN
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -154,7 +159,7 @@ def _worktree(repo):
     return ws
 
 
-TOKEN_LINE = 'TOKEN = "ghp_16C7e42F292c6912E7710c838347Ae178B4a"\n'
+TOKEN_LINE = f'TOKEN = "{GITHUB_TOKEN}"\n'
 
 
 def test_a_secret_the_agent_committed_is_still_scanned(tmp_path):
@@ -275,6 +280,27 @@ def test_exactly_one_process_wins_against_a_stale_lock(tmp_path):
     assert results.count("ACQUIRED") == 1, f"expected exactly one winner, got {results}"
 
 
+def test_process_exit_releases_descriptor_authority_for_crash_recovery(tmp_path):
+    lock = tmp_path / "build.lock"
+    script = f"""
+import os, sys
+sys.path.insert(0, {str(REPO_ROOT)!r})
+from software_factory.core.governance import RunLock
+RunLock({str(lock)!r}).acquire()
+os._exit(0)
+"""
+    completed = subprocess.run([sys.executable, "-c", script], timeout=30)
+    assert completed.returncode == 0
+    crashed_diagnostic = lock.read_bytes()
+
+    recovered = RunLock(lock)
+    recovered.acquire()
+    try:
+        assert lock.read_bytes() != crashed_diagnostic
+    finally:
+        recovered.release()
+
+
 def test_release_only_removes_our_own_lock(tmp_path):
     """Unlinking by path would delete a fresh lock a later run legitimately took."""
     lock = tmp_path / "build.lock"
@@ -284,6 +310,610 @@ def test_release_only_removes_our_own_lock(tmp_path):
     lock.write_text("999999\n")                     # someone else's lock now sits here
     mine.release()
     assert lock.exists(), "release() must not delete a lock it does not own"
+
+
+def test_paused_release_cannot_delete_fresh_diagnostics_or_admit_two_holders(
+    tmp_path, monkeypatch
+):
+    """Model the retired check-then-unlink release schedule at authority close.
+
+    There is no token-check hook anymore: release reaches one authoritative
+    operation, closing the flocked repository descriptor.  Pause there, replace
+    the diagnostic through its public path, and prove both that the replacement
+    survives and that a contender cannot become a second holder.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    lock = repo / ".factory" / "build.lock"
+    holder = RunLock(lock)
+    contender = RunLock(lock)
+    observer = RunLock(lock)
+    holder.acquire()
+    paused = threading.Event()
+    resume = threading.Event()
+    hook_calls = []
+    release_errors = []
+    real_close = os.close
+    authority_identity = (repo.stat().st_dev, repo.stat().st_ino)
+    release_thread = None
+
+    def pause_authority_close(descriptor):
+        try:
+            info = os.fstat(descriptor)
+        except OSError:
+            return real_close(descriptor)
+        if (
+            threading.current_thread() is release_thread
+            and (info.st_dev, info.st_ino) == authority_identity
+            and not hook_calls
+        ):
+            hook_calls.append(descriptor)
+            paused.set()
+            if not resume.wait(timeout=10):
+                raise AssertionError("release barrier was not resumed")
+        return real_close(descriptor)
+
+    def release_holder():
+        try:
+            holder.release()
+        except BaseException as exc:  # surfaced to the asserting thread below
+            release_errors.append(exc)
+
+    with monkeypatch.context() as close_patch:
+        close_patch.setattr(governance_module.os, "close", pause_authority_close)
+        release_thread = threading.Thread(target=release_holder)
+        release_thread.start()
+        try:
+            assert paused.wait(timeout=10), "authoritative release pause did not execute"
+            lock.unlink()
+            lock.write_text("replacement diagnostics\n")
+            lock.chmod(0o600)
+
+            with pytest.raises(AlreadyRunning):
+                contender.acquire()
+            assert lock.read_bytes() == b"replacement diagnostics\n"
+        finally:
+            resume.set()
+            release_thread.join(timeout=10)
+
+    assert hook_calls, "the test never reached the coordinated authority close"
+    assert not release_thread.is_alive()
+    assert release_errors == []
+    assert lock.read_bytes() == b"replacement diagnostics\n"
+
+    try:
+        contender.acquire()
+        with pytest.raises(AlreadyRunning):
+            observer.acquire()
+    finally:
+        observer.release()
+        contender.release()
+
+
+def test_paused_reclaimer_cannot_delete_fresh_diagnostics_or_admit_two_holders(
+    tmp_path, monkeypatch
+):
+    """Model the retired stale-check/unlink schedule at authoritative flock.
+
+    Stale diagnostics no longer have an authority-bearing check hook.  Pause a
+    would-be reclaimer at its current authority operation, replace the diagnostic
+    while the live holder retains the flock, then prove the paused attempt is
+    refused without deleting the replacement.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    lock = repo / ".factory" / "build.lock"
+    holder = RunLock(lock)
+    reclaimer = RunLock(lock, stale_after_s=-1)
+    observer = RunLock(lock)
+    holder.acquire()
+    paused = threading.Event()
+    resume = threading.Event()
+    hook_calls = []
+    reclaimer_result = []
+    reclaimer_thread = None
+    assert governance_module._fcntl is not None
+    real_flock = governance_module._fcntl.flock
+
+    def pause_reclaimer_flock(descriptor, operation):
+        if threading.current_thread() is reclaimer_thread and not hook_calls:
+            hook_calls.append((descriptor, operation))
+            paused.set()
+            if not resume.wait(timeout=10):
+                raise AssertionError("reclaimer barrier was not resumed")
+        return real_flock(descriptor, operation)
+
+    def acquire_as_reclaimer():
+        try:
+            reclaimer.acquire()
+        except AlreadyRunning:
+            reclaimer_result.append("refused")
+        except BaseException as exc:  # surfaced to the asserting thread below
+            reclaimer_result.append(exc)
+        else:
+            reclaimer_result.append("acquired")
+
+    with monkeypatch.context() as flock_patch:
+        flock_patch.setattr(
+            governance_module._fcntl,
+            "flock",
+            pause_reclaimer_flock,
+        )
+        reclaimer_thread = threading.Thread(target=acquire_as_reclaimer)
+        reclaimer_thread.start()
+        try:
+            assert paused.wait(timeout=10), "authoritative reclaimer pause did not execute"
+            lock.unlink()
+            lock.write_text("fresh holder diagnostics\n")
+            lock.chmod(0o600)
+        finally:
+            resume.set()
+            reclaimer_thread.join(timeout=10)
+
+    assert hook_calls, "the test never reached the coordinated flock attempt"
+    assert not reclaimer_thread.is_alive()
+    assert reclaimer_result == ["refused"]
+    assert lock.read_bytes() == b"fresh holder diagnostics\n"
+
+    try:
+        holder.release()
+        reclaimer.acquire()
+        with pytest.raises(AlreadyRunning):
+            observer.acquire()
+    finally:
+        observer.release()
+        reclaimer.release()
+
+
+def test_parent_path_swap_cannot_redirect_acquire_or_release(tmp_path, monkeypatch):
+    """Diagnostic writes stay on the validated directory descriptor."""
+    repo = tmp_path / "repo"
+    managed = repo / ".factory"
+    managed.mkdir(parents=True, mode=0o700)
+    attacker = tmp_path / "attacker"
+    attacker.mkdir(mode=0o700)
+    pinned = repo / ".factory-pinned"
+    lock = RunLock(managed / "build.lock")
+    original_write_diagnostic = lock._write_diagnostic_record
+    swapped = False
+
+    def swap_then_write_diagnostic():
+        nonlocal swapped
+        if not swapped:
+            managed.rename(pinned)
+            managed.symlink_to(attacker, target_is_directory=True)
+            swapped = True
+        return original_write_diagnostic()
+
+    monkeypatch.setattr(
+        lock,
+        "_write_diagnostic_record",
+        swap_then_write_diagnostic,
+    )
+
+    lock.acquire()
+
+    assert (pinned / "build.lock").is_file()
+    assert not (attacker / "build.lock").exists()
+    lock.release()
+    assert (pinned / "build.lock").is_file()
+    assert not (attacker / "build.lock").exists()
+
+
+def test_recreated_managed_directory_cannot_split_lock_authority(tmp_path):
+    """Independent instances must agree even after valid D1 is replaced by D2."""
+    repo = tmp_path / "repo"
+    managed = repo / ".factory"
+    managed.mkdir(parents=True, mode=0o700)
+    pinned = repo / ".factory-pinned"
+    holder = RunLock(managed / "build.lock")
+    contender = RunLock(managed / "build.lock")
+    holder.acquire()
+    managed.rename(pinned)
+    managed.mkdir(mode=0o700)
+
+    try:
+        with pytest.raises(AlreadyRunning):
+            contender.acquire()
+        assert not (managed / "build.lock").exists()
+    finally:
+        contender.release()
+        holder.release()
+
+    contender.acquire()
+    contender.release()
+
+
+def test_lock_authority_has_no_replaceable_root_artifact(tmp_path):
+    """The authority is the stable root inode, never a generated named file."""
+    repo = tmp_path / "repo"
+    managed = repo / ".factory"
+    managed.mkdir(parents=True, mode=0o700)
+    holder = RunLock(managed / "build.lock")
+    contender = RunLock(managed / "build.lock")
+    holder.acquire()
+    assert [entry for entry in repo.iterdir() if entry.is_file()] == []
+
+    try:
+        with pytest.raises(AlreadyRunning):
+            contender.acquire()
+    finally:
+        contender.release()
+        holder.release()
+
+
+def test_interrupted_acquire_releases_descriptor_authority(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    interrupted = RunLock(repo / ".factory" / "build.lock")
+    contender = RunLock(repo / ".factory" / "build.lock")
+
+    def interrupt_parent_preparation():
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        interrupted,
+        "_prepare_private_parent",
+        interrupt_parent_preparation,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        interrupted.acquire()
+
+    contender.acquire()
+    contender.release()
+
+
+def _assert_descriptor_is_closed(descriptor):
+    with pytest.raises(OSError) as caught:
+        os.fstat(descriptor)
+    assert caught.value.errno == errno.EBADF
+
+
+def test_interrupted_local_authority_cleanup_preserves_primary_and_releases_flock(
+    tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    interrupted = RunLock(repo / ".factory" / "build.lock")
+    contender = RunLock(repo / ".factory" / "build.lock")
+    opened = {}
+    close_interruptions = []
+    real_close = os.close
+    assert governance_module._fcntl is not None
+    real_flock = governance_module._fcntl.flock
+
+    class AcquireAbort(BaseException):
+        pass
+
+    class CleanupAbort(BaseException):
+        pass
+
+    primary = AcquireAbort("primary authority acquisition interruption")
+
+    def acquire_flock_then_abort(descriptor, operation):
+        real_flock(descriptor, operation)
+        opened["authority_fd"] = descriptor
+        raise primary
+
+    def interrupt_local_close(descriptor):
+        if descriptor == opened.get("authority_fd") and not close_interruptions:
+            close_interruptions.append(descriptor)
+            raise CleanupAbort("local authority close interruption")
+        return real_close(descriptor)
+
+    with monkeypatch.context() as cleanup_patch:
+        cleanup_patch.setattr(
+            governance_module._fcntl,
+            "flock",
+            acquire_flock_then_abort,
+        )
+        cleanup_patch.setattr(governance_module.os, "close", interrupt_local_close)
+        with pytest.raises(AcquireAbort) as caught:
+            interrupted.acquire()
+
+    assert caught.value is primary
+    assert close_interruptions == [opened["authority_fd"]]
+    assert interrupted._parent_fd is None
+    assert interrupted._authority_fd is None
+    _assert_descriptor_is_closed(opened["authority_fd"])
+    contender.acquire()
+    contender.release()
+
+
+def test_interrupted_local_parent_cleanup_preserves_primary_and_closes_all_fds(
+    tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    managed = repo / ".factory"
+    interrupted = RunLock(managed / "build.lock")
+    contender = RunLock(managed / "build.lock")
+    opened = {}
+    close_interruptions = []
+    real_close = os.close
+    real_fstat = os.fstat
+
+    class AcquireAbort(BaseException):
+        pass
+
+    class CleanupAbort(BaseException):
+        pass
+
+    primary = AcquireAbort("primary parent preparation interruption")
+
+    def inspect_parent_then_abort(descriptor):
+        info = real_fstat(descriptor)
+        try:
+            parent_info = managed.stat()
+        except FileNotFoundError:
+            return info
+        if (
+            (info.st_dev, info.st_ino) == (parent_info.st_dev, parent_info.st_ino)
+            and "parent_fd" not in opened
+        ):
+            opened["parent_fd"] = descriptor
+            opened["authority_fd"] = interrupted._authority_fd
+            raise primary
+        return info
+
+    def interrupt_local_close(descriptor):
+        if descriptor == opened.get("parent_fd") and not close_interruptions:
+            close_interruptions.append(descriptor)
+            raise CleanupAbort("local parent close interruption")
+        return real_close(descriptor)
+
+    with monkeypatch.context() as cleanup_patch:
+        cleanup_patch.setattr(governance_module.os, "fstat", inspect_parent_then_abort)
+        cleanup_patch.setattr(governance_module.os, "close", interrupt_local_close)
+        with pytest.raises(AcquireAbort) as caught:
+            interrupted.acquire()
+
+    assert caught.value is primary
+    assert close_interruptions == [opened["parent_fd"]]
+    assert interrupted._parent_fd is None
+    assert interrupted._authority_fd is None
+    _assert_descriptor_is_closed(opened["parent_fd"])
+    _assert_descriptor_is_closed(opened["authority_fd"])
+    contender.acquire()
+    contender.release()
+
+
+@pytest.mark.parametrize("interrupted_attribute", ["_parent_fd", "_authority_fd"])
+def test_interrupted_acquire_cleanup_closes_every_descriptor_without_masking_failure(
+    tmp_path, monkeypatch, interrupted_attribute
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    interrupted = RunLock(repo / ".factory" / "build.lock")
+    contender = RunLock(repo / ".factory" / "build.lock")
+    opened = {}
+    close_interruptions = []
+    real_close = os.close
+
+    class AcquireAbort(BaseException):
+        pass
+
+    class CleanupAbort(BaseException):
+        pass
+
+    primary = AcquireAbort("primary acquire interruption")
+
+    def fail_after_authority_acquisition():
+        opened["_parent_fd"] = interrupted._parent_fd
+        opened["_authority_fd"] = interrupted._authority_fd
+        raise primary
+
+    def interrupt_one_close(descriptor):
+        if (
+            descriptor == opened.get(interrupted_attribute)
+            and not close_interruptions
+        ):
+            close_interruptions.append(descriptor)
+            raise CleanupAbort("secondary cleanup interruption")
+        return real_close(descriptor)
+
+    monkeypatch.setattr(
+        interrupted,
+        "_write_diagnostic_record",
+        fail_after_authority_acquisition,
+    )
+    with monkeypatch.context() as cleanup_patch:
+        cleanup_patch.setattr(
+            governance_module.os,
+            "close",
+            interrupt_one_close,
+        )
+        with pytest.raises(AcquireAbort) as caught:
+            interrupted.acquire()
+
+    assert caught.value is primary
+    assert close_interruptions == [opened[interrupted_attribute]]
+    assert interrupted._parent_fd is None
+    assert interrupted._authority_fd is None
+    _assert_descriptor_is_closed(opened["_parent_fd"])
+    _assert_descriptor_is_closed(opened["_authority_fd"])
+    contender.acquire()
+    contender.release()
+
+
+@pytest.mark.parametrize("interrupted_attribute", ["_parent_fd", "_authority_fd"])
+def test_interrupted_release_closes_every_descriptor_without_second_release(
+    tmp_path, monkeypatch, interrupted_attribute
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    holder = RunLock(repo / ".factory" / "build.lock")
+    contender = RunLock(repo / ".factory" / "build.lock")
+    holder.acquire()
+    opened = {
+        "_parent_fd": holder._parent_fd,
+        "_authority_fd": holder._authority_fd,
+    }
+    close_interruptions = []
+    real_close = os.close
+
+    class CleanupAbort(BaseException):
+        pass
+
+    def interrupt_one_close(descriptor):
+        if (
+            descriptor == opened[interrupted_attribute]
+            and not close_interruptions
+        ):
+            close_interruptions.append(descriptor)
+            raise CleanupAbort("release cleanup interruption")
+        return real_close(descriptor)
+
+    with monkeypatch.context() as cleanup_patch:
+        cleanup_patch.setattr(governance_module.os, "close", interrupt_one_close)
+        with pytest.raises(CleanupAbort):
+            holder.release()
+
+    assert close_interruptions == [opened[interrupted_attribute]]
+    assert holder._parent_fd is None
+    assert holder._authority_fd is None
+    _assert_descriptor_is_closed(opened["_parent_fd"])
+    _assert_descriptor_is_closed(opened["_authority_fd"])
+    contender.acquire()
+    contender.release()
+
+
+def test_persistent_lock_diagnostics_are_private_and_repo_mode_is_unchanged(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    repo.chmod(0o755)
+    lock = RunLock(repo / ".factory" / "build.lock")
+
+    lock.acquire()
+    diagnostic = repo / ".factory" / "build.lock"
+    try:
+        assert repo.stat().st_mode & 0o777 == 0o755
+        assert diagnostic.stat().st_mode & 0o777 == 0o600
+        pid, nonce = diagnostic.read_text().split()
+        assert pid == str(os.getpid())
+        assert len(nonce) == 16 and all(char in "0123456789abcdef" for char in nonce)
+    finally:
+        lock.release()
+
+    assert diagnostic.exists(), "non-authoritative diagnostics persist for recovery"
+
+
+@pytest.mark.parametrize(
+    "primitive",
+    [
+        "fcntl-none",
+        "flock-missing",
+        "flock-noncallable",
+        "nofollow-absent",
+        "nofollow-noninteger",
+        "directory-absent",
+        "directory-noninteger",
+        "open-dir-fd",
+        "rename-dir-fd",
+        "unlink-dir-fd",
+    ],
+)
+def test_run_lock_fails_closed_before_state_for_each_missing_primitive(
+    tmp_path, monkeypatch, primitive
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    lock = RunLock(repo / ".factory" / "build.lock")
+    flock_calls = []
+    real_fcntl = governance_module._fcntl
+    real_open = governance_module.os.open
+    assert real_fcntl is not None
+
+    def recording_flock(descriptor, operation):
+        flock_calls.append((descriptor, operation))
+        return real_fcntl.flock(descriptor, operation)
+
+    open_calls = []
+
+    def recording_open(*args, **kwargs):
+        descriptor = real_open(*args, **kwargs)
+        open_calls.append(descriptor)
+        return descriptor
+
+    fake_fcntl = SimpleNamespace(
+        flock=recording_flock,
+        LOCK_EX=real_fcntl.LOCK_EX,
+        LOCK_NB=real_fcntl.LOCK_NB,
+    )
+
+    with monkeypatch.context() as primitive_patch:
+        supported = set(governance_module.os.supports_dir_fd)
+        supported.remove(real_open)
+        supported.add(recording_open)
+        primitive_patch.setattr(governance_module.os, "open", recording_open)
+        primitive_patch.setattr(governance_module.os, "supports_dir_fd", supported)
+        primitive_patch.setattr(governance_module, "_fcntl", fake_fcntl)
+        if primitive == "fcntl-none":
+            primitive_patch.setattr(governance_module, "_fcntl", None)
+        elif primitive == "flock-missing":
+            primitive_patch.delattr(fake_fcntl, "flock")
+        elif primitive == "flock-noncallable":
+            primitive_patch.setattr(fake_fcntl, "flock", None)
+        elif primitive == "nofollow-absent":
+            primitive_patch.delattr(governance_module.os, "O_NOFOLLOW")
+        elif primitive == "nofollow-noninteger":
+            primitive_patch.setattr(governance_module.os, "O_NOFOLLOW", object())
+        elif primitive == "directory-absent":
+            primitive_patch.delattr(governance_module.os, "O_DIRECTORY")
+        elif primitive == "directory-noninteger":
+            primitive_patch.setattr(governance_module.os, "O_DIRECTORY", object())
+        elif primitive == "open-dir-fd":
+            primitive_patch.setattr(
+                governance_module.os,
+                "supports_dir_fd",
+                set(governance_module.os.supports_dir_fd) - {governance_module.os.open},
+            )
+        elif primitive == "rename-dir-fd":
+            primitive_patch.setattr(
+                governance_module.os,
+                "supports_dir_fd",
+                set(governance_module.os.supports_dir_fd) - {governance_module.os.rename},
+            )
+        elif primitive == "unlink-dir-fd":
+            primitive_patch.setattr(
+                governance_module.os,
+                "supports_dir_fd",
+                set(governance_module.os.supports_dir_fd) - {governance_module.os.unlink},
+            )
+
+        with pytest.raises(
+            AlreadyRunning,
+            match=r"^secure descriptor lock operations are unavailable on this platform$",
+        ):
+            lock.acquire()
+
+    assert not (repo / ".factory").exists()
+    assert not (repo / ".factory" / "build.lock").exists()
+    assert list(repo.rglob("*.tmp")) == []
+    assert open_calls == []
+    assert flock_calls == []
+    assert lock._parent_fd is None
+    assert lock._authority_fd is None
+
+    probe = RunLock(repo / ".factory" / "build.lock")
+    probe.acquire()
+    parent_fd = probe._parent_fd
+    authority_fd = probe._authority_fd
+    probe.release()
+    _assert_descriptor_is_closed(parent_fd)
+    _assert_descriptor_is_closed(authority_fd)
+
+
+def test_run_lock_does_not_chmod_an_unmanaged_existing_parent(tmp_path):
+    shared = tmp_path / "shared"
+    shared.mkdir(mode=0o755)
+    shared.chmod(0o755)
+
+    with pytest.raises(AlreadyRunning, match=r"private|managed|unsafe"):
+        RunLock(shared / "build.lock").acquire()
+
+    assert shared.stat().st_mode & 0o777 == 0o755
 
 
 def test_a_live_holder_is_never_displaced(tmp_path):
@@ -341,36 +971,23 @@ def test_a_zero_budget_still_builds_a_guard():
         g.charge(0.01)
 
 
-def test_a_paused_reclaimer_cannot_clear_a_lock_taken_while_it_slept(tmp_path):
-    """The subprocess race above is real but scheduler-dependent: it passed on
-    macOS for days and then produced two winners on a Linux CI runner. This
-    pins the same defect deterministically, by freezing one racer at the exact
-    point the runner froze it.
-
-    `slow` fails to link, judges the file stale, and stalls. `fast` then
-    acquires legitimately. `slow` resumes into its reclaim still holding a
-    judgement about a file that no longer exists. It must not clear the live
-    lock, and it must not be handed a second copy.
-    """
+def test_replaced_diagnostics_cannot_displace_a_live_descriptor_holder(tmp_path):
+    """The replaceable PID record is never mutual-exclusion authority."""
     lock = tmp_path / "build.lock"
-    lock.write_text("999999\n")            # a pid that is not running
+    holder = RunLock(lock)
+    contender = RunLock(lock)
+    holder.acquire()
+    lock.unlink()
+    lock.write_text("999999\n")
+    lock.chmod(0o600)
 
-    slow, fast = RunLock(lock), RunLock(lock)
-
-    assert not slow._try_link()             # the file is there...
-    stale = slow._stale_snapshot()          # ...and reclaimable
-    assert stale is not None
-
-    fast.acquire()                          # legitimately held from here on
-    live = lock.read_bytes()
-    assert live != stale
-
-    slow._reclaim(stale)                    # resumes with an obsolete judgement
-    assert lock.exists(), "the reclaimer cleared a live lock"
-    assert lock.read_bytes() == live, "the reclaimer replaced a live lock"
-
-    with pytest.raises(AlreadyRunning):     # and the full path refuses
-        slow.acquire()
+    try:
+        with pytest.raises(AlreadyRunning):
+            contender.acquire()
+        assert lock.read_bytes() == b"999999\n"
+    finally:
+        contender.release()
+        holder.release()
 
 
 def test_reclaim_clears_a_lock_that_really_is_abandoned(tmp_path):
@@ -387,23 +1004,18 @@ def test_reclaim_clears_a_lock_that_really_is_abandoned(tmp_path):
     assert not list(lock.parent.glob("*.reclaim.*")), "reclaim marker was left behind"
 
 
-def test_a_recycled_pid_cannot_make_a_new_lock_look_like_the_old_one(tmp_path):
-    """The reclaim compares contents to decide whether the lock it is about to
-    clear is still the one it judged. If identity were the pid alone, a lock
-    left by a *different* run that happened to get the same pid would compare
-    equal, and a paused reclaimer would clear a lock it never judged.
-
-    Pids are recycled, and this module has already lost this bet twice — once
-    on inodes, once on pids. The nonce is what makes the comparison mean
-    "the same lock" rather than "the same number".
-    """
+def test_distinct_lock_names_in_one_directory_share_authority_scope(tmp_path):
+    """One stable directory inode is the deliberate lock authority boundary."""
     a, b = tmp_path / "a.lock", tmp_path / "b.lock"
-    RunLock(a).acquire()
-    RunLock(b).acquire()
+    first = RunLock(a)
+    second = RunLock(b)
+    first.acquire()
 
-    same_pid = a.read_text().split()[0] == b.read_text().split()[0] == str(os.getpid())
-    assert same_pid, "this test is only meaningful when both locks share a pid"
-    assert a.read_bytes() != b.read_bytes(), (
-        "two distinct locks from the same pid are indistinguishable — "
-        "the reclaim comparison cannot tell them apart"
-    )
+    try:
+        with pytest.raises(AlreadyRunning):
+            second.acquire()
+    finally:
+        first.release()
+
+    second.acquire()
+    second.release()

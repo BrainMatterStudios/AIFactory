@@ -112,7 +112,12 @@ def test_the_shipped_catalog_still_satisfies_its_own_floor():
 
 
 def test_core_floor_roles_ignores_packs():
-    assert core_floor_roles() == {"judge", "security-specialist", "product-manager"}
+    assert core_floor_roles() == {
+        "contract-author",
+        "judge",
+        "security-specialist",
+        "product-manager",
+    }
 
 
 # --------------------------------------------------------------------------- #

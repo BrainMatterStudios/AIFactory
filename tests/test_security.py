@@ -14,17 +14,25 @@ from software_factory.loop.security import (
     verdict_least_privilege,
     verdict_secret_scan,
 )
+from tests.fixtures.synthetic_sensitive_values import (
+    ANTHROPIC_KEY,
+    AWS_ACCESS_KEY,
+    CREDENTIAL_DSN,
+    GITHUB_GENERIC_TOKEN,
+    PASSWORD_ASSIGNMENT,
+    PRIVATE_KEY_HEADER,
+)
 
 
 # --------------------------------------------------------------------------- #
 # Patterns — precision matters, a noisy scanner gets turned off
 # --------------------------------------------------------------------------- #
 def test_real_credentials_match():
-    assert scan_text("AWS_KEY = AKIAIOSFODNN7EXAMPLE") == 1
-    assert scan_text("-----BEGIN RSA PRIVATE KEY-----") == 1
-    assert scan_text('password = "hunter2isnotgreat"') == 1
-    assert scan_text("DATABASE_URL=postgresql://user:s3cretpw@db.internal:5432/app") == 1
-    assert scan_text("token: ghp_abcdefghijklmnopqrstuvwxyz0123") == 1
+    assert scan_text("AWS_KEY = " + AWS_ACCESS_KEY) == 1
+    assert scan_text(PRIVATE_KEY_HEADER) == 1
+    assert scan_text(PASSWORD_ASSIGNMENT) == 1
+    assert scan_text("DATABASE_URL=" + CREDENTIAL_DSN) == 1
+    assert scan_text("token: " + GITHUB_GENERIC_TOKEN) == 1
 
 
 def test_environment_references_do_not_match():
@@ -53,8 +61,8 @@ def test_only_git_tracked_files_are_scanned(tmp_path):
     """An untracked .env is not a leak; flagging it teaches people to ignore the
     scanner."""
     repo = _git_repo(tmp_path)
-    (repo / ".env").write_text("SECRET_KEY=sk-ant-abcdefghijklmnopqrstuvwxyz123\n")
-    (repo / "app.py").write_text('token = "ghp_abcdefghijklmnopqrstuvwxyz0123"\n')
+    (repo / ".env").write_text("SECRET_KEY=" + ANTHROPIC_KEY + "\n")
+    (repo / "app.py").write_text(f'token = "{GITHUB_GENERIC_TOKEN}"\n')
     subprocess.run(["git", "add", "app.py"], cwd=repo, check=True)
 
     assert tracked_files(repo) == ["app.py"]
@@ -63,14 +71,16 @@ def test_only_git_tracked_files_are_scanned(tmp_path):
 
 def test_binary_and_generated_files_are_skipped(tmp_path):
     repo = _git_repo(tmp_path)
-    (repo / "logo.svg").write_text('<svg data="AKIAIOSFODNN7EXAMPLE"/>')
+    (repo / "logo.svg").write_text(f'<svg data="{AWS_ACCESS_KEY}"/>')
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
     assert collect_secret_hits(repo) == {}
 
 
 def test_the_baseline_path_can_be_skipped(tmp_path):
     repo = _git_repo(tmp_path)
-    (repo / "baseline.json").write_text('{"a.py": 1, "k": "AKIAIOSFODNN7EXAMPLE"}')
+    (repo / "baseline.json").write_text(
+        f'{{"a.py": 1, "k": "{AWS_ACCESS_KEY}"}}'
+    )
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
     assert collect_secret_hits(repo, skip=("baseline.json",)) == {}
 

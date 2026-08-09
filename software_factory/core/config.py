@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +21,7 @@ from software_factory.adapters.registry import VALID_KINDS, get_registry
 from software_factory.core.orchestrate.routing import Thresholds
 
 DEFAULT_MANIFEST_NAMES = ("factory.config.yaml", "factory.config.yml", "factory.config.json")
+VALID_REVIEW_PROTOCOLS = frozenset({"verdict_v1", "findings_v2"})
 
 
 # --------------------------------------------------------------------------- #
@@ -91,6 +93,9 @@ class BuildConfig:
     #: The label a human adds to a T2 feature issue to approve its stored plan.
     #: The build then implements that plan instead of producing another one.
     plan_approved_label: str = "plan-approved"
+    review_protocol: str = "verdict_v1"
+    state_dir: str | None = None
+    contract_author_role: str = "contract-author"
 
 
 @dataclass(frozen=True)
@@ -169,6 +174,27 @@ class FactoryConfig:
         )
 
         bd = f.get("build") or {}
+        review_protocol = bd.get("review_protocol", "verdict_v1")
+        if not isinstance(review_protocol, str) or review_protocol not in VALID_REVIEW_PROTOCOLS:
+            raise ValueError(
+                "factory.build.review_protocol must be one of "
+                f"{sorted(VALID_REVIEW_PROTOCOLS)!r}"
+            )
+        if "review_protocol" not in bd:
+            warnings.warn(
+                "factory.build.review_protocol is missing; using deprecated verdict_v1 "
+                "compatibility behavior",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        state_dir = bd.get("state_dir")
+        if state_dir is not None and (
+            not isinstance(state_dir, str) or not state_dir.strip()
+        ):
+            raise ValueError("factory.build.state_dir must be a non-empty path string or null")
+        contract_author_role = bd.get("contract_author_role", "contract-author")
+        if not isinstance(contract_author_role, str) or not contract_author_role.strip():
+            raise ValueError("factory.build.contract_author_role must be a non-empty string")
         build = BuildConfig(
             dev_branch=bd.get("dev_branch", "develop"),
             verify_cmd=bd.get("verify_cmd", "pytest -q"),
@@ -182,6 +208,9 @@ class FactoryConfig:
             require_contract=bool(bd.get("require_contract", False)),
             contracts_dir=bd.get("contracts_dir", "contracts"),
             plan_approved_label=bd.get("plan_approved_label", "plan-approved"),
+            review_protocol=review_protocol,
+            state_dir=state_dir,
+            contract_author_role=contract_author_role,
         )
 
         plugins = tuple(f.get("plugins") or ())

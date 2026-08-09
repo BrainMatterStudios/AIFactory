@@ -179,6 +179,20 @@ def test_a_metered_turn_is_not_flagged():
     assert out.cost_usd == pytest.approx(0.25)
 
 
+def test_a_legacy_workspace_without_checkpoint_methods_keeps_the_v1_lifecycle():
+    """Checkpoint isolation is a v2 capability. Adding it to the protocol must
+    not make an existing verdict-v1 custom workspace unusable."""
+    workspace = _Workspace()
+    assert not hasattr(workspace, "checkpoint")
+    assert not hasattr(workspace, "reset_to")
+    assert not hasattr(workspace, "review_fingerprint")
+
+    out = run_build(_issue(), runner=_Runner(), source=_src(), workspace=workspace,
+                    dev_branch="develop", signals=T0)
+
+    assert out.status is BuildStatus.SHIPPED
+
+
 def test_an_exhausted_budget_refuses_before_spawning_an_agent():
     """Charging happens after a turn returns, so without a pre-flight the first
     turn of every invocation runs and is paid for at a cap already blown."""

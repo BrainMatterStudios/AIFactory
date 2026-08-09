@@ -74,18 +74,21 @@ factory:
     dev_branch: develop       # the ONLY base the loop may target — never a prod ref
     verify_cmd: "pytest -q"   # YOUR project's test/lint gate; must pass before a PR
     workspace_root: .factory-worktrees
-    max_revise: 2             # judge revise cycles before it escalates to a human
-    # Contracts-before-code. Off by default: it only means something in a repo
-    # that writes contracts/<issue>.json, and turning it on elsewhere blocks
-    # every build for a file nobody agreed to write. When on it fails closed —
-    # a commit order the gate cannot read is a block, not a pass — and it checks
-    # three things: commit order, that the document is a valid contract, and that
-    # no criterion carries an instruction aimed at the judge.
-    require_contract: false
+    max_revise: 2             # bounded deterministic review revisions
+    # Current guidance: freeze Contract v2 intent before implementation and use
+    # findings-only sensors. verdict_v1 is deprecated v0.x compatibility only.
+    require_contract: true
+    review_protocol: findings_v2
     contracts_dir: contracts
-    # A T2 feature halts after planning. The plan is stored under
-    # .factory/plans/ and posted to the issue; adding this label and re-running
-    # implements THAT plan rather than producing a new one.
+    contract_author_role: contract-author
+    # Controller approvals/decision events must resolve outside this repository
+    # and every worktree. If set, this overrides FACTORY_STATE_DIR; if both are
+    # absent, the controller default is used. Exact pending/accepted contracts
+    # and stored plans are separate ignored controller state under .factory in
+    # the canonical checkout, outside disposable agent worktrees.
+    # state_dir: null
+    # This legacy status label is compatibility-only and deprecated as authority.
+    # Current T2 approval uses the exact plan digest plus parent contract digest.
     plan_approved_label: plan-approved
 
   # ── policy ────────────────────────────────────────────────────────────────

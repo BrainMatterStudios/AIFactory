@@ -40,6 +40,14 @@ meta:
 
 personas:
   # --- the gate ---
+  - name: contract-author
+    model: opus
+    tier_lock: floor
+    author: file
+    frequency: standard
+    phase: intake
+    role: Declares strict Contract v2 intent and questions before any implementation begins.
+
   - name: judge
     model: opus
     tier_lock: floor

@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "max_file_bytes": 1048576,
+  "forbidden_paths": [
+    {"rule": "path.private-state", "detail": "tracked private agent state is forbidden", "pattern": "(?i)(?:^|/)\\.(?:ai|factory)(?:/|$)"},
+    {"rule": "path.private-report", "detail": "tracked transcript, evidence, or generated report is forbidden", "pattern": "(?i)(?:^|/)[^/]*(?<![A-Za-z0-9])(?:transcripts?|evidence|reports?)(?![A-Za-z0-9])[^/]*(?:/|$)"},
+    {"rule": "path.issue-export", "detail": "tracked issue export is forbidden", "pattern": "(?i)(?:^|/)exports?/(?:issues?|tickets?)(?:[./_-]|$)"},
+    {"rule": "path.database-export", "detail": "tracked database export is forbidden", "pattern": "(?i)(?:^|/)exports?/(?:database|db|schema)(?:[./_-]|$)"},
+    {"rule": "path.metric-export", "detail": "tracked metric export is forbidden", "pattern": "(?i)(?:^|/)exports?/(?:metrics?|telemetry)(?:[./_-]|$)"},
+    {"rule": "path.internal-runbook", "detail": "tracked internal runbook is forbidden", "pattern": "(?i)(?:^|/)(?:runbooks?(?:/|$)|runbook[^/]*$)"},
+    {"rule": "path.incident-artifact", "detail": "tracked incident artifact is forbidden", "pattern": "(?i)(?:^|/)(?:incidents?(?:/|$)|incident[^/]*$)"},
+    {"rule": "provenance.unapproved-third-party", "detail": "third-party source lacks exact approved provenance", "pattern": "(?i)(?:^|/)(?:third_party|vendor)(?:/|$)"}
+  ],
+  "content_patterns": [
+    {"rule": "secret.credential", "detail": "credential or token shape is forbidden", "pattern": "(?i)(?:\\bAKIA[0-9A-Z]{16}\\b|\\bgh[pousr]_[A-Za-z0-9]{20,}\\b|\\b(?:sk-ant-|sk-or-v1-|gsk_|sk_(?:live|test)_)[A-Za-z0-9_-]{16,}\\b|\\beyJ[A-Za-z0-9_=-]+\\.[A-Za-z0-9_=-]+\\.[A-Za-z0-9_=-]+\\b|\\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|password|secret)\\s*[:=]\\s*[\\\"'][A-Za-z0-9_./+=-]{16,}[\\\"'])"},
+    {"rule": "secret.credentialed-dsn", "detail": "credentialed data-source URL is forbidden", "pattern": "(?i)\\b(?:postgres(?:ql)?|mysql|mongodb(?:\\+srv)?|redis)://[^\\s/:]+:[^\\s/@]+@"},
+    {"rule": "secret.private-key", "detail": "private-key material is forbidden", "pattern": "-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----"},
+    {"rule": "private.hostname", "detail": "private hostname is forbidden", "pattern": "(?i)(?<![A-Za-z0-9_-])(?:(?:10|127)\\.[0-9.]+|172\\.(?:1[6-9]|2[0-9]|3[01])\\.[0-9.]+|192\\.168\\.[0-9.]+|169\\.254\\.[0-9.]+|(?:[A-Za-z0-9-]+\\.)+internal)(?=$|[:/.\\s\\\"'])"},
+    {"rule": "private.account-id", "detail": "account identifier shape is forbidden", "pattern": "(?i)(?:\\baccount[_ -]?id\\s*[:=]\\s*[\\\"']?[0-9]{10,20}\\b|\\barn:aws[a-z-]*:[^:\\s]*:[^:\\s]*:[0-9]{12}:)"},
+    {"rule": "private.internal-url", "detail": "internal URL is forbidden", "pattern": "(?i)https?://(?:localhost|(?:10|127)\\.[0-9.]+|172\\.(?:1[6-9]|2[0-9]|3[01])\\.[0-9.]+|192\\.168\\.[0-9.]+|169\\.254\\.[0-9.]+|\\[?::1\\]?|[^/\\s]+\\.internal)(?=[:/\\s]|$)"},
+    {"rule": "private.absolute-path", "detail": "private absolute filesystem path is forbidden", "pattern": "(?:(?<![A-Za-z0-9_])/(?:Users|home)/[^/\\s]+/[^\\s]+|[A-Za-z]:\\\\Users\\\\[^\\s]+)"}
+  ],
+  "binary_allowlist": [],
+  "third_party_allowlist": [],
+  "content_allowlist": [
+    {
+      "path": "tests/fixtures/synthetic_sensitive_values.py",
+      "git_mode": "100644",
+      "object_type": "blob",
+      "sha256": "87c31e0a748031a19cf0d1f3459f32fd5291b4873adc62f895eb349541b68ce8",
+      "license": "Apache-2.0",
+      "source": "project-original:synthetic-sensitive-values-v1",
+      "rule_ids": [
+        "private.absolute-path",
+        "private.account-id",
+        "private.hostname",
+        "private.internal-url",
+        "secret.credential",
+        "secret.credentialed-dsn",
+        "secret.private-key"
+      ]
+    }
+  ]
+}

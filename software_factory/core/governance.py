@@ -16,12 +16,21 @@ Pure-ish (env + filesystem reads); no third-party deps.
 """
 from __future__ import annotations
 
-import hashlib
+import errno
 import math
 import os
+import stat
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+
+try:
+    import fcntl as _fcntl
+except ImportError:
+    _fcntl = None
+
+_NOFOLLOW = getattr(os, "O_NOFOLLOW", None)
+_DIRECTORY = getattr(os, "O_DIRECTORY", None)
 
 # --------------------------------------------------------------------------- #
 # Kill switch
@@ -356,9 +365,26 @@ class RunLock:
     finding is filed twice — but are not locked yet; use one lock per repo if you
     schedule observe densely enough for passes to overlap.
 
-    Uses atomic `O_EXCL` create — no dependencies, works on every platform. A
-    lock whose owning process is gone is stale and gets reclaimed, so a crashed
-    run does not wedge the loop forever.
+    Mutual exclusion comes from a POSIX descriptor lock on the verified
+    higher-level controller directory. For the normal
+    ``repo/.factory/build.lock`` layout, that authority is the ``repo``
+    directory inode rather than a replaceable file or the replaceable
+    ``.factory`` directory. Independent instances therefore contend on one
+    stable inode even if ``.factory`` is renamed and recreated while a run is
+    active. The authority boundary is the directory: generic lock paths in the
+    same containing directory intentionally serialize one another too.
+
+    ``path`` remains a private diagnostic record containing the last acquiring
+    pid and a nonce. It is deliberately not the lock authority and is never
+    unlinked during release or crash recovery. Closing the authority descriptor
+    releases the kernel lock automatically after both orderly exit and process
+    death; no named authority artifact or read-then-unlink stale-token protocol
+    is involved.
+
+    POSIX ``flock``, descriptor-relative opens, directory descriptors, and
+    no-follow opens are required. Platforms without them fail closed. The
+    ``stale_after_s`` argument remains accepted for API compatibility, but a
+    live descriptor holder is never displaced based on elapsed time.
     """
 
     def __init__(self, path: str | Path, *, stale_after_s: float = 6 * 3600) -> None:
@@ -366,182 +392,282 @@ class RunLock:
         self.stale_after_s = stale_after_s
         self._held = False
         self._token: str | None = None
+        self._parent_fd: int | None = None
+        self._authority_fd: int | None = None
 
-    def _owner_alive(self) -> bool:
-        """Is the process that wrote this lock still running?
+    @property
+    def _name(self) -> str:
+        name = self.path.name
+        if not name or name in {".", ".."} or "/" in name or "\0" in name:
+            raise AlreadyRunning("lock filename is unsafe")
+        return name
 
-        Our own pid counts as alive: another RunLock in this process holds it, and
-        that is a genuine conflict — two overlapping loops in one process collide
-        on exactly the same resources as two in separate processes.
+    def _directory(self) -> int:
+        if self._parent_fd is None:
+            self._prepare_private_parent()
+        assert self._parent_fd is not None
+        return self._parent_fd
+
+    @property
+    def _managed_parent(self) -> bool:
+        return self.path.parent.name == ".factory"
+
+    @property
+    def _authority_parent(self) -> Path:
+        if self._managed_parent:
+            return self.path.parent.parent
+        return self.path.parent
+
+    def _close_parent(self) -> None:
+        descriptor = self._parent_fd
+        if descriptor is None:
+            return
+        self._parent_fd = None
+        self._close_descriptor(descriptor)
+
+    @staticmethod
+    def _close_descriptor(
+        descriptor: int,
+        *,
+        primary_active: bool = False,
+    ) -> None:
+        """Best-effort close while preserving an asynchronous interruption.
+
+        Ownership leaves the object before this external call.  If a process-
+        fatal exception interrupts the first attempt, make one bounded second
+        attempt so the descriptor is not knowingly left live, then re-raise the
+        original close exception unless the caller is already handling a primary
+        failure.  Cleanup must never replace that active primary exception.
         """
         try:
-            pid = int(self.path.read_text(encoding="utf-8").split()[0])
-        except (OSError, ValueError, IndexError):
-            return False             # unreadable/garbled lock — treat as abandoned
-        try:
-            os.kill(pid, 0)          # signal 0 = existence check only
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True              # exists, owned by another user
-        return True
-
-    def _is_stale(self) -> bool:
-        """A lock is stale when its owner is gone, or when a live owner has held
-        it past `stale_after_s` (presumed wedged). The age arm is why the default
-        is generous: a legitimately long run must not have its lock stolen while
-        it is still working."""
-        if not self._owner_alive():
-            return True
-        try:
-            import time
-
-            return (time.time() - self.path.stat().st_mtime) > self.stale_after_s
+            os.close(descriptor)
         except OSError:
-            return True
+            pass
+        except BaseException:
+            try:
+                os.close(descriptor)
+            except BaseException:
+                pass
+            if not primary_active:
+                raise
 
     def acquire(self) -> None:
         """Take the lock, or raise AlreadyRunning.
 
-        The lock file is written fully and then `os.link`ed into place. `link`
-        fails atomically if the name already exists, so there is no window in
-        which the lock exists but is empty — an empty file reads as garbled,
-        which reads as abandoned, which is a second way to hand out the lock
-        twice.
-
-        Reclaiming a *stale* lock is the part that is easy to get wrong, and
-        this is the third design. Unlink-then-create hands the lock to everyone
-        who saw the same stale file. Rename-then-link is better but still wrong:
-        a process that judged the file stale and then paused can rename away a
-        lock a faster process legitimately took in the meantime, and both end up
-        believing they hold it. That is not theoretical — a CI runner produced
-        two winners out of six while every local run passed.
-
-        So reclaiming never moves a file it might not own. Instead the racers
-        compete for an exclusive marker named after the *contents* of the stale
-        lock: `O_EXCL` picks exactly one winner per stale lock, and only that
-        winner may clear it, after re-reading it to confirm it is still the same
-        one. A process that arrives late finds the contents changed and simply
-        retries the link.
-
-        The deliberate trade: if a process dies holding a marker, that one stale
-        lock can no longer be reclaimed and every later run refuses until the
-        marker is removed by hand. Refusing to run is a safe failure; running
-        twice is not.
+        The stable authority is acquired before the managed ``.factory`` path is
+        opened. Once the descriptor lock is held, replacing the diagnostic
+        record is safe: no other cooperative instance can concurrently publish
+        or remove lock state.
         """
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        for _ in range(3):
-            if self._try_link():
-                return
-            stale = self._stale_snapshot()
-            if stale is None:
-                raise AlreadyRunning(
-                    f"another factory run holds {self.path} — "
-                    "refusing to run two loops against the same repo"
-                )
-            self._reclaim(stale)        # whatever happens, retry the link
-        raise AlreadyRunning(f"could not acquire {self.path}")
-
-    def _stale_snapshot(self) -> bytes | None:
-        """The lock's exact bytes if it is reclaimable, else None.
-
-        Returned as bytes so the reclaimer can prove the file it is about to
-        clear is the same one it judged — see `acquire`.
-        """
+        if self._held or self._authority_fd is not None:
+            raise AlreadyRunning(
+                f"another factory run holds {self.path} — "
+                "refusing to run two loops against the same repo"
+            )
+        self._require_lock_primitives()
         try:
-            data = self.path.read_bytes()
-        except OSError:
-            return b""                  # already gone: nothing to reclaim
-        return data if self._is_stale() else None
-
-    def _reclaim(self, stale: bytes) -> None:
-        """Clear the abandoned lock whose contents are exactly `stale`.
-
-        Silent about failure by design: every outcome — we cleared it, someone
-        else cleared it, someone else is clearing it, someone has since taken
-        it — leads to the same next step, which is to retry the link and let
-        that decide.
-        """
-        if not stale:
-            return
-        digest = hashlib.sha256(stale).hexdigest()[:16]
-        marker = self.path.with_name(f"{self.path.name}.reclaim.{digest}")
-        try:
-            fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except OSError:
-            return                      # another process owns this reclaim
-        os.close(fd)
-        try:
-            try:
-                current = self.path.read_bytes()
-            except OSError:
-                return                  # already gone
-            if current != stale:
-                return                  # not the lock we judged; leave it alone
-            try:
-                os.unlink(self.path)
-            except OSError:
-                pass
-        finally:
-            try:
-                os.unlink(marker)
-            except OSError:
-                pass
-
-    def _try_link(self) -> bool:
-        """Write our identity to a private temp file and link it into place.
-
-        The identity is `<pid> <nonce>`, not a bare pid. Pids are recycled, and
-        this module has already been bitten twice by trusting a number the
-        system is free to reuse — once by inode, once by pid. The nonce makes
-        "is this still the lock I was looking at?" answerable across a reclaim
-        and re-acquire, which is what the stale-reclaim compare-and-swap needs.
-        The pid stays first so staleness can still be judged from it.
-        """
-        tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
-        identity = f"{os.getpid()} {os.urandom(8).hex()}"
-        try:
-            with open(tmp, "w", encoding="utf-8") as fh:
-                fh.write(f"{identity}\n")
-                fh.flush()
-                os.fsync(fh.fileno())
-            try:
-                os.link(tmp, self.path)
-            except FileExistsError:
-                return False
-            self._token = identity
+            if not self._managed_parent:
+                self._prepare_private_parent()
+            self._acquire_authority()
+            if self._managed_parent:
+                self._prepare_private_parent()
+            self._write_diagnostic_record()
             self._held = True
-            return True
-        finally:
+        except BaseException:
+            self._held = False
+            self._token = None
             try:
-                os.unlink(tmp)
+                self._close_descriptors()
+            except BaseException:
+                pass
+            raise
+
+    @staticmethod
+    def _require_lock_primitives() -> None:
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        directory = getattr(os, "O_DIRECTORY", None)
+        supports_dir_fd = getattr(os, "supports_dir_fd", ())
+        if (
+            _fcntl is None
+            or not callable(getattr(_fcntl, "flock", None))
+            or not isinstance(getattr(_fcntl, "LOCK_EX", None), int)
+            or not isinstance(getattr(_fcntl, "LOCK_NB", None), int)
+            or isinstance(nofollow, bool)
+            or not isinstance(nofollow, int)
+            or not nofollow
+            or isinstance(directory, bool)
+            or not isinstance(directory, int)
+            or not directory
+            or os.open not in supports_dir_fd
+            or os.rename not in supports_dir_fd
+            or os.unlink not in supports_dir_fd
+        ):
+            raise AlreadyRunning(
+                "secure descriptor lock operations are unavailable on this platform"
+            )
+
+    def _acquire_authority(self) -> None:
+        descriptor: int | None = None
+        try:
+            assert _NOFOLLOW is not None
+            assert _DIRECTORY is not None
+            descriptor = os.open(
+                self._authority_parent,
+                os.O_RDONLY | _DIRECTORY | _NOFOLLOW,
+            )
+            directory_info = os.fstat(descriptor)
+            geteuid = getattr(os, "geteuid", None)
+            if (
+                not stat.S_ISDIR(directory_info.st_mode)
+                or geteuid is None
+                or directory_info.st_uid != geteuid()
+                or stat.S_IMODE(directory_info.st_mode) & 0o022
+            ):
+                raise OSError("unsafe lock authority directory")
+            assert _fcntl is not None
+            try:
+                _fcntl.flock(descriptor, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}:
+                    raise AlreadyRunning(
+                        f"another factory run holds {self.path} — "
+                        "refusing to run two loops against the same repo"
+                    ) from None
+                raise
+            self._authority_fd = descriptor
+            descriptor = None
+        except BaseException as exc:
+            if descriptor is not None:
+                owned_descriptor = descriptor
+                descriptor = None
+                self._close_descriptor(owned_descriptor, primary_active=True)
+            if isinstance(exc, AlreadyRunning):
+                raise
+            if isinstance(exc, (NotImplementedError, OSError, TypeError, ValueError)):
+                raise AlreadyRunning(
+                    f"lock authority for {self.path} is unsafe or unavailable"
+                ) from exc
+            raise
+
+    def _prepare_private_parent(self) -> None:
+        """Create/tighten controller state without following a leaf symlink."""
+        if self._parent_fd is not None:
+            return
+        parent = self.path.parent
+        created = False
+        try:
+            try:
+                parent.mkdir(parents=True, mode=0o700)
+                created = True
+            except FileExistsError:
+                pass
+            if not _NOFOLLOW or not _DIRECTORY:
+                raise OSError("secure directory descriptors are unavailable")
+            descriptor = os.open(parent, os.O_RDONLY | _NOFOLLOW | _DIRECTORY)
+        except (OSError, TypeError, NotImplementedError) as exc:
+            raise AlreadyRunning(
+                f"lock state directory {parent} is unsafe or unavailable"
+            ) from exc
+        try:
+            info = os.fstat(descriptor)
+            geteuid = getattr(os, "geteuid", None)
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or geteuid is None
+                or info.st_uid != geteuid()
+            ):
+                raise AlreadyRunning(
+                    f"lock state directory {parent} has an unsafe type or owner"
+                )
+            permissions = info.st_mode & 0o077
+            if permissions and (created or parent.name == ".factory"):
+                os.fchmod(descriptor, 0o700)
+                permissions = os.fstat(descriptor).st_mode & 0o077
+            if permissions:
+                raise AlreadyRunning(
+                    f"lock state directory {parent} is not private managed state"
+                )
+        except OSError as exc:
+            owned_descriptor = descriptor
+            descriptor = None
+            self._close_descriptor(owned_descriptor, primary_active=True)
+            raise AlreadyRunning(
+                f"lock state directory {parent} cannot be secured"
+            ) from exc
+        except BaseException:
+            owned_descriptor = descriptor
+            descriptor = None
+            self._close_descriptor(owned_descriptor, primary_active=True)
+            raise
+        self._parent_fd = descriptor
+        descriptor = None
+
+    def _write_diagnostic_record(self) -> None:
+        """Atomically publish private, non-authoritative owner diagnostics."""
+        identity = f"{os.getpid()} {os.urandom(8).hex()}"
+        tmp = f".{self._name}.{identity.split()[1]}.tmp"
+        descriptor: int | None = None
+        try:
+            assert _NOFOLLOW is not None
+            descriptor = os.open(
+                tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW,
+                0o600,
+                dir_fd=self._directory(),
+            )
+            os.fchmod(descriptor, 0o600)
+            payload = f"{identity}\n".encode()
+            written = 0
+            while written < len(payload):
+                count = os.write(descriptor, payload[written:])
+                if count <= 0:
+                    raise OSError("lock diagnostic write made no progress")
+                written += count
+            os.fsync(descriptor)
+            owned_descriptor = descriptor
+            descriptor = None
+            self._close_descriptor(owned_descriptor)
+            os.rename(
+                tmp,
+                self._name,
+                src_dir_fd=self._directory(),
+                dst_dir_fd=self._directory(),
+            )
+            self._token = identity
+        finally:
+            if descriptor is not None:
+                owned_descriptor = descriptor
+                descriptor = None
+                self._close_descriptor(owned_descriptor, primary_active=True)
+            try:
+                os.unlink(tmp, dir_fd=self._directory())
             except OSError:
                 pass
 
     def release(self) -> None:
-        """Release only if the lock on disk is still ours.
-
-        Unlinking by path would delete whichever lock currently sits there —
-        including a fresh one a later run legitimately took after ours was
-        reclaimed as stale.
-
-        Ownership is checked against the full identity we wrote — pid AND nonce
-        — never by inode. Inode numbers are
-        recycled: on Linux an unlink followed by a create in the same directory
-        frequently returns the same st_ino, so an inode comparison reports "this
-        is still mine" about a file another process created. That passed on macOS
-        and failed on the CI runner, which is the useful reminder that identity
-        must come from content we control rather than from a number the
-        filesystem is free to reuse.
-        """
-        if not self._held:
-            return
-        try:
-            if self.path.read_text(encoding="utf-8").strip() == self._token:
-                self.path.unlink(missing_ok=True)
-        except (OSError, IndexError):
-            pass
+        """Release by closing the descriptor; persistent files are never unlinked."""
         self._held = False
+        self._token = None
+        self._close_descriptors()
+
+    def _close_descriptors(self) -> None:
+        """Close both descriptors without replacing a parent-close interrupt."""
+        try:
+            self._close_parent()
+        except BaseException:
+            try:
+                self._close_authority()
+            except BaseException:
+                pass
+            raise
+        else:
+            self._close_authority()
+
+    def _close_authority(self) -> None:
+        descriptor = self._authority_fd
+        if descriptor is None:
+            return
+        self._authority_fd = None
+        self._close_descriptor(descriptor)
 
     def __enter__(self) -> RunLock:
         self.acquire()

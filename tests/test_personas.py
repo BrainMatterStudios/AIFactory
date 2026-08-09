@@ -8,7 +8,7 @@ from software_factory.core.personas import (
 )
 
 LEAN_CORE_EXPECTED = {
-    "judge", "product-manager", "requirements-analyst",
+    "contract-author", "judge", "product-manager", "requirements-analyst",
     "security-specialist", "test-author",
 }
 
@@ -29,6 +29,14 @@ def test_judge_is_opus_and_always():
     judge = next(p for p in load_catalog() if p.name == "judge")
     assert judge.model == "opus"
     assert judge.author == "file"
+
+
+def test_contract_author_is_authored_at_the_frontier_floor():
+    contract_author = next(p for p in load_catalog() if p.name == "contract-author")
+    assert contract_author.model == "opus"
+    assert contract_author.tier_lock == "floor"
+    assert contract_author.author == "file"
+    assert contract_author.phase == "intake"
 
 
 def test_builtins_present():

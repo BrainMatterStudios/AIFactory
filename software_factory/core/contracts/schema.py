@@ -27,7 +27,9 @@ data-fix collapse.
 from __future__ import annotations
 
 import re
+import warnings
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -137,7 +139,7 @@ _REQUIRED_FIELDS: list[tuple[str, type]] = [
 ]
 
 
-def validate_contract(doc: Any, *, require_negotiation_evidence: bool = True) -> list[str]:
+def _validate_v1_contract(doc: Any, *, require_negotiation_evidence: bool = True) -> list[str]:
     """Validate a build-contract document.
 
     Returns a (possibly empty) list of human-readable error strings; empty means
@@ -313,3 +315,66 @@ def is_data_fix_collapse_valid(
         return False
     nr = doc.get("negotiation_rounds")
     return isinstance(nr, int) and not isinstance(nr, bool) and nr == 0
+
+
+@dataclass(frozen=True)
+class ContractValidationReport:
+    """Validation result that preserves schema-version and migration evidence."""
+
+    schema_version: int | None
+    errors: tuple[str, ...]
+    warnings: tuple[str, ...] = ()
+
+
+def validate_contract_report(
+    doc: Any, *, require_negotiation_evidence: bool = True
+) -> ContractValidationReport:
+    """Validate a v1 or v2 contract and return errors plus compatibility warnings."""
+    if not isinstance(doc, dict):
+        return ContractValidationReport(None, ("document must be a dict",))
+    if "schema_version" not in doc:
+        return ContractValidationReport(None, ("missing required field: 'schema_version'",))
+    version = doc["schema_version"]
+    if isinstance(version, bool):
+        return ContractValidationReport(None, ("'schema_version': expected int, got bool",))
+    if not isinstance(version, int):
+        return ContractValidationReport(
+            None,
+            (f"'schema_version': expected int, got {type(version).__name__}",),
+        )
+    if version == 1:
+        warning = "Contract v1 is deprecated; migrate to schema_version 2"
+        warnings.warn(warning, DeprecationWarning, stacklevel=2)
+        return ContractValidationReport(
+            1,
+            tuple(
+                _validate_v1_contract(
+                    doc, require_negotiation_evidence=require_negotiation_evidence
+                )
+            ),
+            (warning,),
+        )
+    if version == 2:
+        from software_factory.core.contracts.schema_v2 import validate_v2_contract
+
+        return ContractValidationReport(
+            2,
+            tuple(
+                validate_v2_contract(
+                    doc, require_negotiation_evidence=require_negotiation_evidence
+                )
+            ),
+        )
+    return ContractValidationReport(
+        version,
+        (f"schema_version must be 1 or 2, got {version!r}",),
+    )
+
+
+def validate_contract(doc: Any, *, require_negotiation_evidence: bool = True) -> list[str]:
+    """Validate a v1 or v2 contract through the legacy list-returning API."""
+    return list(
+        validate_contract_report(
+            doc, require_negotiation_evidence=require_negotiation_evidence
+        ).errors
+    )

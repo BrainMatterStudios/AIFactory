@@ -15,6 +15,7 @@ from software_factory.adapters.base import Issue, RunResult
 from software_factory.adapters.reference.memory import MemorySource
 from software_factory.build.orchestrator import BuildStatus, run_build
 from software_factory.build.workspace import GitWorktree, NothingToCommit
+from software_factory.core.approvals import ApprovalStore
 from software_factory.core.governance import (
     AlreadyRunning,
     BudgetExceeded,
@@ -26,6 +27,16 @@ from software_factory.core.governance import (
     crosses_prod_boundary,
     kill_requested,
     normalize_ref,
+)
+from software_factory.trace.decisions import DecisionLog
+
+from .test_build import (
+    ContractWorkspace,
+    FakeRunner,
+    _stub_contract_phase,
+)
+from .test_build import (
+    _issue as _build_issue,
 )
 
 
@@ -318,3 +329,288 @@ def test_the_ceiling_refuses_a_project_specific_prod_branch():
                     dev_branch="trunk", prod_refs=("main", "trunk"))
     assert out.status is BuildStatus.HALTED
     assert "prod boundary" in out.reason
+
+
+class _FailingDecisionLog:
+    def append(self, _event):
+        raise RuntimeError("synthetic append failure")
+
+    def read_verified(self, **_identity):
+        raise RuntimeError("synthetic replay failure")
+
+
+def test_decision_append_failure_stops_after_contract_before_implementation(
+    tmp_path, monkeypatch
+):
+    src, issue = _build_issue()
+    workspace = ContractWorkspace()
+    _stub_contract_phase(monkeypatch, workspace)
+    runner = FakeRunner()
+
+    outcome = run_build(
+        issue,
+        runner=runner,
+        source=src,
+        workspace=workspace,
+        dev_branch="develop",
+        require_contract=True,
+        repository="example-repo",
+        repo_root=str(tmp_path),
+        decision_log=_FailingDecisionLog(),
+        run_id="run-7",
+        timestamp="2026-08-05T12:00:00Z",
+    )
+
+    assert outcome.status is BuildStatus.BLOCKED
+    assert "decision" in outcome.reason.lower()
+    assert runner.calls == ["contract-author"]
+    assert not workspace.pushed
+
+
+def test_decision_replay_failure_after_commit_stops_before_push(tmp_path, monkeypatch):
+    src, issue = _build_issue()
+    workspace = ContractWorkspace()
+    _stub_contract_phase(monkeypatch, workspace)
+    delegate = DecisionLog(tmp_path / "controller-decisions")
+
+    class FailFinalReplay:
+        final_appended = False
+        final_replayed = False
+
+        def append(self, event):
+            persisted = delegate.append(event)
+            if event.stage == "final-disposition":
+                self.final_appended = True
+            return persisted
+
+        def read_verified(self, **identity):
+            if self.final_appended and self.final_replayed:
+                raise RuntimeError("synthetic pre-push replay failure")
+            history = delegate.read_verified(**identity)
+            if self.final_appended:
+                self.final_replayed = True
+            return history
+
+    outcome = run_build(
+        issue,
+        runner=FakeRunner(judge_replies=["verdict: PASS"]),
+        source=src,
+        workspace=workspace,
+        dev_branch="develop",
+        require_contract=True,
+        repository="example-repo",
+        repo_root=str(tmp_path),
+        approval_store=ApprovalStore(tmp_path / "controller-approvals"),
+        decision_log=FailFinalReplay(),
+        run_id="run-7",
+        timestamp="2026-08-05T12:00:00Z",
+    )
+
+    assert outcome.status is BuildStatus.BLOCKED
+    assert "decision" in outcome.reason.lower() and "push" in outcome.reason.lower()
+    assert workspace.committed is not None
+    assert not workspace.pushed
+    assert outcome.keep_workspace
+
+
+def test_pre_push_replay_rejects_a_valid_but_truncated_current_history(
+    tmp_path, monkeypatch
+):
+    src, issue = _build_issue()
+    workspace = ContractWorkspace()
+    _stub_contract_phase(monkeypatch, workspace)
+    delegate = DecisionLog(tmp_path / "controller-decisions")
+    class StaleFinalReplay:
+        final_appended = False
+        reads_after_final = 0
+
+        def append(self, event):
+            persisted = delegate.append(event)
+            if event.stage == "final-disposition":
+                self.final_appended = True
+            return persisted
+
+        def read_verified(self, **identity):
+            history = delegate.read_verified(**identity)
+            if self.final_appended:
+                self.reads_after_final += 1
+                if self.reads_after_final >= 2:
+                    return history[:-1]
+            return history
+
+    outcome = run_build(
+        issue,
+        runner=FakeRunner(judge_replies=["verdict: PASS"]),
+        source=src,
+        workspace=workspace,
+        dev_branch="develop",
+        require_contract=True,
+        repository="example-repo",
+        repo_root=str(tmp_path),
+        approval_store=ApprovalStore(tmp_path / "controller-approvals"),
+        decision_log=StaleFinalReplay(),
+        run_id="run-7",
+        timestamp="2026-08-05T12:00:00Z",
+    )
+
+    assert outcome.status is BuildStatus.BLOCKED
+    assert "decision" in outcome.reason.lower() and "push" in outcome.reason.lower()
+    assert not workspace.pushed
+
+
+def test_pre_push_replay_rejects_a_complete_older_authorizing_run(
+    tmp_path, monkeypatch
+):
+    # Make independently created repositories produce identical authorized
+    # commits, so run identity is the only distinction left for replay to enforce.
+    monkeypatch.setenv("GIT_AUTHOR_DATE", "2026-08-04T12:00:00Z")
+    monkeypatch.setenv("GIT_COMMITTER_DATE", "2026-08-04T12:00:00Z")
+    delegate = DecisionLog(tmp_path / "controller-decisions")
+    old_src, old_issue = _build_issue()
+    old_workspace = ContractWorkspace()
+    _stub_contract_phase(monkeypatch, old_workspace)
+    old_outcome = run_build(
+        old_issue,
+        runner=FakeRunner(judge_replies=["verdict: PASS"]),
+        source=old_src,
+        workspace=old_workspace,
+        dev_branch="develop",
+        require_contract=True,
+        repository="example-repo",
+        repo_root=str(tmp_path),
+        approval_store=ApprovalStore(tmp_path / "controller-approvals"),
+        decision_log=delegate,
+        run_id="older-run",
+        timestamp="2026-08-04T12:00:00Z",
+    )
+    older = tuple(
+        event
+        for event in delegate.read_verified(repository="example-repo", issue="7")
+        if event.run_id == "older-run"
+    )
+    assert old_outcome.status is BuildStatus.SHIPPED
+    assert old_workspace.pushed
+    assert [event.stage for event in older] == [
+        "contract",
+        "contract-outcome",
+        "implementation-objective",
+        "review-result",
+        "review-routing",
+        "reverify",
+        "publication-scan",
+        "final-disposition",
+    ]
+    assert older[-1].disposition == "SHIPPED"
+
+    current_src, current_issue = _build_issue()
+    current_workspace = ContractWorkspace()
+    _stub_contract_phase(monkeypatch, current_workspace)
+
+    class ReplayOlderAuthorityAtCurrentPush:
+        final_appended = False
+        reads_after_final = 0
+
+        def append(self, event):
+            persisted = delegate.append(event)
+            if event.run_id == "current-run" and event.stage == "final-disposition":
+                self.final_appended = True
+            return persisted
+
+        def read_verified(self, **identity):
+            history = delegate.read_verified(**identity)
+            if self.final_appended:
+                self.reads_after_final += 1
+                if self.reads_after_final >= 2:
+                    return older
+            return history
+
+    outcome = run_build(
+        current_issue,
+        runner=FakeRunner(judge_replies=["verdict: PASS"]),
+        source=current_src,
+        workspace=current_workspace,
+        dev_branch="develop",
+        require_contract=True,
+        repository="example-repo",
+        repo_root=str(tmp_path),
+        approval_store=ApprovalStore(tmp_path / "controller-approvals"),
+        decision_log=ReplayOlderAuthorityAtCurrentPush(),
+        run_id="current-run",
+        timestamp="2026-08-05T12:00:00Z",
+    )
+
+    assert outcome.status is BuildStatus.BLOCKED
+    assert "decision" in outcome.reason.lower() and "push" in outcome.reason.lower()
+    assert not current_workspace.pushed
+    complete = delegate.read_verified(repository="example-repo", issue="7")
+    current_final = next(
+        event
+        for event in complete
+        if event.run_id == "current-run" and event.stage == "final-disposition"
+    )
+    assert (
+        older[-1].artifact_digest,
+        older[-1].parent_digest,
+        older[-1].source_version,
+        older[-1].disposition,
+    ) == (
+        current_final.artifact_digest,
+        current_final.parent_digest,
+        current_final.source_version,
+        current_final.disposition,
+    ), "the complete older authority differs only by run identity"
+
+
+def test_unknown_review_protocol_refuses_before_any_agent_dispatch(tmp_path):
+    src, issue = _build_issue()
+    workspace = ContractWorkspace()
+    runner = FakeRunner()
+    decision_log = DecisionLog(tmp_path / "controller-decisions")
+
+    outcome = run_build(
+        issue,
+        runner=runner,
+        source=src,
+        workspace=workspace,
+        dev_branch="develop",
+        require_contract=True,
+        repository="example-repo",
+        repo_root=str(tmp_path),
+        decision_log=decision_log,
+        review_protocol="findings_v3",
+    )
+
+    assert outcome.status is BuildStatus.BLOCKED
+    assert "review protocol" in outcome.reason.lower()
+    assert runner.calls == []
+    assert not workspace.pushed
+    terminal = decision_log.read_verified(repository="example-repo", issue="7")[-1]
+    assert terminal.stage == "terminal-disposition"
+    assert terminal.disposition == "BLOCKED"
+
+
+def test_contract_preflight_budget_halt_records_terminal_disposition(tmp_path):
+    src, issue = _build_issue()
+    workspace = ContractWorkspace()
+    decision_log = DecisionLog(tmp_path / "controller-decisions")
+
+    outcome = run_build(
+        issue,
+        runner=FakeRunner(),
+        source=src,
+        workspace=workspace,
+        dev_branch="develop",
+        require_contract=True,
+        repository="example-repo",
+        repo_root=str(tmp_path),
+        decision_log=decision_log,
+        budget=BudgetGuard(per_task_usd=0.0),
+        run_id="run-preflight",
+        timestamp="2026-08-05T12:00:00Z",
+    )
+
+    assert outcome.status is BuildStatus.HALTED
+    assert not workspace.created
+    terminal = decision_log.read_verified(repository="example-repo", issue="7")[-1]
+    assert terminal.stage == "terminal-disposition"
+    assert terminal.disposition == "HALTED"

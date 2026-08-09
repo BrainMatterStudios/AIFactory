@@ -37,7 +37,7 @@ def test_the_frontier_floor_is_the_expected_set():
     """If a role leaves this set, that is a deliberate policy change — not a
     catalog tweak that should slip through unnoticed."""
     assert set(floor_personas(load_catalog())) == {
-        "judge", "security-specialist", "product-manager",
+        "contract-author", "judge", "security-specialist", "product-manager",
     }
 
 

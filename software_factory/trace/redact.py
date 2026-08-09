@@ -27,7 +27,7 @@ _AUTH_RE = re.compile(r"(?i)\b(authorization\s*[:=]\s*)\S+")
 
 # Blanket-redact whole match.
 _BLANKET = [
-    # credential DSN: scheme://user:pass@host/...
+    # credential-bearing data-source URL
     re.compile(r"\b[a-z][a-z0-9+.\-]*://[^\s:/@]+:[^\s:/@]+@\S+", re.I),
     # JWT
     re.compile(r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),

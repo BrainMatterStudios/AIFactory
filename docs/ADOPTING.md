@@ -21,11 +21,19 @@ The package supports two ways of building the fix, and they are not equal.
 | Provenance | How the origin factory actually runs, and where its results come from | Written for this release, no production behind it |
 | Use it when | Now | You are experimenting, and read [KNOWN_ISSUES.md](../KNOWN_ISSUES.md) first |
 
-Both share everything else — the same observing, the same queue, the same tier
-rules, the same judge, the same ceiling. The difference is only who holds the
-steering wheel during the build step.
+Both share observing, queueing, tier rules, and the production ceiling. The
+human-supervised doctrine uses an independent judge under operator control. The
+experimental autonomous path adds the 0.2 architecture-first controller:
+Contract v2, exact approvals, findings-only model sensors, and deterministic
+disposition.
 
 This guide assumes the doctrine path. §6 covers the other one.
+
+> **0.2 release-candidate note:** the `findings_v2` parser, controller-owned
+> routing, semantic authority replay, and adversarial tests described below are
+> now present and locally verified. This does not make 0.2.0 released. Adoption
+> from a release artifact remains gated on the complete release checklist,
+> sanitized candidate history, and separately approved shared-state actions.
 
 ---
 
@@ -77,6 +85,8 @@ The three fields worth thinking about:
 build:
   dev_branch: develop        # the ONLY base the loop may target. Must exist LOCALLY.
   verify_cmd: "pytest -q"    # YOUR gate. Must be runnable and must actually fail on bad code.
+  require_contract: true     # current guidance: freeze Contract v2 before code
+  review_protocol: findings_v2
 
 governance:
   prod_refs: [main, release] # ADDS to main/master/production/prod — never replaces
@@ -257,9 +267,74 @@ to watch:
 factory build 42     # EXPERIMENTAL
 ```
 
-A narrower version of the same loop, with no human. It creates a worktree, runs
-the agent, gates on `verify_cmd`, judges read-only, re-runs `verify_cmd` against
-the tree it is about to push, scans the produced diff for secrets, and opens a PR.
+A narrower controller-driven loop, with no human supervising each agent turn. It
+uses this lifecycle for T1/T2 work:
+
+```text
+issue -> isolated worktree -> contract-only author turn
+      -> deterministic intent gate -> frozen Contract v2 checkpoint
+      -> T2 plan and exact plan approval when applicable
+      -> implementation -> objective verify_cmd
+      -> findings_v2 model sensors -> deterministic disposition
+      -> reverify -> objective secret scan -> PR into the development branch
+```
+
+An unresolved blocking ambiguity returns `SPEC_PENDING`; no implementer runs.
+A human-owned irreversible choice returns `APPROVAL_PENDING` with the exact
+contract digest. T2 planning happens only after intent passes, and the plan is
+bound to both its own digest and its parent contract digest. Labels do not grant
+authority.
+
+When a contract needs human authority, the controller persists its exact text,
+document, digest, repository/issue identity, and policy version as **pending**.
+On the next build it materializes those same bytes into the fresh worktree and
+re-runs validation, intent policy, and the current approval lookup without
+dispatching the contract author again. A matching approval lets the controller
+checkpoint the contract and atomically promote the pending record to
+**accepted**.
+
+Accepted does not mean “approved forever.” Every resume re-checks the exact
+approval. Removing the approval record returns the same accepted digest as
+`APPROVAL_PENDING`; atomically replacing the approval with a different digest is
+a mismatch and blocks. The accepted contract record remains the artifact being
+checked until a stopped, audited manual state procedure replaces that lifecycle
+state. Do not edit pending or accepted JSON in place: descriptor, inode, identity,
+and digest checks block invalid or corrupt records, and a file replacement while
+a run is active is detected and blocks.
+
+The build prints a copyable command. It assumes Git provides `user.email` or
+`user.name`; if neither is configured, add `--approver <operator-identity>`.
+These equivalent examples contain only deliberately synthetic values:
+
+```bash
+factory approve contract demo-42 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --approver demo-operator --reason "synthetic intent review"
+
+factory approve plan demo-42 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+  --parent aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --approver demo-operator --reason "synthetic plan review"
+```
+
+The plan command requires the exact parent digest. Any changed, stale, missing,
+unreadable, corrupt, or wrong-parent approval fails closed. Manifest
+`factory.build.state_dir` selects approval/decision storage first; when absent,
+`FACTORY_STATE_DIR` is used, then the controller default. That location must be
+outside the repository and every registered worktree. Exact pending/accepted
+contract records and contract-bound plan envelopes are separate controller-owned
+local state under the canonical checkout's ignored `.factory` directory, not the
+disposable agent worktree.
+
+The build's last content check is a high-signal secret scan over the Git blobs it
+would propose. It does not run the full public-content scanner. Hosted/local CI
+and the release process separately run the current-tree and history-range policy
+from [PUBLIC_CONTENT_POLICY.md](PUBLIC_CONTENT_POLICY.md).
+
+Review models use `findings_v2`: they report typed observations and evidence
+locations but cannot author the final disposition. The controller freezes each
+report against the reviewed artifact fingerprint and applies pinned routing
+rules. A finding override must be a decision event bound to the exact fingerprint
+and finding ID, with operator authority and rationale. It is not a manifest flag,
+and the contract/plan approval command does not override a review finding.
 
 Read [KNOWN_ISSUES.md](../KNOWN_ISSUES.md) before you use it. Eight adversarial
 review panels have examined this subsystem and each found real defects; they are
@@ -267,19 +342,47 @@ fixed and pinned by tests, but it has never run unattended against a real
 repository for a sustained period. It is the only part of this package with no
 production behind it.
 
-**A T2 feature stops the same way it does on the doctrine path.** The plan is
-written to `.factory/plans/issue-<id>.md` and posted as a comment on the issue,
-and the build halts. Read it; if you agree, add the `plan-approved` label and run
-the build again — it implements *that* plan rather than re-reading the issue. If
-you disagree, close the issue. Nothing was written to the repository either way.
-
 If you do try it: your `dev_branch` must exist **locally** (nothing here fetches),
-one build runs per repo at a time, and budget caps only bind if your runner
-reports a cost.
+one build runs per repo at a time, budget caps only bind if your runner reports a
+finite cost, and controller state needs a tested backup. Directory separation
+alone does not isolate state from an unrestricted runner; sandbox the runner and
+give it least-privilege credentials.
+
+## 7. Migrating an existing project to 0.2
+
+### Contract migration
+
+Contract v1 is readable during v0.x but deprecated; it emits migration evidence
+and is not current authoring guidance. For Contract v2:
+
+1. Set `schema_version` to `2` and remove `approved_git_rev`.
+2. Add `intent` with scope, non-goals, risk flags, ambiguities, invariants,
+   failure modes, irreversible operations, and exact dependency pins.
+3. Give every child a stable unique ID and make criteria cover every invariant
+   and irreversible operation.
+4. Run the intent gate and resolve `SPEC_PENDING` questions without inventing
+   facts.
+5. Obtain a new exact contract approval if policy requires human authority.
+6. Regenerate any T2 plan from that contract and approve the plan's new digest
+   with the exact parent contract digest.
+
+Changing intent invalidates downstream plan authority. Do not copy a label,
+filename, or old approval record to the new artifact.
+
+### Review migration
+
+Set `review_protocol: findings_v2` explicitly. The `verdict_v1` protocol and a
+manifest that omits `review_protocol` are deprecated v0.x compatibility paths
+only. They emit warnings and remain readable so upgrades do not silently break,
+but new scaffolds and current guidance use `findings_v2`.
+
+Before the first real run, verify that your runner can write the single findings
+scratch file, cannot read controller state, and cannot mutate the reviewed code
+surface without the fingerprint check detecting it.
 
 ---
 
-## 7. Closing the loop
+## 8. Closing the loop
 
 The next `factory observe` re-runs the check that produced the issue. If it
 passes, the fix is confirmed by measurement rather than by assertion. If it does
