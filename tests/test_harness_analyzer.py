@@ -506,17 +506,20 @@ def test_deep_hook_tree_is_scanned_without_python_recursion_failure(tmp_path: Pa
     ]
 
 
-def test_json_beyond_decoder_recursion_limit_becomes_constant_correctness_evidence(
-    tmp_path: Path,
+def test_decoder_recursion_error_becomes_constant_correctness_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    depth = 1_200
-    payload = '{"outer":' + ("[" * depth) + "0" + ("]" * depth) + "}"
-    (tmp_path / ".mcp.json").write_text(payload, encoding="utf-8")
+    def fail_to_decode(*_args: object, **_kwargs: object) -> object:
+        raise RecursionError(ANTHROPIC_KEY)
+
+    monkeypatch.setattr(harness_module.json, "loads", fail_to_decode)
+    (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
 
     findings = _findings(tmp_path)
 
     assert [_summary(finding) for finding in findings] == [("correctness", "high", ".mcp.json")]
     assert findings[0]["message"] == "Supported harness configuration is not valid strict JSON."
+    assert ANTHROPIC_KEY not in json.dumps(findings)
 
 
 def test_json_node_budget_fails_closed_with_constant_high_correctness(tmp_path: Path) -> None:
