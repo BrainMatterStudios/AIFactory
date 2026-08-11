@@ -287,6 +287,11 @@ factory:
   alert:
     provider: stdout           # or slack/telegram (set *_env to the secret env var)
 
+  scheduler:                   # rendering is safe; install remains an explicit action
+    provider: cron
+    cron: "0 9 * * *"
+    command: "factory observe --target dev"
+
   build:                       # how `factory build <id>` turns an issue into a PR
     dev_branch: {dev}          # the ONLY base the loop may target — never prod
     verify_cmd: "{verify}"     # YOUR test/lint gate; must pass before a PR
@@ -2374,8 +2379,14 @@ def _run_build_locked(args, cfg, repo_dir: str, repository: str | None = None) -
 def cmd_schedule(args) -> int:
     """Render / install / uninstall the standing schedule that fires the loop."""
     cfg = _load_config(args.config)
+    if "scheduler" not in cfg.adapters:
+        print(
+            "schedule unavailable: no scheduler adapter configured; "
+            "add factory.scheduler to the manifest"
+        )
+        return 2
     sched = cfg.build("scheduler")
-    sc = dict(cfg.adapters["scheduler"].options) if "scheduler" in cfg.adapters else {}
+    sc = dict(cfg.adapters["scheduler"].options)
     name = args.name
     cron = args.cron or sc.get("cron", "0 9 * * *")
     command = args.command or sc.get("command", "factory observe --target prod --apply --alert")

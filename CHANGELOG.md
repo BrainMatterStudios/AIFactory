@@ -25,6 +25,9 @@ project uses semantic versioning.
 
 - New scaffolds select `design_ir_v1` for T2 work and require the harness
   analyzer. Existing Contract parents keep their sticky recorded workflow.
+- New scaffolds include a safe, dev-only cron schedule for previewing with
+  `factory schedule render`; older manifests without a scheduler now receive a
+  configuration error instead of an internal traceback.
 - The T2 Design path supersedes opaque plan approval: implementation requires a
   current passing gate and approval of the exact Design digest and parent
   Contract digest.
@@ -41,6 +44,9 @@ project uses semantic versioning.
 
 ### Security and known limitations
 
+- Malformed YAML parser diagnostics are normalized before reaching the CLI, so
+  source lines containing accidentally embedded private values are not echoed
+  into terminal or CI logs.
 - Installed analyzers are trusted code. Process isolation and normalized output
   are not a sandbox; persistent workspace mutation is detected, but transient
   mutation and external side effects cannot be disproved.

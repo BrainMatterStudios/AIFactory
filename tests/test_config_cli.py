@@ -1215,6 +1215,27 @@ def test_cli_doctor_offline(tmp_path, capsys, monkeypatch):
     assert rc == 0
 
 
+def test_cli_doctor_normalizes_malformed_yaml_without_echoing_input(
+    tmp_path, capsys, monkeypatch
+):
+    """Removing parser-error normalization must re-expose manifest contents."""
+    monkeypatch.delenv("KILL_FACTORY", raising=False)
+    private_value = "synthetic-private-value"
+    manifest = tmp_path / "factory.config.yaml"
+    manifest.write_text(
+        f"factory:\n  name: [{private_value}\n",
+        encoding="utf-8",
+    )
+
+    result = main(["--config", str(manifest), "doctor"])
+    output = _combined_output(capsys)
+
+    assert result == 1
+    assert private_value not in output
+    assert "manifest        : NOT LOADED — YAML manifest could not be parsed" in output
+    assert "Traceback" not in output
+
+
 def test_cli_doctor_with_json_manifest_does_not_require_yaml_extra(
     tmp_path, capsys, monkeypatch
 ):
@@ -1383,6 +1404,51 @@ def test_release_scaffold_selects_findings_v2(tmp_path, capsys):
     assert text.count("design_protocol: design_ir_v1") == 1
     assert "design_author_role: design-author" in text
     assert "- name: harness\n        required: true" in text
+
+
+def test_release_scaffold_renders_a_safe_schedule_without_installing(tmp_path, capsys):
+    """Removing the starter scheduler must break this first-user CLI journey."""
+    assert main(["init", "--dir", str(tmp_path), "--repo", "acme/api"]) == 0
+    _combined_output(capsys)
+    manifest = tmp_path / "factory.config.yaml"
+
+    result = main([
+        "--config",
+        str(manifest),
+        "schedule",
+        "render",
+        "--name",
+        "acme-nightly",
+    ])
+
+    assert result == 0
+    assert _combined_output(capsys) == (
+        "# factory schedule: acme-nightly\n"
+        "0 9 * * * factory observe --target dev\n"
+    )
+
+
+def test_schedule_without_adapter_is_a_user_safe_configuration_error(
+    tmp_path, capsys
+):
+    """A legacy manifest without a scheduler must not expose a KeyError traceback."""
+    config = json.loads(json.dumps(OFFLINE))
+    del config["factory"]["scheduler"]
+    manifest = tmp_path / "factory.config.json"
+    manifest.write_text(json.dumps(config), encoding="utf-8")
+
+    try:
+        result = main(["--config", str(manifest), "schedule", "render"])
+    except KeyError as exc:
+        pytest.fail(f"schedule exposed an internal configuration exception: {exc}")
+
+    output = _combined_output(capsys)
+    assert result == 2
+    assert output == (
+        "schedule unavailable: no scheduler adapter configured; "
+        "add factory.scheduler to the manifest\n"
+    )
+    assert "Traceback" not in output
 
 
 def test_example_config_documents_new_and_legacy_design_protocols():

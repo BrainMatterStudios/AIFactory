@@ -38,7 +38,14 @@ def _read_manifest(path: Path) -> dict[str, Any]:
                 "PyYAML is required to read a YAML manifest. Install with "
                 "`pip install software-factory[yaml]` or use a .json manifest."
             ) from e
-        data = yaml.safe_load(text)
+        try:
+            data = yaml.safe_load(text)
+        except Exception:
+            # PyYAML diagnostics include the offending source line. Manifests
+            # should reference secrets through environment-variable names, but
+            # a malformed file may still contain a value that must not be
+            # copied into terminal or CI logs.
+            raise ValueError("YAML manifest could not be parsed") from None
     else:
         data = json.loads(text)
     if not isinstance(data, dict):
