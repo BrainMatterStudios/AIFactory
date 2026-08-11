@@ -15,6 +15,18 @@ from software_factory.build.review_findings import (
     SensorIdentity,
 )
 from software_factory.build.review_policy import FindingOverride, ReviewDecision
+from software_factory.build.status import (
+    FactoryStatus,
+    FactoryStatusState,
+    issue_status,
+    project_status,
+    status_document,
+)
+from software_factory.build.workflow_protocol_store import (
+    WorkflowProtocolSelection,
+    WorkflowProtocolStore,
+    WorkflowProtocolStoreError,
+)
 from software_factory.build.workspace import (
     GitWorktree,
     NothingToCommit,
@@ -25,6 +37,8 @@ __all__ = [
     "BuildOutcome",
     "BuildStatus",
     "EvidenceLocation",
+    "FactoryStatus",
+    "FactoryStatusState",
     "Finding",
     "FindingOverride",
     "FindingsReport",
@@ -33,6 +47,12 @@ __all__ = [
     "NothingToCommit",
     "ReviewDecision",
     "SensorIdentity",
+    "WorkflowProtocolSelection",
+    "WorkflowProtocolStore",
+    "WorkflowProtocolStoreError",
     "Workspace",
+    "issue_status",
+    "project_status",
     "run_build",
+    "status_document",
 ]

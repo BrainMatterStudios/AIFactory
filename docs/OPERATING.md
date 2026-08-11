@@ -125,6 +125,30 @@ Schedule the command so these are visible, not swallowed.
 | `observe` | PASS or WARN | overall FAIL | the board could not be searched — **nothing was filed** |
 | `build` | shipped; deprecated compatibility plan-pending also returns 0 | specification/approval pending, deterministic review stop, failed gates, or governance stop | another build holds the lock, controller state cannot be isolated, or Contract v2 lacks a canonical repository identity |
 
+Read-only lifecycle inspection uses the same taxonomy:
+
+```bash
+factory doctor
+factory design validate <file>
+factory design gate <file>
+factory analyze <adapter>
+factory capabilities
+factory status [issue]
+```
+
+Exit `0` means a successful passing inspection or a status of `ready`,
+`degraded`, or `complete`; exit `1` means runtime/authority unavailability, a
+non-passing gate, or another non-ready status; exit `2` means invalid invocation,
+input, or configuration. All except `doctor` accept `--json`; `doctor` is also
+read-only and never invokes a model or analyzer.
+
+Status reports `ready`, `approval_pending`, `blocked`, `degraded`, `unavailable`,
+or `complete`. Required unreadable authority and deterministic integrity/policy
+blocks take precedence over exact approval, optional degradation, readiness, and
+replay-bound completion. The result is linearizable "as observed" at its final
+observation point. It is not a repository snapshot or cooperative lock, so a
+writer can change state after status returns.
+
 Exit `2` from `observe` deserves attention: it means dedup could not be trusted,
 so the pass deliberately filed nothing rather than duplicating every open ticket.
 Findings from that night exist and were never delivered. Re-run it once the board
@@ -220,6 +244,15 @@ it, print it, and return the verdict the pass actually reached.
 `factory build` is experimental — see [KNOWN_ISSUES.md](../KNOWN_ISSUES.md). If
 you are going to schedule it anyway:
 
+> **Required harness compatibility:** ordinary current macOS APFS volumes cannot
+> prove a no-atime read. New scaffolds require the harness analyzer, so any
+> present supported harness file blocks the Design gate with high-security
+> fail-closed evidence. Use `factory doctor` and `factory analyze harness` as a
+> preview. Move the project to an explicitly no-atime-capable
+> volume/environment or keep existing parents on `legacy_plan`. Restoring atime
+> after a read is another mutation and is not a supported workaround; disabling
+> the required analyzer does not preserve the shipped Design authority.
+
 - Set `governance.require_branch_protection: true` and give your prod ref real
   server-side protection. `doctor` warns when your gate is convention-only, and a
   convention is not enough once nobody is watching.
@@ -247,18 +280,21 @@ Controller state has two roots:
   field is absent, the environment value is used; when both are absent, the
   controller default is used. This root must resolve outside the source
   repository, its workspace root, and all registered Git worktrees.
-- Exact pending/accepted contract records and contract-bound T2 plan envelopes
-  live under the canonical checkout's ignored `.factory` controller directory,
-  outside the disposable agent worktree. Pending and accepted are exclusive
-  states; conflicting or manually replaced records block.
+- Exact pending/accepted Contract records, contract-bound legacy Plan envelopes,
+  immutable Design generations, stored gates, and sticky workflow-protocol
+  records live under controller-owned ignored state associated with the
+  canonical checkout, outside the disposable agent worktree. Pending and
+  accepted Contract states are exclusive; conflicting or manually replaced
+  authority blocks.
 
 Give the controller write access to both roots and keep the agent runner
 sandboxed away from them. A different directory on an unrestricted shared host
 is organization, not an OS security boundary.
 
-Back up approvals, decision logs, pending/accepted contracts, and stored plans on
-the same retention schedule as the repository they govern. Preserve permissions
-and take a consistent snapshot of both roots. An exact approval remains
+Back up approvals, decision logs, pending/accepted Contracts, stored Plans,
+immutable Design generations, gates, and protocol records on the same retention
+schedule as the repository they govern. Preserve permissions and take a
+consistent snapshot of both roots. An exact approval remains
 independently checkable when a decision log is missing; the log does not
 cryptographically validate the approval. But that backup has lost audit
 continuity and cannot support claims about the complete prior lifecycle. State
@@ -271,13 +307,14 @@ authority. Recovery is intentionally manual:
 
 1. Stop builds and preserve the unreadable state for investigation without
    copying its contents into public logs or issues.
-2. Restore the complete last known-good approvals, decisions, contract records,
-   and plan envelopes to their controller-owned roots.
-3. Authenticate pending/accepted records and stored plans, then replay available
-   event chains before restarting work. Record any continuity gap honestly.
+2. Restore the complete last known-good approvals, decisions, Contract records,
+   Plans, Designs, gates, and protocol records to their controller-owned roots.
+3. Authenticate every restored envelope and immutable generation, then replay
+   available event chains before restarting work. Record any continuity gap
+   honestly.
 4. If no trustworthy complete snapshot exists, preserve the damaged state,
    select fresh controller state, and re-author or deliberately re-establish
-   pending/accepted contract and plan state before reissuing approvals for the
+   Contract, Plan, Design, gate, and protocol state before reissuing approvals for the
    current exact digests. Do not truncate, hand-edit, or splice an old decision
    log into a seemingly continuous history.
 
@@ -327,7 +364,7 @@ publication history and scan the range again. A human then reviews the exact
 diff and tracked-file list for private facts and third-party provenance the
 patterns cannot understand.
 
-Use [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md). Push, tag, GitHub release, and
-package-registry publication are four separate shared-state actions and each
-requires its own explicit operator approval after the relevant evidence is
-current.
+Use [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md). Push, pull-request creation,
+merge, tag creation, tag push, GitHub release, and package-registry publication
+are separate shared-state actions. Each requires its own explicit operator
+approval after the relevant evidence is current.

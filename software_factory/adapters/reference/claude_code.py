@@ -11,10 +11,16 @@ from __future__ import annotations
 
 import subprocess
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from software_factory.adapters.base import RunResult
 from software_factory.adapters.registry import register
+
+if TYPE_CHECKING:
+    from software_factory.core.design.capabilities import (
+        CapabilityObservation,
+        RunnerCapabilityDeclaration,
+    )
 
 # Default tier→model mapping (overridable in the manifest). These are the
 # doctrine's model tiers; concrete IDs live in config so they track new releases.
@@ -69,6 +75,29 @@ class ClaudeCodeRunner:
     def resolve_model(self, model: str) -> str:
         # Accept either a tier name ("opus") or a concrete id.
         return self.models.get(model, model)
+
+    def capability_declaration(self) -> RunnerCapabilityDeclaration:
+        """Declare no controller guarantees: deny patterns are not a sandbox."""
+        from software_factory.core.design.capabilities import RunnerCapabilityDeclaration
+
+        return RunnerCapabilityDeclaration(
+            schema_version="runner-capability-v1",
+            source="claude_code",
+            capabilities=frozenset(),
+        )
+
+    def observe_capabilities(
+        self, *, workspace_path: str, repo_root: str
+    ) -> CapabilityObservation:
+        from software_factory.core.design.capabilities import CapabilityObservation
+
+        del workspace_path, repo_root
+        return CapabilityObservation(
+            schema_version="capability-observation-v1",
+            source="claude_code",
+            confirmed=frozenset(),
+            failed=frozenset(),
+        )
 
     def run_agent(self, prompt, *, model, system=None, tools=None, cwd=None) -> RunResult:
         model_id = self.resolve_model(model)

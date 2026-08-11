@@ -52,6 +52,7 @@ PRIVATE_HOST_IP = "10.1.2.3"
 CLOUD_ARN = "arn:aws:iam::123456789012:role/example"
 ACCOUNT_ID = "123456789012"
 PRIVATE_ABSOLUTE_PATH = "/Users/example/Private/project"
+PRIVATE_WINDOWS_ABSOLUTE_PATH = "C:\\Users\\example\\Private\\project"
 CONFIG_APPROVAL_SECRET_REPOSITORY = (
     "https://operator:SECRET-MUST-NOT-PRINT@github.com/acme/widgets.git"
 )

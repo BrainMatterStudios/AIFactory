@@ -35,19 +35,20 @@ another, Postgres or Snowflake, Slack or Telegram. Adopting it is configuration
 and adapters, not a rewrite. The core has zero hard dependencies and ships a
 complete offline adapter set, so the whole loop runs in your tests and your CI.
 
-**Status:** 0.2.0, CI on Python 3.10 and 3.12–3.13, Apache-2.0. The
+**Status:** 0.3.0, CI on Python 3.10 and 3.12–3.13, Apache-2.0. The
 observe→diagnose→queue→verify loop and deterministic gate helpers are generalized
 from a factory used against a production system, where passes are invoked on
 demand. The *autonomous* build loop (`factory build`) is newer, remains
 experimental, and is not scientifically or production validated. See
 [KNOWN_ISSUES.md](KNOWN_ISSUES.md) and §Provenance for the exact boundary.
 
-> **0.2.0 release:** the `findings_v2` parser, authenticated sensor reports,
-> deterministic router, authority replay, all-exit scratch cleanup, and
-> adversarial tests passed the documented release gates. The source release is
-> distributed through the protected GitHub tag and release; it is not published
-> on PyPI. Future pushes, merges, tags, releases, and package publication remain
-> separately approved shared-state actions.
+> **0.3.0 compatibility warning:** new scaffolds require the harness analyzer for
+> Design IR. Ordinary current macOS APFS volumes cannot prove the analyzer's
+> no-atime requirement, so any present supported harness file produces
+> high-security fail-closed evidence and blocks the Design gate. Preview with
+> `factory doctor`; use a verifiable no-atime volume/environment or keep existing
+> Contract parents on their sticky legacy workflow. See
+> [the 0.3.0 release notes](docs/releases/0.3.0.md).
 
 ## Documentation
 
@@ -55,7 +56,8 @@ experimental, and is not scientifically or production validated. See
 |---|---|
 | **[Adopting the factory](docs/ADOPTING.md)** | The working guide: install → your first collector → running a build under the doctrine. **Start here.** |
 | **[Operating it](docs/OPERATING.md)** | Scheduling it unattended, arming a dead-man's switch, and the ways an observe loop lies to you. |
-| **[0.2.0 release notes](docs/releases/0.2.0.md)** | Architecture-first rationale, authority model, migration, threat model, and limits. |
+| **[0.3.0 release notes](docs/releases/0.3.0.md)** | Design authority, migration, macOS compatibility, threat model, and explicit non-claims. |
+| [0.2.0 release notes](docs/releases/0.2.0.md) | Architecture-first compatibility history and provenance. |
 | [Public content policy](docs/PUBLIC_CONTENT_POLICY.md) | What may enter the public package and how current and historical content is inspected. |
 | [Release checklist](docs/RELEASE_CHECKLIST.md) | Local verification, protected `main`, provenance, and separate publication approvals. |
 | [Model tiering](docs/MODEL_TIERING.md) | Which model each role runs on, why the gate has a floor, and how to re-derive it for your repo. |
@@ -73,7 +75,8 @@ software_factory/            ← the product (installable Python package)
   core/
     contracts/               ← Contract v1 compatibility + strict Contract v2,
                                intent policy, and canonical artifact digests
-    approvals.py             ← exact contract/plan authority outside worktrees
+    approvals.py             ← exact contract/plan/design authority outside worktrees
+    design/                  ← strict Design IR, capabilities, and deterministic gate
     publication.py           ← current-tree and history-range public scanner
     orchestrate/             ← classify_tier + combine — the gate rules that
                                MUST be code, not an LLM remembering them
@@ -109,11 +112,11 @@ software_factory/            ← the product (installable Python package)
                                least-privilege
     spend.py                 ← where the factory's own token budget goes, and
                                how much of it is re-routable
-  cli.py                     ← `factory init | doctor | personas | demo | observe |
-                               pickup | build | approve | schedule | version`
+  analyzers/                 ← bounded execution, SARIF import, harness posture
+  cli.py                     ← lifecycle + read-only Design/capability/status inspection
 
-  build/                     ← experimental contract→checkpoint→implementation→
-                               findings sensor→deterministic routing lifecycle
+  build/                     ← experimental Contract→sticky protocol→Design→gate→
+                               exact approval→implementation/review lifecycle
   trace/decisions.py         ← redacted, digest-chained controller evidence
 
 scripts/ci-local.sh          ← every CI job, locally, with CI's pinned toolchain
@@ -151,9 +154,9 @@ factory pickup                   # the next Ready issue a build loop would take
   and submits to an independent judge; you are at the controls. This is how the
   factory this package came from actually runs.
 * **`factory build 42` — autonomous, and experimental.** Contract v2 freezes
-  declared intent before code; exact digest approvals bind human-owned decisions
-  and T2 plans; `findings_v2` reviewers report observations while deterministic
-  code owns disposition. It is still the only major subsystem with no production
+  declared intent before code; exact digest approvals bind human-owned Contracts
+  and Designs (or plans for compatibility-mode parents); `findings_v2` reviewers
+  report observations while deterministic code owns disposition. It is still the only major subsystem with no production
   provenance. Read [KNOWN_ISSUES.md](KNOWN_ISSUES.md) before pointing it at a repo
   you care about, and do not schedule it unattended.
 
@@ -161,12 +164,34 @@ factory pickup                   # the next Ready issue a build loop would take
 factory build 42                 # experimental — see KNOWN_ISSUES.md
 ```
 
+**Read-only inspection**, before you authorize or run anything:
+
+```bash
+factory doctor
+factory design validate <file>
+factory design gate <file>
+factory analyze <adapter>
+factory capabilities
+factory status [issue]
+```
+
+The four Design inspection commands (`design validate`, `design gate`,
+`analyze`, and `capabilities`) plus `status` support versioned `--json` output.
+They do not repair, approve, migrate, refresh, or persist evidence. `doctor`
+previews the configured protocol, analyzers, and capability gaps without running
+models or analyzers. Status reports `ready`, `approval_pending`, `blocked`,
+`degraded`, `unavailable`, or `complete`, with conservative precedence from
+unreadable authority and integrity blocks through exact approval, optional
+degradation, readiness, and replay-bound completion. It is a linearizable "as
+observed" result, not a repository snapshot or cooperative lock.
+
 **Exit codes**, so a scheduler can see a bad night:
 
 | | `0` | `1` | `2` |
 |---|---|---|---|
 | `observe` | PASS or WARN | overall FAIL | the board could not be searched — nothing filed |
 | `build` | shipped; deprecated compatibility plan-pending also returns 0 | specification/approval pending, deterministic BLOCK/REVISE, tests red, secrets found, budget, ceiling, or kill switch | another build holds the lock, controller state cannot be isolated, or a canonical repository identity is missing |
+| inspection/status | successful passing inspection; status ready, degraded, or complete | runtime/authority unavailable, non-passing gate, or status not ready | invalid invocation, input, or configuration |
 
 An engaged kill switch stops `observe` with exit **0** (nothing ran, nothing is
 wrong) and `build` with exit **1** (the requested work did not happen).
@@ -180,16 +205,16 @@ The `factory` command finds your `factory.config.yaml` by walking up from the cu
 directory, so run it from anywhere inside your project. Real (non-offline) use needs
 `gh` authenticated and your providers' secrets in env vars named by the manifest.
 
-`factory build` classifies the tier and, for T1/T2 work, gives a contract author
-one writable contract path. Deterministic intent policy must accept that Contract
-v2 document before the controller checkpoints it. A T2 plan is hashed with its
-parent contract digest and waits for exact operator approval. Only then does an
-implementer run in the isolated worktree. Objective verification, frozen
-`findings_v2` reports, deterministic review routing, re-verification, and the
-objective secret scan must all pass before a PR can be opened into the configured
-development branch. It never merges. The full public-content boundary is a
-separate CI and release gate over the current tree and candidate history; it is
-not run inside every `factory build`.
+`factory build` classifies the tier and, for T1/T2 work, gives a Contract author
+one writable path. Deterministic intent policy must accept Contract v2 before the
+controller checkpoints it. For an adopted T2 Design workflow, a sticky protocol
+selection then leads through runner capability preflight, Design IR v1, bounded
+analyzer evidence, a deterministic gate, and approval of the exact Design digest
+and parent Contract digest. Only then does an implementer run. Objective
+verification, frozen `findings_v2` reports, deterministic review routing,
+re-verification, a refreshed exact Design gate, and the objective secret scan
+must pass before a PR can be opened into the configured development branch. It
+never merges. Compatibility-mode parents keep the legacy opaque-plan path.
 
 The build prints the exact approval command when authority is required. That
 command is directly copyable when Git has `user.email` or `user.name`; otherwise
@@ -202,6 +227,9 @@ factory approve contract demo-42 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 factory approve plan demo-42 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
   --parent aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --approver demo-operator --reason "synthetic plan review"
+factory approve design demo-42 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+  --parent aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --approver demo-operator --reason "synthetic design review"
 ```
 
 An approval-pending contract is persisted as an exact controller record. A later
@@ -211,9 +239,12 @@ approval is still checked on every run: deleting approval returns the same diges
 to `APPROVAL_PENDING`, while replacing it with a different digest blocks.
 
 Approval and decision state must resolve outside the repository and registered
-worktrees. Pending/accepted contract records and plan envelopes are
-controller-owned, ignored local state under the canonical checkout's `.factory`
-directory, outside the disposable runner worktree. See
+worktrees. Pending/accepted Contract records plus Plan, immutable Design, gate,
+and sticky protocol records are controller-owned ignored local state associated
+with the canonical checkout, outside disposable runner worktrees. Back up and
+restore the external and canonical controller roots as one lifecycle set; never
+hand-edit, truncate, or auto-repair authority. Directory separation is not an OS
+sandbox. See
 [ADOPTING.md](docs/ADOPTING.md) for migration and
 [OPERATING.md](docs/OPERATING.md) for precedence, backup, and recovery.
 
@@ -252,6 +283,8 @@ where people get hurt:
 | Frozen intent | Contract v2 is validated, gated, separately committed, and digest-checked after later turns. | Schema conformance does not prove the declared intent is true or complete. |
 | Exact approval | Controller records bind repository, issue, artifact digest, and plan parent digest. | The local operator identity is not a cryptographic signature. |
 | Findings-only review | Models emit typed observations bound to the reviewed fingerprint; deterministic code owns disposition. | A model may still miss a defect or report a false positive. |
+| Design gate | Exact Contract, Design, configuration, capability and analyzer identities are replayable. | Schema validity is not design correctness; the gate cannot prove omitted facts or sensor completeness. |
+| Analyzer boundary | Time, bytes, frames, descriptors, output and persistent workspace fingerprints are bounded. | Installed analyzers are trusted code; normalized evidence is not a sandbox and cannot disprove transient or external side effects. |
 | Re-verify and objective secret scan | Tests are rerun and produced Git blobs are checked for high-signal secret shapes before a PR. | This is not the full public-content policy; CI, history-range scanning, protected `main`, and human release review remain separate requirements. |
 
 Unattended operation still needs a sandboxed runner and least-privilege
@@ -301,5 +334,12 @@ AIFactory adapts ideas, not source implementation; its implementation code and
 fixtures are original Apache-2.0 work. See the
 [0.2.0 release notes](docs/releases/0.2.0.md) for the licensing boundary and the
 parts deliberately deferred.
+
+The 0.3 operator lifecycle was conceptually informed by
+[Everything Claude Code](https://github.com/affaan-m/ecc) at commit
+`649def769bd860512e5fce86e30aa05c8119259f`: explicit capability visibility,
+analyzer-style harness inspection, review-oriented presentation, managed
+lifecycle planning, and portable context. This is influence, not a vendored
+dependency or copied implementation; no ECC source or assets are included.
 
 Maintainer: BrainMatterStudios.

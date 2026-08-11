@@ -54,6 +54,23 @@ unattended against a real repository for a sustained period. Treat it as a
 reference implementation of the shape, not as something to point at your codebase
 and leave running.
 
+### Required harness limitation on macOS
+
+Ordinary current macOS APFS volumes cannot prove no-atime reads. The native
+harness analyzer therefore refuses to content-open every present supported file
+and emits constant high-security fail-closed evidence. New scaffolds make this
+analyzer required, so the Design gate blocks in that condition.
+
+Use `factory doctor` and `factory analyze harness` to preview the environment.
+The supported mitigation is a volume or execution environment with a verifiable
+no-atime policy. Restoring atime after inspection is not safe proof because it is
+itself a mutation and exposes an intermediate state. Existing Contract parents
+can keep their sticky `legacy_plan` workflow. Removing or making the required
+analyzer optional does not preserve the released Design-authority guarantee.
+
+The analyzer broker requires `fork`: release execution is supported on macOS and
+Linux, while native Windows analyzer execution fails unavailable.
+
 **Specific limitations, current:**
 
 - **Schema conformance is not semantic truth.** Contract v2 validates structure,
@@ -64,10 +81,13 @@ and leave running.
   prevents a model from granting authority through prose, but sensors can miss a
   real problem or report a false positive. Overrides must be exact,
   authority-bearing decision events so their rate can be audited.
-- **There is no separate general design gate.** A general design intermediate
-  representation, universal third-party analyzer adapters, code-to-intent
-  re-extraction, and automatic policy discovery are deferred. Existing scanners
-  can provide evidence, but AIFactory does not make their coverage universal.
+- **Schema validity is not design correctness.** Design IR validates structure,
+  identity, references, declared traceability, and bounded facts. It cannot prove
+  scope, claims, mechanisms, or evidence obligations are true or complete.
+- **Analyzer normalization is not a sandbox.** Installed analyzers are trusted
+  code. Process/output bounds and persistent fingerprinting detect lasting
+  workspace mutation, but cannot prove there was no transient mutation or
+  external side effect. Analyzers can miss defects and report false positives.
 - **Directory separation is not an OS security boundary.** Approval and decision
   state lives outside worktrees, but an unrestricted runner on the same host may
   still reach it. Sandbox agents and use least-privilege controller and release
@@ -76,6 +96,11 @@ and leave running.
   the local controller accepted using explicit or local Git identity. They are
   not signed identity assertions. The decision chain is tamper-evident on replay,
   not an externally witnessed transparency log.
+- **Status is an observation, not snapshot authority.** `factory status` is a
+  linearizable "as observed" read-only projection at its final observation
+  point. It does not lock the repository or prevent a writer changing state
+  immediately afterward. Logical read-only claims exclude access time; some
+  platforms provide no portable no-atime read.
 - **The secret and public-content gates are backstops, not guarantees.** Pattern
   checks can miss novel credentials, private facts, or provenance problems. The
   public current-tree scan also cannot certify intermediate commits; every public
@@ -110,6 +135,10 @@ and leave running.
   structured intent reliably improves software, and the autonomous builder
   remains experimental. Do not schedule it unattended on an important
   repository.
+
+Version 0.3.0 does not provide merge, deployment, registry, self-learning, UI,
+or configuration ownership. It does not automatically remediate analyzer
+findings, install harness configuration, or migrate existing workflows.
 
 ---
 

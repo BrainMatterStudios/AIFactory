@@ -12,6 +12,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from software_factory.core.authority import AuthorityFailureKind, classify_read_error
 from software_factory.core.contracts import artifact_sha256, canonical_json_bytes
 
 SCHEMA_VERSION = 2
@@ -33,10 +34,25 @@ _DIRECTORY = getattr(os, "O_DIRECTORY", None)
 _OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
 _LINK_SUPPORTS_DIR_FD = os.link in os.supports_dir_fd
 _RENAME_SUPPORTS_DIR_FD = os.rename in os.supports_dir_fd
+_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+_MAX_RECORD_BYTES = 4 * 1024 * 1024
 
 
 class ContractStoreError(RuntimeError):
     """Contract authority is absent, unsafe, corrupt, conflicting, or unwritable."""
+
+    def __init__(
+        self, message: str, *, kind: AuthorityFailureKind = AuthorityFailureKind.INTEGRITY
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+class _ContractStorageAbsent(ContractStoreError):
+    """Internal typed distinction for a wholly absent read-only store."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, kind=AuthorityFailureKind.ABSENT)
 
 
 @dataclass(frozen=True)
@@ -108,15 +124,48 @@ class ContractEnvelopeStore:
         self, *, repository: str, issue: str, policy_version: str
     ) -> StoredContract | None:
         """Load exactly one pending or accepted record through pinned descriptors."""
-        pending_name = self._filename(issue)
-        accepted_name = self._accepted_filename(issue)
         directory = self._open_root(for_write=True)
+        return self._load_from_open_directory(
+            directory,
+            repository=repository,
+            issue=issue,
+            policy_version=policy_version,
+        )
+
+    def inspect(
+        self, *, repository: str, issue: str, policy_version: str
+    ) -> StoredContract | None:
+        """Inspect lifecycle authority without creating controller storage."""
+        try:
+            directory = self._open_root(for_write=False)
+        except _ContractStorageAbsent:
+            return None
+        return self._load_from_open_directory(
+            directory,
+            repository=repository,
+            issue=issue,
+            policy_version=policy_version,
+        )
+
+    def _load_from_open_directory(
+        self,
+        directory: int,
+        *,
+        repository: str,
+        issue: str,
+        policy_version: str,
+    ) -> StoredContract | None:
+        """Load through one caller-owned, already authenticated directory."""
         pending_descriptor: int | None = None
         accepted_descriptor: int | None = None
         try:
             self._refuse_transition_evidence(directory, issue)
-            pending_descriptor = self._open_optional_record(directory, pending_name)
-            accepted_descriptor = self._open_optional_record(directory, accepted_name)
+            pending_descriptor = self._open_optional_record(
+                directory, self._filename(issue)
+            )
+            accepted_descriptor = self._open_optional_record(
+                directory, self._accepted_filename(issue)
+            )
             if pending_descriptor is not None and accepted_descriptor is not None:
                 raise ContractStoreError(
                     "pending and accepted contract records conflict"
@@ -141,12 +190,7 @@ class ContractEnvelopeStore:
                 issue=issue,
                 policy_version=policy_version,
             )
-            return StoredContract(
-                state=state,
-                envelope=envelope,
-                device=info.st_dev,
-                inode=info.st_ino,
-            )
+            return StoredContract(state, envelope, info.st_dev, info.st_ino)
         finally:
             if pending_descriptor is not None:
                 os.close(pending_descriptor)
@@ -509,9 +553,14 @@ class ContractEnvelopeStore:
         cls._validate_descriptor(descriptor, regular=True)
         try:
             with os.fdopen(descriptor, "rb", closefd=False) as source:
-                raw = source.read()
+                raw = source.read(_MAX_RECORD_BYTES + 1)
         except OSError as exc:
-            raise ContractStoreError("stored contract envelope is unreadable") from exc
+            raise ContractStoreError(
+                "stored contract envelope is unreadable",
+                kind=AuthorityFailureKind.UNREADABLE_RUNTIME,
+            ) from exc
+        if len(raw) > _MAX_RECORD_BYTES:
+            raise ContractStoreError("stored contract envelope is corrupt")
         try:
             data = cls._strict_json_object(raw)
             if set(data) != _FIELDS:
@@ -675,16 +724,30 @@ class ContractEnvelopeStore:
                 if not for_write
                 else "pending contract storage cannot be written"
             )
-            raise ContractStoreError(message) from exc
+            error = ContractStoreError if for_write else _ContractStorageAbsent
+            raise error(message) from exc
         except ContractStoreError:
             raise
-        except (NotImplementedError, OSError, TypeError) as exc:
+        except OSError as exc:
             message = (
                 "pending contract storage is unreadable"
                 if not for_write
                 else "pending contract storage cannot be written"
             )
-            raise ContractStoreError(message) from exc
+            raise ContractStoreError(
+                message,
+                kind=classify_read_error(exc) if not for_write else AuthorityFailureKind.INTEGRITY,
+            ) from exc
+        except (NotImplementedError, TypeError) as exc:
+            message = (
+                "pending contract storage is unreadable"
+                if not for_write
+                else "pending contract storage cannot be written"
+            )
+            raise ContractStoreError(
+                message,
+                kind=AuthorityFailureKind.UNREADABLE_RUNTIME if not for_write else AuthorityFailureKind.INTEGRITY,
+            ) from exc
         finally:
             if factory is not None:
                 os.close(factory)
@@ -704,12 +767,20 @@ class ContractEnvelopeStore:
     def _open_record(directory: int, filename: str) -> int:
         try:
             descriptor = os.open(
-                filename, os.O_RDONLY | _NOFOLLOW, dir_fd=directory
+                filename, os.O_RDONLY | _NONBLOCK | _NOFOLLOW, dir_fd=directory
             )
         except FileNotFoundError as exc:
             raise ContractStoreError("stored contract envelope is absent") from exc
-        except (NotImplementedError, OSError, TypeError) as exc:
-            raise ContractStoreError("stored contract envelope is unreadable") from exc
+        except OSError as exc:
+            raise ContractStoreError(
+                "stored contract envelope is unreadable",
+                kind=classify_read_error(exc),
+            ) from exc
+        except (NotImplementedError, TypeError) as exc:
+            raise ContractStoreError(
+                "stored contract envelope is unreadable",
+                kind=AuthorityFailureKind.UNREADABLE_RUNTIME,
+            ) from exc
         try:
             ContractEnvelopeStore._validate_descriptor(descriptor, regular=True)
         except Exception:
@@ -721,12 +792,20 @@ class ContractEnvelopeStore:
     def _open_optional_record(directory: int, filename: str) -> int | None:
         try:
             descriptor = os.open(
-                filename, os.O_RDONLY | _NOFOLLOW, dir_fd=directory
+                filename, os.O_RDONLY | _NONBLOCK | _NOFOLLOW, dir_fd=directory
             )
         except FileNotFoundError:
             return None
-        except (NotImplementedError, OSError, TypeError) as exc:
-            raise ContractStoreError("stored contract envelope is unreadable") from exc
+        except OSError as exc:
+            raise ContractStoreError(
+                "stored contract envelope is unreadable",
+                kind=classify_read_error(exc),
+            ) from exc
+        except (NotImplementedError, TypeError) as exc:
+            raise ContractStoreError(
+                "stored contract envelope is unreadable",
+                kind=AuthorityFailureKind.UNREADABLE_RUNTIME,
+            ) from exc
         try:
             ContractEnvelopeStore._validate_descriptor(descriptor, regular=True)
         except Exception:
@@ -776,7 +855,7 @@ class ContractEnvelopeStore:
         getuid = getattr(os, "geteuid", None)
         if getuid is None or info.st_uid != getuid():
             raise ContractStoreError("stored contract descriptor has an unsafe owner")
-        if private and info.st_mode & 0o077:
+        if private and stat.S_IMODE(info.st_mode) != (0o600 if regular else 0o700):
             raise ContractStoreError("stored contract descriptor has unsafe permissions")
 
     @staticmethod

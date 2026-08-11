@@ -13,6 +13,7 @@ open a PR into the dev branch. It wires in every rail:
 
 It opens a PR; it never merges, deploys, or writes prod.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -30,6 +31,7 @@ from typing import Any
 from uuid import uuid4
 
 from software_factory.adapters.base import (
+    CapabilityAwareRunner,
     Issue,
     PRDraft,
     PullRequest,
@@ -50,12 +52,19 @@ from software_factory.build.contract_store import (
     ContractRecordState,
     ContractStoreError,
 )
+from software_factory.build.design_gate_store import DesignGateStore
+from software_factory.build.design_store import (
+    DesignEnvelopeStore,
+)
+from software_factory.build.lifecycle_replay import (
+    PublishedLifecycleAuthority,
+    verify_published_lifecycle,
+)
 from software_factory.build.plan_store import PlanEnvelopeStore, PlanStoreError
 from software_factory.build.review_findings import (
     FindingsReport,
     FindingsUnreadable,
     clear_findings,
-    parse_findings,
     read_findings,
 )
 from software_factory.build.review_policy import FindingOverride, route_findings
@@ -65,13 +74,34 @@ from software_factory.build.verdict_file import (
     clear_verdict,
     read_verdict,
 )
+from software_factory.build.workflow_protocol_store import (
+    WorkflowProtocolStore,
+    WorkflowProtocolStoreError,
+)
 from software_factory.build.workspace import NothingToCommit, Workspace
-from software_factory.core.approvals import ApprovalError, ApprovalStore, ArtifactKind
+from software_factory.core.approvals import (
+    ApprovalError,
+    ApprovalRecord,
+    ApprovalStore,
+    ArtifactKind,
+)
 from software_factory.core.contracts import (
     IntentDisposition,
     artifact_sha256,
+    canonical_json_bytes,
     evaluate_intent,
 )
+from software_factory.core.design.capabilities import (
+    CapabilityObservation,
+    RunnerCapabilityDeclaration,
+    assess_capabilities,
+    capability_document,
+    capability_sha256,
+    derive_required_capabilities,
+)
+from software_factory.core.design.capability_names import Capability
+from software_factory.core.design.configuration import AnalyzerSpec
+from software_factory.core.design.gate import DesignGateState, design_gate_sha256
 from software_factory.core.governance import (
     BudgetExceeded,
     BudgetGuard,
@@ -94,13 +124,20 @@ from software_factory.trace.decisions import (
 )
 
 
+def run_design_phase(**kwargs):
+    """Lazy boundary avoids build-package/analyzer import recursion."""
+    from software_factory.build.design_phase import run_design_phase as implementation
+
+    return implementation(**kwargs)
+
+
 class BuildStatus(str, Enum):
-    SHIPPED = "shipped"            # a PR was opened into the dev branch
-    BLOCKED = "blocked"           # escalated to a human (judge BLOCK / tests not green)
+    SHIPPED = "shipped"  # a PR was opened into the dev branch
+    BLOCKED = "blocked"  # escalated to a human (judge BLOCK / tests not green)
     PLAN_PENDING = "plan-pending"  # T2 feature: plan produced, awaiting human approval
     SPEC_PENDING = "spec-pending"  # contract has unresolved blocking questions
     APPROVAL_PENDING = "approval-pending"  # exact contract/plan approval required
-    HALTED = "halted"             # kill switch / budget / ceiling stopped the run
+    HALTED = "halted"  # kill switch / budget / ceiling stopped the run
 
 
 @dataclass
@@ -132,18 +169,56 @@ class BuildOutcome:
     parent_digest: str | None = None
     #: Blocking contract questions paired with their proposed defaults.
     pending_questions: tuple[tuple[str, str], ...] = ()
+    #: Design IR v1 compatibility additions. Legacy callers observe the same
+    #: defaults and all earlier fields retain their existing meanings.
+    design_text: str | None = None
+    gate_state: str | None = None
+    design_protocol: str | None = None
 
 
 # Signal keywords. Deliberately broad: over-tiering costs an extra judge pass,
 # under-tiering routes real risk to a cheap model with no security lens.
-_PROD_WORDS = ("production", "prod ", "live site", "customer-facing", "outage",
-               "incident", "hotfix", "rollback", "deploy")
-_DATA_WORDS = ("migration", "migrate", "schema", "alembic", "backfill", "drop table",
-               "alter table", "reindex", "data loss", "truncate")
-_CROSS_WORDS = ("refactor", "rename across", "every module", "codebase-wide",
-                "all callers", "cross-cutting", "sweeping", "repo-wide")
-_MECHANICAL_WORDS = ("typo", "bump version", "update the changelog", "formatting",
-                     "lint fix", "dead link")
+_PROD_WORDS = (
+    "production",
+    "prod ",
+    "live site",
+    "customer-facing",
+    "outage",
+    "incident",
+    "hotfix",
+    "rollback",
+    "deploy",
+)
+_DATA_WORDS = (
+    "migration",
+    "migrate",
+    "schema",
+    "alembic",
+    "backfill",
+    "drop table",
+    "alter table",
+    "reindex",
+    "data loss",
+    "truncate",
+)
+_CROSS_WORDS = (
+    "refactor",
+    "rename across",
+    "every module",
+    "codebase-wide",
+    "all callers",
+    "cross-cutting",
+    "sweeping",
+    "repo-wide",
+)
+_MECHANICAL_WORDS = (
+    "typo",
+    "bump version",
+    "update the changelog",
+    "formatting",
+    "lint fix",
+    "dead link",
+)
 
 
 def derive_signals(issue: Issue) -> dict[str, Any]:
@@ -164,8 +239,11 @@ def derive_signals(issue: Issue) -> dict[str, Any]:
         if label.startswith("type:"):
             t = label.split(":", 1)[1]
             source = {
-                "bug": "bug", "feature": "feature", "chore": "chore",
-                "data-quality": "data-quality", "task": "feature",
+                "bug": "bug",
+                "feature": "feature",
+                "chore": "chore",
+                "data-quality": "data-quality",
+                "task": "feature",
             }.get(t, source)
     text = f"{issue.title} {issue.body}".lower()
 
@@ -173,8 +251,11 @@ def derive_signals(issue: Issue) -> dict[str, Any]:
         return any(w in text for w in words)
 
     touches_security = (
-        "security" in labels or "type:security" in labels
-        or "security" in text or "vuln" in text or "cve" in text
+        "security" in labels
+        or "type:security" in labels
+        or "security" in text
+        or "vuln" in text
+        or "cve" in text
     )
     return {
         "source": source,
@@ -187,7 +268,9 @@ def derive_signals(issue: Issue) -> dict[str, Any]:
         "mechanical": (
             _any(_MECHANICAL_WORDS)
             and not touches_security
-            and not _any(_PROD_WORDS) and not _any(_DATA_WORDS) and not _any(_CROSS_WORDS)
+            and not _any(_PROD_WORDS)
+            and not _any(_DATA_WORDS)
+            and not _any(_CROSS_WORDS)
         ),
     }
 
@@ -204,8 +287,16 @@ JUDGE_TOOLS: tuple[str, ...] = (
     # Write is required: the verdict is a file the judge creates. That is a
     # deliberate trade — the judge holds a writable worktree, which is why the
     # verify command is re-run against the exact tree about to be pushed.
-    "Read", "Grep", "Glob", "LS", "NotebookRead", "Write",
-    "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)", "Bash(git status:*)",
+    "Read",
+    "Grep",
+    "Glob",
+    "LS",
+    "NotebookRead",
+    "Write",
+    "Bash(git diff:*)",
+    "Bash(git log:*)",
+    "Bash(git show:*)",
+    "Bash(git status:*)",
 )
 
 #: Roles the loop asks the catalog for, by job. Names must exist in
@@ -225,9 +316,10 @@ class Team:
     to hardcode one worker and one judge and never open the catalog at all, so
     editing the catalog changed the doctrine path and nothing else.
     """
+
     worker: str
     worker_model: str
-    judges: tuple[tuple[str, str], ...] = ()      # (persona name, model)
+    judges: tuple[tuple[str, str], ...] = ()  # (persona name, model)
     planner: str | None = None
     planner_model: str = "opus"
 
@@ -239,8 +331,9 @@ class Team:
         return ", ".join(parts)
 
 
-def form_team(tier: Tier, signals: Mapping[str, Any], *, personas=None,
-              planned: bool = False) -> Team:
+def form_team(
+    tier: Tier, signals: Mapping[str, Any], *, personas=None, planned: bool = False
+) -> Team:
     """Assemble a proportional team from the persona catalog.
 
     Proportional means: T0 is gated by the tests alone and gets no judge; T1 gets
@@ -311,8 +404,7 @@ def _scannable_blobs(workspace) -> tuple[list[tuple[str, bytes]], list[str], str
         return [], [], "workspace exposes no path; the produced diff cannot be scanned"
 
     def git(*args, text=True):
-        return subprocess.run(["git", *args], cwd=root, capture_output=True,
-                              text=text, timeout=180)
+        return subprocess.run(["git", *args], cwd=root, capture_output=True, text=text, timeout=180)
 
     out: list[tuple[str, bytes]] = []
     skipped: list[str] = []
@@ -322,25 +414,41 @@ def _scannable_blobs(workspace) -> tuple[list[tuple[str, bytes]], list[str], str
     if base is None:
         # Not "nothing committed" — "cannot tell what is committed". Those are
         # opposite facts about what is about to be pushed.
-        return [], [], ("workspace declares no base, so the commit range cannot be "
-                        "determined; refusing to push content that was never inspected")
+        return (
+            [],
+            [],
+            (
+                "workspace declares no base, so the commit range cannot be "
+                "determined; refusing to push content that was never inspected"
+            ),
+        )
 
     try:
         listed = git("rev-list", "--objects", "HEAD", "--not", base)
         if listed.returncode != 0:
-            return [], [], (f"cannot enumerate the commit range against base {base!r}: "
-                            f"{listed.stderr.strip() or 'unknown error'}")
+            return (
+                [],
+                [],
+                (
+                    f"cannot enumerate the commit range against base {base!r}: "
+                    f"{listed.stderr.strip() or 'unknown error'}"
+                ),
+            )
         candidates: list[tuple[str, str]] = []
         for line in listed.stdout.splitlines():
             oid, _, path = line.partition(" ")
-            if oid and path:                      # commits/trees have no path
+            if oid and path:  # commits/trees have no path
                 candidates.append((oid, path))
         # Ask git what each object is, in one call, and keep the blobs.
         if candidates:
             probe = subprocess.run(
                 ["git", "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
-                cwd=root, input="\n".join(o for o, _ in candidates),
-                capture_output=True, text=True, timeout=180)
+                cwd=root,
+                input="\n".join(o for o, _ in candidates),
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
             sizes = {}
             for line in probe.stdout.splitlines():
                 parts = line.split()
@@ -355,10 +463,15 @@ def _scannable_blobs(workspace) -> tuple[list[tuple[str, bytes]], list[str], str
                 # OSError nor SubprocessError, so it escaped every handler and
                 # crashed the build instead of blocking it.
                 if sizes[oid] > MAX_PUSH_SCAN_BYTES:
-                    return [], skipped, (
-                        f"{path} is {sizes[oid]} bytes, over the "
-                        f"{MAX_PUSH_SCAN_BYTES}-byte scan limit — refusing to push content "
-                        "that was never inspected. Raise the limit or remove the file")
+                    return (
+                        [],
+                        skipped,
+                        (
+                            f"{path} is {sizes[oid]} bytes, over the "
+                            f"{MAX_PUSH_SCAN_BYTES}-byte scan limit — refusing to push content "
+                            "that was never inspected. Raise the limit or remove the file"
+                        ),
+                    )
                 content = git("cat-file", "blob", oid, text=False)
                 if content.returncode != 0:
                     return [], [], f"could not read blob {oid[:8]} ({path})"
@@ -376,8 +489,14 @@ def _scannable_blobs(workspace) -> tuple[list[tuple[str, bytes]], list[str], str
     try:
         changed = workspace.changed_files()
     except AttributeError:
-        return [], [], ("this Workspace does not implement changed_files(), so the "
-                        "produced diff cannot be scanned for secrets")
+        return (
+            [],
+            [],
+            (
+                "this Workspace does not implement changed_files(), so the "
+                "produced diff cannot be scanned for secrets"
+            ),
+        )
     except Exception as e:
         return [], [], f"could not list changed files: {e}"
 
@@ -396,13 +515,18 @@ def _scannable_blobs(workspace) -> tuple[list[tuple[str, bytes]], list[str], str
                 return [], skipped, f"could not read the symlink {rel}: {e}"
             continue
         if not path.exists():
-            continue                  # deleted on the branch: contributes no blob
+            continue  # deleted on the branch: contributes no blob
         try:
             size = path.stat().st_size
             if size > MAX_PUSH_SCAN_BYTES:
-                return [], skipped, (
-                    f"{rel} is {size} bytes, over the {MAX_PUSH_SCAN_BYTES}-byte "
-                    "scan limit — refusing to push content that was never inspected")
+                return (
+                    [],
+                    skipped,
+                    (
+                        f"{rel} is {size} bytes, over the {MAX_PUSH_SCAN_BYTES}-byte "
+                        "scan limit — refusing to push content that was never inspected"
+                    ),
+                )
             with open(path, "rb") as fh:
                 out.append((rel, fh.read()))
         except OSError as e:
@@ -437,8 +561,11 @@ def _scan_for_secrets(workspace) -> tuple[list[str], int, str | None]:
         # nothing" returned a byte-identical tuple. Nothing is skipped by the
         # scanner any more, so a non-empty list means a caller changed that —
         # refuse rather than inherit the old silence.
-        return [], len(blobs), ("content this build would push was not scanned: "
-                                + ", ".join(skipped))
+        return (
+            [],
+            len(blobs),
+            ("content this build would push was not scanned: " + ", ".join(skipped)),
+        )
 
     hits: list[str] = []
     for rel, blob in blobs:
@@ -470,8 +597,9 @@ def _decodings(blob: bytes) -> tuple[str, ...]:
     return tuple(dict.fromkeys(readings))
 
 
-def _check_contract(workspace, dev_branch: str, issue_id: str,
-                    contracts_dir: str) -> tuple[bool, str, str | None]:
+def _check_contract(
+    workspace, dev_branch: str, issue_id: str, contracts_dir: str
+) -> tuple[bool, str, str | None]:
     """Contracts-before-code. Returns (ok, reason, contract_text).
 
     Three things are checked, and all of them fail closed:
@@ -509,14 +637,19 @@ def _check_contract(workspace, dev_branch: str, issue_id: str,
     try:
         number = int(issue_id)
     except (TypeError, ValueError):
-        return False, (f"issue id {issue_id!r} is not numeric, so the contract path "
-                       f"{rel} cannot be derived; the contract gate needs a numeric "
-                       "issue id"), None
+        return (
+            False,
+            (
+                f"issue id {issue_id!r} is not numeric, so the contract path "
+                f"{rel} cannot be derived; the contract gate needs a numeric "
+                "issue id"
+            ),
+            None,
+        )
     try:
         commits = commits_from_git(str(workspace.path), dev_branch)
-        ok, why = contract_precedes_implementation(
-            commits, number, contracts_dir=contracts_dir)
-    except Exception as e:                       # unreadable history is not a pass
+        ok, why = contract_precedes_implementation(commits, number, contracts_dir=contracts_dir)
+    except Exception as e:  # unreadable history is not a pass
         return False, f"could not read commit order: {e}", None
     if not ok:
         return False, why, None
@@ -695,7 +828,14 @@ def _publication_revision_is_authorized(
     rel = f"{contracts_dir.rstrip('/')}/{issue_id}.json"
     try:
         resolved = subprocess.run(
-            ["git", "rev-parse", "--verify", "--quiet", "--end-of-options", f"{revision}^{{commit}}"],
+            [
+                "git",
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                f"{revision}^{{commit}}",
+            ],
             cwd=workspace.path,
             capture_output=True,
             text=True,
@@ -764,6 +904,12 @@ def run_build(
     review_protocol: str | None = None,
     contract_author_role: str = "contract-author",
     finding_overrides: Iterable[FindingOverride] = (),
+    design_protocol: str = "legacy_plan",
+    design_analyzers: tuple[AnalyzerSpec, ...] = (),
+    design_author_role: str = "design-author",
+    design_store: DesignEnvelopeStore | None = None,
+    design_gate_store: DesignGateStore | None = None,
+    workflow_protocol_store: WorkflowProtocolStore | None = None,
 ) -> BuildOutcome:
     """`repo_root` anchors the halt-file check; without it the durable kill switch
     is relative to the process cwd and a cron run that does not cd into the repo
@@ -783,10 +929,11 @@ def run_build(
     protocol = "verdict_v1" if review_protocol is None else review_protocol
     _finding_overrides = tuple(finding_overrides)
     lifecycle_run_id = run_id or f"build-{uuid4().hex}"
-    lifecycle_timestamp = (
-        timestamp or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    )
+    lifecycle_timestamp = timestamp or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     last_decision_digest: dict[str, str | None] = {"value": None}
+    selected_design_protocol: str | None = None
+    approved_design_digest: str | None = None
+    publication_design_authority: tuple[str, str, str] | None = None
 
     unmetered = {"n": 0}
     spent = {"total": 0.0}
@@ -859,13 +1006,21 @@ def run_build(
                 "contract-outcome": ("contract-v2", "contract-phase-v2", "contract-phase-v2"),
                 "plan-outcome": ("plan-envelope-v1", "plan-store-v1", PLAN_CONFIG_VERSION),
                 "approval-lookup": ("approval-v1", "approval-store-v1", PLAN_CONFIG_VERSION),
-                "implementation-objective": ("test-result-v1", "verify-command-v1", "build-gate-v1"),
+                "implementation-objective": (
+                    "test-result-v1",
+                    "verify-command-v1",
+                    "build-gate-v1",
+                ),
                 "review-result": ("verdict-v1", "verdict-file-v1", "review-routing-v1"),
                 "review-routing": ("review-routing-v1", "combine-v1", "review-routing-v1"),
                 "reverify": ("test-result-v1", "verify-command-v1", "build-gate-v1"),
                 "publication-scan": ("scan-result-v1", "secret-scan-v2", "publication-v1"),
                 "final-disposition": ("terminal-v1", "publication-controller-v1", "publication-v1"),
-                "terminal-disposition": ("terminal-v1", "deterministic-controller-v1", "lifecycle-v1"),
+                "terminal-disposition": (
+                    "terminal-v1",
+                    "deterministic-controller-v1",
+                    "lifecycle-v1",
+                ),
             }
             if stage.startswith("contract-integrity-"):
                 schema_version, sensor_version, config_version = (
@@ -915,324 +1070,70 @@ def run_build(
             history = decision_log.read_verified(repository=repository or "", issue=issue.id)
             if not history:
                 raise RuntimeError("decision history is empty")
-            tail = history[-1]
-            if (
-                not last_decision_digest["value"]
-                or tail.event_digest != last_decision_digest["value"]
-                or tail.issue != issue.id
-                or tail.run_id != lifecycle_run_id
-                or tail.stage != "final-disposition"
-                or tail.disposition != BuildStatus.SHIPPED.value.upper()
-            ):
-                raise RuntimeError("decision history tail is not current publication authority")
-            current = [event for event in history if event.run_id == lifecycle_run_id]
-
-            def _last(stage_name: str, before: int) -> int:
-                for index in range(before - 1, -1, -1):
-                    if current[index].stage == stage_name:
-                        return index
-                raise RuntimeError(
-                    f"decision history is missing required stage {stage_name}"
+            workflow_protocol = selected_design_protocol or "none"
+            if workflow_protocol == "design_ir_v1":
+                if publication_design_authority is None or approved_design_digest is None:
+                    raise RuntimeError("current Design gate authority is unavailable")
+                gate_result_digest, gate_evidence_digest, gate_config_digest = (
+                    publication_design_authority
                 )
-
-            final_index = _last("final-disposition", len(current))
-            scan_index = _last("publication-scan", final_index)
-            reverify_index = _last("reverify", scan_index)
-            routing_index = _last("review-routing", reverify_index)
-            implementation_index = _last("implementation-objective", routing_index)
-            contract_outcome_index = _last("contract-outcome", implementation_index)
-            contract_index = _last("contract", contract_outcome_index)
-            if final_index != len(current) - 1:
-                raise RuntimeError("current run has decisions after final authorization")
-            contract_digest = accepted_contract_digest
-            if (
-                contract_digest is None
-                or current[contract_index].artifact_digest != contract_digest
-                or current[contract_outcome_index].artifact_digest != contract_digest
-                or current[contract_outcome_index].disposition
-                != IntentDisposition.PASS.value
-            ):
-                raise RuntimeError("contract authority continuity is broken")
-
-            if tier is Tier.T2 and sig.get("source") == "feature":
-                plan_index = _last("plan-outcome", implementation_index)
-                approval_index = _last("approval-lookup", implementation_index)
-                if not (
-                    contract_outcome_index < plan_index < approval_index < implementation_index
-                ):
-                    raise RuntimeError("T2 plan authority order is broken")
-                plan_event = current[plan_index]
-                approval_event = current[approval_index]
-                if (
-                    plan_event.disposition != IntentDisposition.PASS.value
-                    or approval_event.disposition != IntentDisposition.PASS.value
-                    or plan_event.artifact_digest is None
-                    or approval_event.artifact_digest != plan_event.artifact_digest
-                    or plan_event.parent_digest != contract_digest
-                    or approval_event.parent_digest != contract_digest
-                ):
-                    raise RuntimeError("T2 plan authority continuity is broken")
-
-            review_window = current[implementation_index + 1:routing_index]
-            reviews = [event for event in review_window if event.stage == "review-result"]
-            if not reviews:
-                raise RuntimeError("decision history is missing required stage review-result")
-            routing_event = current[routing_index]
-            v2_routing = routing_event.schema_version == "review-routing-v2"
-            code_events = [
-                current[implementation_index],
-                *(() if protocol == "findings_v2" else (routing_event,)),
-                current[reverify_index],
-                current[scan_index],
-                current[final_index],
-            ]
-            code_digest = current[final_index].artifact_digest
-            if (
-                code_digest is None
-                or code_digest != authorized_surface_digest
-                or current[final_index].source_version != publication_revision
-                or any(
-                event.artifact_digest != code_digest
-                or event.parent_digest != contract_digest
-                for event in code_events
-                )
-            ):
-                raise RuntimeError("assessed code surface continuity is broken")
-            v2_reviews = [event for event in reviews if event.schema_version == "findings-v2"]
-            if protocol == "findings_v2":
-                expected_sensors = tuple(
-                    (
-                        name,
-                        model,
-                        "security" if name == _SECURITY_ROLE else "general",
-                    )
-                    for name, model in team.judges
-                )
-                if (
-                    not v2_routing
-                    or len(v2_reviews) != len(reviews)
-                    or len(v2_reviews) != len(expected_sensors)
-                    or len({name for name, _model, _role in expected_sensors})
-                    != len(expected_sensors)
-                ):
-                    raise RuntimeError("findings sensor panel is incomplete or mixed")
-                review_fingerprint = v2_reviews[0].artifact_digest
-                if (
-                    review_fingerprint is None
-                    or review_artifact_fingerprint is None
-                    or review_fingerprint != review_artifact_fingerprint
-                ):
-                    raise RuntimeError("findings artifact identity is not live authority")
-                replayed_reports: dict[str, FindingsReport] = {}
-                all_finding_ids: set[str] = set()
-                for event, (name, model, role) in zip(
-                    v2_reviews, expected_sensors, strict=True
-                ):
-                    evidence = _evidence(event.findings)
-                    if len(evidence) != 1 or type(evidence[0]) is not dict:
-                        raise RuntimeError("findings evidence shape is invalid")
-                    item = evidence[0]
-                    if set(item) != {"sensor", "revision", "role", "report", "error"}:
-                        raise RuntimeError("findings evidence fields are invalid")
-                    if (
-                        event.stage != "review-result"
-                        or event.disposition != "OBSERVED"
-                        or event.artifact_digest != review_fingerprint
-                        or event.parent_digest != contract_digest
-                        or event.source_version != code_digest
-                        or event.schema_version != "findings-v2"
-                        or event.policy_version != "review-policy-v2"
-                        or event.sensor_version != f"{name}@{model}"
-                        or event.config_version != "review-routing-v2"
-                        or event.authority != "deterministic-controller"
-                        or event.rule != "review.sensor.observed"
-                        or item["sensor"] != name
-                        or item["revision"] != model
-                        or item["role"] != role
-                        or item["error"] is not None
-                        or item["report"] is None
-                    ):
-                        raise RuntimeError("findings sensor identity is invalid")
-                    report = parse_findings(
-                        item["report"],
-                        expected_name=name,
-                        expected_revision=model,
-                    )
-                    for finding in report.findings:
-                        if finding.id in all_finding_ids:
-                            raise RuntimeError("finding IDs are not globally unique")
-                        all_finding_ids.add(finding.id)
-                    replayed_reports[name] = report
-
-                override_events = [
-                    event for event in review_window if event.stage == "finding-override"
-                ]
-                if (
-                    tuple(event.stage for event in review_window)
-                    != ("review-result",) * len(expected_sensors)
-                    + ("finding-override",) * len(_finding_overrides)
-                    or len(override_events) != len(_finding_overrides)
-                ):
-                    raise RuntimeError("findings evidence order is invalid")
-                ordered_findings = tuple(
-                    finding
-                    for name, _model, _role in expected_sensors
-                    for finding in replayed_reports[name].findings
-                )
-                replayed_overrides: list[FindingOverride] = []
-                for event, submitted in zip(
-                    override_events, _finding_overrides, strict=True
-                ):
-                    matching = tuple(
-                        finding
-                        for finding in ordered_findings
-                        if isinstance(submitted.finding_id, str)
-                        and finding.id == submitted.finding_id
-                    )
-                    exists = bool(matching)
-                    unambiguous = len(matching) == 1
-                    artifact_matches = (
-                        isinstance(submitted.artifact_fingerprint, str)
-                        and submitted.artifact_fingerprint == review_fingerprint
-                    )
-                    immutable = any(
-                        finding.severity == "critical"
-                        or (
-                            finding.category == "security"
-                            and finding.severity == "high"
+            else:
+                gate_result_digest = gate_evidence_digest = gate_config_digest = ""
+            expected_plan_digest = (
+                _plan_digest(approved_plan)
+                if workflow_protocol == "legacy_plan" and approved_plan is not None
+                else None
+            )
+            if workflow_protocol == "legacy_plan" and expected_plan_digest is None:
+                raise RuntimeError("approved plan authority is unavailable")
+            expected_contract_authority = contract_intent_authority
+            if contract_requires_approval:
+                expected_contract_authority = approval_store.require(
+                    repository=repository or "",
+                    issue=issue.id,
+                    artifact_kind=ArtifactKind.CONTRACT,
+                    artifact_digest=accepted_contract_digest or "",
+                    parent_digest=None,
+                ).approver
+            shared_replay = verify_published_lifecycle(
+                history,
+                PublishedLifecycleAuthority(
+                    run_id=lifecycle_run_id,
+                    contract_digest=accepted_contract_digest or "",
+                    design_digest=approved_design_digest or "",
+                    gate_result_digest=gate_result_digest,
+                    gate_evidence_digest=gate_evidence_digest,
+                    config_digest=gate_config_digest,
+                    policy_version=contract_policy_version,
+                    code_surface_digest=authorized_surface_digest or "",
+                    publication_revision=publication_revision or "",
+                    expected_contract_intent_authority=expected_contract_authority,
+                    expected_workflow_protocol=workflow_protocol,
+                    expected_plan_digest=expected_plan_digest,
+                    expected_review_protocol=protocol,
+                    expected_sensors=tuple(
+                        (
+                            name,
+                            model,
+                            "security" if name == _SECURITY_ROLE else "general",
                         )
-                        for finding in matching
-                    )
-                    overridable = any(
-                        finding.severity == "high"
-                        and finding.category != "security"
-                        for finding in matching
-                    )
-                    authority = (
-                        submitted.authority.strip()
-                        if isinstance(submitted.authority, str)
-                        and submitted.authority.strip()
-                        else "controller-override-submission"
-                    )
-                    rationale = (
-                        submitted.rationale.strip()
-                        if isinstance(submitted.rationale, str)
-                        and submitted.rationale.strip()
-                        else "override rejected because rationale is absent"
-                    )
-                    applied = bool(
-                        unambiguous
-                        and artifact_matches
-                        and isinstance(submitted.authority, str)
-                        and submitted.authority.strip()
-                        and isinstance(submitted.rationale, str)
-                        and submitted.rationale.strip()
-                        and not immutable
-                        and overridable
-                    )
-                    expected_override_evidence = {
-                        "finding_id": submitted.finding_id,
-                        "finding_exists": exists,
-                        "finding_unambiguous": unambiguous,
-                        "artifact_matches": artifact_matches,
-                        "immutable": immutable,
-                        "overridable": overridable,
-                        "applied": applied,
-                    }
-                    evidence = _evidence(event.findings)
-                    if (
-                        event.artifact_digest != review_fingerprint
-                        or event.parent_digest != contract_digest
-                        or event.source_version != code_digest
-                        or event.schema_version != "finding-override-v1"
-                        or event.policy_version != "review-policy-v2"
-                        or event.sensor_version != "operator-decision-v1"
-                        or event.config_version != "review-routing-v2"
-                        or event.authority != authority
-                        or event.rationale != rationale
-                        or event.disposition != ("APPLIED" if applied else "REJECTED")
-                        or event.rule
-                        != (
-                            "review.override.exact-authority"
-                            if applied
-                            else "review.override.rejected"
-                        )
-                        or evidence != (expected_override_evidence,)
-                    ):
-                        raise RuntimeError("finding override evidence is invalid")
-                    if applied:
-                        replayed_overrides.append(
-                            FindingOverride(
-                                finding_id=submitted.finding_id,
-                                artifact_fingerprint=review_fingerprint,
-                                authority=event.authority,
-                                rationale=event.rationale,
-                            )
-                        )
-
-                replayed_decision = route_findings(
-                    required_sensors={
-                        name: role for name, _model, role in expected_sensors
-                    },
-                    reports=replayed_reports,
-                    sensor_errors={},
+                        for name, model in team.judges
+                    ),
+                    expected_review_artifact_fingerprint=review_artifact_fingerprint,
+                    expected_overrides=tuple(_finding_overrides),
                     revise_count=revise,
                     restart_count=restarts,
                     revise_cap=max_revise,
-                    objective_green=True,
-                    artifact_unchanged=True,
-                    artifact_fingerprint=review_fingerprint,
-                    overrides=tuple(replayed_overrides),
+                    expected_tail_digest=last_decision_digest["value"],
+                ),
+            )
+            if not shared_replay.valid:
+                raise RuntimeError(
+                    f"shared lifecycle replay rejected publication: {shared_replay.failure_code}"
                 )
-                if replayed_decision.verdict is not Verdict.PASS:
-                    raise RuntimeError("findings evidence does not authorize publication")
-                expected_routing_evidence = _evidence(
-                    (
-                        {
-                            "effective_verdict": replayed_decision.verdict.value,
-                            "routing_rule": replayed_decision.rule,
-                            "revise_count": revise,
-                            "restart_count": restarts,
-                            "required_changes": replayed_decision.required_changes,
-                            "warnings": _evidence(replayed_decision.warnings),
-                        },
-                    )
-                )
-                if (
-                    routing_event.artifact_digest != review_fingerprint
-                    or routing_event.parent_digest != contract_digest
-                    or routing_event.source_version != code_digest
-                    or routing_event.schema_version != "review-routing-v2"
-                    or routing_event.policy_version != "review-policy-v2"
-                    or routing_event.sensor_version != "review-policy-v2"
-                    or routing_event.config_version != "review-routing-v2"
-                    or routing_event.authority != "deterministic-controller"
-                    or routing_event.disposition != replayed_decision.verdict.value
-                    or routing_event.rule != "build.review-routing"
-                    or _evidence(routing_event.findings) != expected_routing_evidence
-                ):
-                    raise RuntimeError("findings routing decision is not reproducible")
-            else:
-                if v2_routing or v2_reviews:
-                    raise RuntimeError("legacy review protocol contains v2 evidence")
-                if any(
-                    event.artifact_digest != code_digest
-                    or event.parent_digest != contract_digest
-                    or event.disposition != IntentDisposition.PASS.value
-                    for event in reviews
-                ):
-                    raise RuntimeError("legacy review evidence continuity is broken")
-            if any(
-                event.disposition not in {
-                    IntentDisposition.PASS.value,
-                    BuildStatus.SHIPPED.value.upper(),
-                }
-                for event in code_events
-            ):
-                raise RuntimeError("publication authority contains a non-passing decision")
-        except Exception:
-            return False, f"decision evidence could not be replayed at {stage}"
-        return True, ""
+            return True, ""
+        except Exception as exc:
+            return False, f"decision evidence could not be replayed at {stage}: {exc}"
 
     tier = classify_tier(**sig)
     team = form_team(tier, sig)
@@ -1240,7 +1141,10 @@ def run_build(
     contract_store: ContractEnvelopeStore | None = None
     contract_record = None
     accepted_contract_text: str | None = None
+    accepted_contract_document: dict[str, Any] | None = None
     accepted_contract_digest: str | None = None
+    contract_requires_approval = False
+    contract_intent_authority = "deterministic-policy"
     contract_checkpoint: str | None = None
     contract_policy_version = "intent-v1"
     assessed_surface_digest: str | None = None
@@ -1281,9 +1185,7 @@ def run_build(
             parent_digest=(
                 accepted_contract_digest if assessed_surface_digest is not None else None
             ),
-            source_version=(
-                remote_publication["revision"] or contract_checkpoint or "controller"
-            ),
+            source_version=(remote_publication["revision"] or contract_checkpoint or "controller"),
             policy_version=contract_policy_version,
             rationale=outcome.reason or f"build ended as {outcome.status.value}",
             findings=(
@@ -1291,7 +1193,9 @@ def run_build(
                     "remote_branch_pushed": True,
                     "remote_head": remote_publication["head"],
                 },
-            ) if remote_publication["revision"] is not None else (),
+            )
+            if remote_publication["revision"] is not None
+            else (),
             rule=f"build.terminal.{outcome.status.value}",
         )
         if not recorded:
@@ -1309,16 +1213,11 @@ def run_build(
             pass
 
     def _approval_pending_authority_changed(outcome: BuildOutcome) -> bool:
-        if (
-            outcome.status is not BuildStatus.APPROVAL_PENDING
-            or contract_record is None
-        ):
+        if outcome.status is not BuildStatus.APPROVAL_PENDING or contract_record is None:
             return False
         try:
             if contract_store is None:
-                raise ContractStoreError(
-                    "stored contract has no controller-owned store"
-                )
+                raise ContractStoreError("stored contract has no controller-owned store")
             contract_store.require_current(contract_record)
         except ContractStoreError:
             return True
@@ -1339,6 +1238,8 @@ def run_build(
         )
 
     def _finish_prebuild(outcome: BuildOutcome, *, keep: bool) -> BuildOutcome:
+        if outcome.design_protocol is None and selected_design_protocol is not None:
+            outcome.design_protocol = selected_design_protocol
         if _approval_pending_authority_changed(outcome):
             outcome = _blocked_stored_contract_outcome()
             keep = True
@@ -1362,9 +1263,7 @@ def run_build(
         assert_within_ceiling(pr_base=dev_branch, action="open_pr", **_ceiling_kw)
         assert_live(killswitch_env, root=repo_root)
     except FactoryHalted as e:
-        return _terminalize(
-            BuildOutcome(issue.id, BuildStatus.HALTED, tier=tier, reason=str(e))
-        )
+        return _terminalize(BuildOutcome(issue.id, BuildStatus.HALTED, tier=tier, reason=str(e)))
 
     # Before ANY spawn, including the T2 planner — which runs on the most
     # expensive model. Guarding only the T0/T1 loop meant an exhausted budget
@@ -1373,8 +1272,13 @@ def run_build(
     over = _preflight()
     if over:
         return _terminalize(
-            BuildOutcome(issue.id, BuildStatus.HALTED, tier=tier,
-                         reason=f"budget: {over}", unmetered_runs=unmetered["n"])
+            BuildOutcome(
+                issue.id,
+                BuildStatus.HALTED,
+                tier=tier,
+                reason=f"budget: {over}",
+                unmetered_runs=unmetered["n"],
+            )
         )
 
     if protocol not in {"verdict_v1", "findings_v2"}:
@@ -1444,8 +1348,10 @@ def run_build(
                     issue.id,
                     BuildStatus.BLOCKED,
                     tier=tier,
-                    reason=("contract checkpoint lifecycle requires workspace capabilities: "
-                            + ", ".join(missing)),
+                    reason=(
+                        "contract checkpoint lifecycle requires workspace capabilities: "
+                        + ", ".join(missing)
+                    ),
                 )
             )
         try:
@@ -1549,21 +1455,16 @@ def run_build(
                     and phase.checkpoint_sha is None
                     and phase.requires_approval
                     and pending_policy.policy_version == phase.policy_version
-                    and pending_policy.disposition
-                    is IntentDisposition.APPROVAL_PENDING
+                    and pending_policy.disposition is IntentDisposition.APPROVAL_PENDING
                     and pending_policy.requires_contract_approval
-                    and artifact_sha256(phase.contract_document)
-                    == phase.contract_digest
+                    and artifact_sha256(phase.contract_document) == phase.contract_digest
                 )
                 if valid_pending and pending_contract is not None:
                     valid_pending = (
                         phase.contract_text == pending_contract.contract_text
-                        and phase.contract_document
-                        == pending_contract.contract_document
-                        and phase.contract_digest
-                        == pending_contract.artifact_digest
-                        and phase.policy_version
-                        == pending_contract.policy_version
+                        and phase.contract_document == pending_contract.contract_document
+                        and phase.contract_digest == pending_contract.artifact_digest
+                        and phase.policy_version == pending_contract.policy_version
                     )
             except (TypeError, ValueError, UnicodeError):
                 valid_pending = False
@@ -1573,9 +1474,7 @@ def run_build(
                     "Approval-pending contract result is invalid and was not persisted"
                 )
             elif contract_store is None:
-                persistence_reason = (
-                    "Approval-pending contract storage requires repo_root"
-                )
+                persistence_reason = "Approval-pending contract storage requires repo_root"
             elif pending_contract is None:
                 try:
                     written_contract = contract_store.write(
@@ -1596,21 +1495,15 @@ def run_build(
                         or contract_record.state is not ContractRecordState.PENDING
                         or contract_record.envelope != written_contract
                     ):
-                        raise ContractStoreError(
-                            "new pending contract could not be authenticated"
-                        )
+                        raise ContractStoreError("new pending contract could not be authenticated")
                     pending_contract = contract_record.envelope
                 except ContractStoreError:
-                    persistence_reason = (
-                        "Approval-pending contract could not be persisted securely"
-                    )
+                    persistence_reason = "Approval-pending contract could not be persisted securely"
             if not persistence_reason and contract_record is not None:
                 try:
                     contract_store.require_current(contract_record)
                 except ContractStoreError:
-                    persistence_reason = (
-                        "Approval-pending contract could not be reauthenticated"
-                    )
+                    persistence_reason = "Approval-pending contract could not be reauthenticated"
             if persistence_reason:
                 phase = replace(
                     phase,
@@ -1660,6 +1553,33 @@ def run_build(
 
         accepted_contract_digest = phase.contract_digest
         contract_policy_version = phase.policy_version
+        contract_requires_approval = phase.requires_approval
+        if (
+            phase.disposition is IntentDisposition.PASS
+            and phase.contract_document is not None
+            and phase.contract_document.get("schema_version") == 1
+        ):
+            contract_intent_authority = "compatibility-policy"
+        elif phase.requires_approval and phase.disposition is IntentDisposition.PASS:
+            try:
+                contract_intent_authority = approval_store.require(
+                    repository=repository,
+                    issue=issue.id,
+                    artifact_kind=ArtifactKind.CONTRACT,
+                    artifact_digest=phase.contract_digest,
+                    parent_digest=None,
+                ).approver
+            except Exception:
+                return _finish_prebuild(
+                    BuildOutcome(
+                        issue.id,
+                        BuildStatus.BLOCKED,
+                        tier=tier,
+                        reason="Contract approval authority could not be authenticated",
+                        keep_workspace=True,
+                    ),
+                    keep=True,
+                )
 
         if phase.disposition is not IntentDisposition.PASS:
             status = {
@@ -1687,13 +1607,9 @@ def run_build(
                         else None
                     ),
                     artifact_digest=(
-                        phase.contract_digest
-                        if status is BuildStatus.APPROVAL_PENDING
-                        else None
+                        phase.contract_digest if status is BuildStatus.APPROVAL_PENDING else None
                     ),
-                    pending_questions=_pending_contract_questions(
-                        phase.contract_document
-                    ),
+                    pending_questions=_pending_contract_questions(phase.contract_document),
                 ),
                 keep=phase.keep_workspace,
             )
@@ -1715,6 +1631,7 @@ def run_build(
                 keep=True,
             )
         accepted_contract_text = phase.contract_text
+        accepted_contract_document = dict(phase.contract_document)
         accepted_contract_digest = phase.contract_digest
         contract_checkpoint = phase.checkpoint_sha
         contract_policy_version = phase.policy_version
@@ -1774,9 +1691,7 @@ def run_build(
         if contract_record is not None:
             try:
                 if contract_store is None:
-                    raise ContractStoreError(
-                        "stored contract has no controller-owned store"
-                    )
+                    raise ContractStoreError("stored contract has no controller-owned store")
                 contract_store.require_current(contract_record)
             except ContractStoreError:
                 ok = False
@@ -1876,13 +1791,8 @@ def run_build(
         assessed_surface_digest = digest
         return digest
 
-    def _surface_drift_outcome(
-        stage: str, *, expected: str, actual: str
-    ) -> BuildOutcome:
-        reason = (
-            f"{stage} changed the authorized code surface "
-            f"({expected} -> {actual})"
-        )
+    def _surface_drift_outcome(stage: str, *, expected: str, actual: str) -> BuildOutcome:
+        reason = f"{stage} changed the authorized code surface ({expected} -> {actual})"
         _keep["workspace"] = True
         return _terminalize(
             BuildOutcome(
@@ -1896,33 +1806,343 @@ def run_build(
             )
         )
 
-    def _review_evidence_boundary(
-        stage: str, *, expected_fingerprint: str
-    ) -> BuildOutcome | None:
+    def _review_evidence_boundary(stage: str, *, expected_fingerprint: str) -> BuildOutcome | None:
         """Reauthenticate sensor input and accepted contract after controller I/O."""
         try:
             current = workspace.review_fingerprint()
         except Exception:
-            return _terminalize(BuildOutcome(
-                issue.id,
-                BuildStatus.BLOCKED,
-                tier=tier,
-                reason=f"reviewed artifact is unreadable after {stage}",
-                cost_usd=spent["total"],
-                unmetered_runs=unmetered["n"],
-                keep_workspace=_keep.setdefault("workspace", True),
-            ))
-        if current != expected_fingerprint:
-            return _surface_drift_outcome(
-                stage, expected=expected_fingerprint, actual=current
+            return _terminalize(
+                BuildOutcome(
+                    issue.id,
+                    BuildStatus.BLOCKED,
+                    tier=tier,
+                    reason=f"reviewed artifact is unreadable after {stage}",
+                    cost_usd=spent["total"],
+                    unmetered_runs=unmetered["n"],
+                    keep_workspace=_keep.setdefault("workspace", True),
+                )
             )
+        if current != expected_fingerprint:
+            return _surface_drift_outcome(stage, expected=expected_fingerprint, actual=current)
         return _contract_boundary(stage)
+
+    approved_design: str | None = None
+    approved_design_envelope = None
+    design_eligible = contract_mode and tier is Tier.T2 and sig.get("source") == "feature"
+    if design_eligible:
+        assert repository is not None
+        assert accepted_contract_digest is not None
+
+        def _state_roots_are_separate(*roots: object) -> bool:
+            try:
+                worktree = Path(workspace.path).resolve()
+                resolved = tuple(Path(root).resolve() for root in roots)
+            except (OSError, TypeError, ValueError):
+                return False
+            return all(
+                root != worktree and root not in worktree.parents and worktree not in root.parents
+                for root in resolved
+            )
+
+        if design_protocol not in {"legacy_plan", "design_ir_v1"}:
+            return _finish_prebuild(
+                BuildOutcome(
+                    issue.id,
+                    BuildStatus.BLOCKED,
+                    tier=tier,
+                    reason="configured workflow protocol is invalid",
+                    design_protocol=design_protocol,
+                ),
+                keep=False,
+            )
+        if workflow_protocol_store is not None:
+            if not _state_roots_are_separate(workflow_protocol_store.root):
+                return _finish_prebuild(
+                    BuildOutcome(
+                        issue.id,
+                        BuildStatus.BLOCKED,
+                        tier=tier,
+                        reason="workflow protocol state is not controller-separated",
+                        design_protocol=design_protocol,
+                    ),
+                    keep=False,
+                )
+            contract_block = _contract_boundary("workflow protocol selection preflight")
+            if contract_block is not None:
+                contract_block.design_protocol = design_protocol
+                return _finish_prebuild(contract_block, keep=True)
+            try:
+                selection = workflow_protocol_store.select(
+                    repository=repository,
+                    issue=issue.id,
+                    parent_digest=accepted_contract_digest,
+                    requested=design_protocol,
+                )
+            except WorkflowProtocolStoreError:
+                return _finish_prebuild(
+                    BuildOutcome(
+                        issue.id,
+                        BuildStatus.BLOCKED,
+                        tier=tier,
+                        reason="workflow protocol authority is unavailable or conflicted",
+                        keep_workspace=True,
+                        design_protocol=design_protocol,
+                    ),
+                    keep=True,
+                )
+            selected_design_protocol = selection.protocol
+            contract_block = _contract_boundary("workflow protocol selection")
+            if contract_block is not None:
+                contract_block.design_protocol = selected_design_protocol
+                return _finish_prebuild(contract_block, keep=True)
+        else:
+            selected_design_protocol = design_protocol
+
+        if selected_design_protocol == "design_ir_v1":
+            if (
+                workflow_protocol_store is None
+                or design_store is None
+                or design_gate_store is None
+                or not isinstance(runner, CapabilityAwareRunner)
+            ):
+                return _finish_prebuild(
+                    BuildOutcome(
+                        issue.id,
+                        BuildStatus.BLOCKED,
+                        tier=tier,
+                        reason=(
+                            "Design IR requires controller stores and a capability-aware runner"
+                        ),
+                        gate_state="unavailable",
+                        design_protocol=selected_design_protocol,
+                    ),
+                    keep=False,
+                )
+            if not _state_roots_are_separate(
+                workflow_protocol_store.root,
+                design_store.store_root,
+                design_gate_store.store_root,
+                approval_store.root,
+                decision_log.root,
+            ):
+                return _finish_prebuild(
+                    BuildOutcome(
+                        issue.id,
+                        BuildStatus.BLOCKED,
+                        tier=tier,
+                        reason="Design controller state is not separated from the runner",
+                        gate_state="unavailable",
+                        design_protocol=selected_design_protocol,
+                    ),
+                    keep=False,
+                )
+
+            contract_block = _contract_boundary("design capability preflight")
+            if contract_block is not None:
+                contract_block.design_protocol = selected_design_protocol
+                return _finish_prebuild(contract_block, keep=True)
+            try:
+                runner_declaration = runner.capability_declaration()
+                runner_observation = runner.observe_capabilities(
+                    workspace_path=workspace.path,
+                    repo_root=workspace.path,
+                )
+                controller_capabilities = frozenset(
+                    {
+                        Capability.CONTROLLER_STATE_SEPARATION,
+                        Capability.ARTIFACT_FINGERPRINTING,
+                    }
+                )
+                controller_declaration = RunnerCapabilityDeclaration(
+                    "runner-capability-v1",
+                    "aifactory-controller",
+                    controller_capabilities,
+                )
+                controller_observation = CapabilityObservation(
+                    "capability-observation-v1",
+                    "aifactory-controller",
+                    controller_capabilities,
+                    frozenset(),
+                )
+                required_capabilities = derive_required_capabilities(
+                    design_protocol="design_ir_v1",
+                    tier="T2",
+                    analyzers=design_analyzers,
+                )
+                design_capabilities = assess_capabilities(
+                    declarations=(runner_declaration, controller_declaration),
+                    observations=(runner_observation, controller_observation),
+                    required=required_capabilities,
+                )
+            except BaseException:
+                design_capabilities = None
+            contract_block = _contract_boundary("design capability observation")
+            if contract_block is not None:
+                contract_block.design_protocol = selected_design_protocol
+                return _finish_prebuild(contract_block, keep=True)
+            if (
+                design_capabilities is None
+                or design_capabilities.missing
+                or design_capabilities.unverifiable
+            ):
+                return _finish_prebuild(
+                    BuildOutcome(
+                        issue.id,
+                        BuildStatus.BLOCKED,
+                        tier=tier,
+                        reason="required design capabilities are unavailable",
+                        gate_state="unavailable",
+                        design_protocol=selected_design_protocol,
+                    ),
+                    keep=False,
+                )
+
+            assert accepted_contract_text is not None
+            assert accepted_contract_document is not None
+            design_control_failure: dict[str, BuildOutcome | None] = {"outcome": None}
+
+            def _design_parent_boundary(parent_digest: str) -> None:
+                if parent_digest != accepted_contract_digest:
+                    raise RuntimeError("Design parent authority does not match")
+                block = _contract_boundary("Design parent boundary")
+                if block is not None:
+                    design_control_failure["outcome"] = block
+                    raise RuntimeError("Design parent authority changed")
+
+            def _dispatch_design(role: str, prompt: str) -> RunResult:
+                if role != design_author_role:
+                    raise RuntimeError("Design author role does not match configuration")
+                over = _preflight()
+                if over:
+                    halted = BuildOutcome(
+                        issue.id,
+                        BuildStatus.HALTED,
+                        tier=tier,
+                        reason=f"budget: {over}",
+                        cost_usd=spent["total"],
+                        unmetered_runs=unmetered["n"],
+                        design_protocol=selected_design_protocol,
+                    )
+                    design_control_failure["outcome"] = halted
+                    raise BudgetExceeded(over)
+                try:
+                    result, block = _run_guarded_agent(
+                        "design author",
+                        lambda: runner.run_agent(
+                            prompt,
+                            model=team.planner_model,
+                            system=role,
+                            cwd=workspace.path,
+                        ),
+                    )
+                except BudgetExceeded as exc:
+                    halted = BuildOutcome(
+                        issue.id,
+                        BuildStatus.HALTED,
+                        tier=tier,
+                        reason=f"budget: {exc}",
+                        cost_usd=spent["total"],
+                        unmetered_runs=unmetered["n"],
+                        design_protocol=selected_design_protocol,
+                    )
+                    design_control_failure["outcome"] = halted
+                    raise
+                if block is not None:
+                    design_control_failure["outcome"] = block
+                    raise RuntimeError("Design dispatch parent authority changed")
+                if type(result) is not RunResult:
+                    raise RuntimeError("Design dispatch returned an invalid result")
+                return result
+
+            phase = run_design_phase(
+                issue=issue,
+                repository=repository,
+                contract_text=accepted_contract_text,
+                contract_document=accepted_contract_document,
+                contract_digest=accepted_contract_digest,
+                dispatch=_dispatch_design,
+                parent_boundary=_design_parent_boundary,
+                workspace=workspace,
+                repo_root=workspace.path,
+                capabilities=design_capabilities,
+                analyzer_specs=design_analyzers,
+                approval_store=approval_store,
+                design_store=design_store,
+                gate_store=design_gate_store,
+                finding_overrides=_finding_overrides,
+                decision_log=decision_log,
+                run_id=lifecycle_run_id,
+                timestamp=lifecycle_timestamp,
+                policy_version=contract_policy_version,
+                design_author_role=design_author_role,
+            )
+            if design_control_failure["outcome"] is not None:
+                failure = design_control_failure["outcome"]
+                assert failure is not None
+                failure.design_protocol = selected_design_protocol
+                return _finish_prebuild(
+                    failure,
+                    keep=failure.keep_workspace,
+                )
+
+            design_text = None
+            design_digest = None
+            if phase.design is not None:
+                design_text = canonical_json_bytes(phase.design.design_document).decode("utf-8")
+                design_digest = phase.design.artifact_digest
+            gate_state = (
+                phase.gate.state.value if phase.gate is not None else phase.disposition.value
+            )
+            if phase.disposition.value != "pass":
+                approval_pending = phase.disposition.value == "approval_pending"
+                status = BuildStatus.APPROVAL_PENDING if approval_pending else BuildStatus.BLOCKED
+                return _finish_prebuild(
+                    BuildOutcome(
+                        issue.id,
+                        status,
+                        tier=tier,
+                        reason=phase.reason,
+                        cost_usd=spent["total"],
+                        unmetered_runs=unmetered["n"],
+                        design_text=design_text,
+                        gate_state=gate_state,
+                        design_protocol=selected_design_protocol,
+                        artifact_kind=(
+                            ArtifactKind.DESIGN.value
+                            if approval_pending and design_digest is not None
+                            else None
+                        ),
+                        artifact_digest=(design_digest if approval_pending else None),
+                        parent_digest=(
+                            accepted_contract_digest
+                            if approval_pending and design_digest is not None
+                            else None
+                        ),
+                    ),
+                    keep=False,
+                )
+            if phase.design is None or phase.gate is None or design_text is None:
+                return _finish_prebuild(
+                    BuildOutcome(
+                        issue.id,
+                        BuildStatus.BLOCKED,
+                        tier=tier,
+                        reason="passing Design phase omitted exact authority",
+                        gate_state="unavailable",
+                        design_protocol=selected_design_protocol,
+                    ),
+                    keep=False,
+                )
+            approved_design = design_text
+            approved_design_envelope = phase.design
+            approved_design_digest = phase.design.artifact_digest
+            team = form_team(tier, sig, planned=True)
 
     # Contract-enabled T2 plans are inert envelopes bound to the accepted
     # contract digest. Board labels remain status hints only; ApprovalStore is
     # the sole authority used to continue.
     approved_plan: str | None = None
-    if contract_mode and tier is Tier.T2 and sig.get("source") == "feature":
+    if design_eligible and selected_design_protocol == "legacy_plan":
         contract_block = _contract_boundary("plan authority preflight")
         if contract_block is not None:
             return contract_block
@@ -2170,9 +2390,7 @@ def run_build(
         except Exception as exc:
             pending = isinstance(exc, ApprovalError) and str(exc) == "approval authority is absent"
             disposition = (
-                IntentDisposition.APPROVAL_PENDING
-                if pending
-                else IntentDisposition.BLOCKED
+                IntentDisposition.APPROVAL_PENDING if pending else IntentDisposition.BLOCKED
             )
             recorded, decision_reason = _record_lifecycle_decision(
                 "approval-lookup",
@@ -2199,7 +2417,8 @@ def run_build(
                 f"T2 plan {plan_digest} awaits exact approval for parent "
                 f"contract {accepted_contract_digest}"
                 if status is BuildStatus.APPROVAL_PENDING
-                else decision_reason or "plan approval does not exactly match plan and parent contract"
+                else decision_reason
+                or "plan approval does not exactly match plan and parent contract"
             )
             try:
                 _notify("add_labels", issue.id, [status.value])
@@ -2214,17 +2433,13 @@ def run_build(
                     reason=reason,
                     plan=envelope["plan"],
                     artifact_kind=(
-                        ArtifactKind.PLAN.value
-                        if status is BuildStatus.APPROVAL_PENDING
-                        else None
+                        ArtifactKind.PLAN.value if status is BuildStatus.APPROVAL_PENDING else None
                     ),
                     artifact_digest=(
                         plan_digest if status is BuildStatus.APPROVAL_PENDING else None
                     ),
                     parent_digest=(
-                        accepted_contract_digest
-                        if status is BuildStatus.APPROVAL_PENDING
-                        else None
+                        accepted_contract_digest if status is BuildStatus.APPROVAL_PENDING else None
                     ),
                     cost_usd=spent["total"],
                     unmetered_runs=unmetered["n"],
@@ -2281,26 +2496,39 @@ def run_build(
                     # traceback out of the middle of a build, with the issue
                     # never labelled and the board never told anything.
                     _notify("add_labels", issue.id, ["blocked"])
-                    _notify("comment", issue.id,
-                                   f"Approved plan at `{plan_file}` could not be read: {e}")
+                    _notify(
+                        "comment",
+                        issue.id,
+                        f"Approved plan at `{plan_file}` could not be read: {e}",
+                    )
                     return BuildOutcome(
-                        issue.id, BuildStatus.BLOCKED, tier=tier,
+                        issue.id,
+                        BuildStatus.BLOCKED,
+                        tier=tier,
                         reason=f"approved plan is unreadable: {e}",
-                        cost_usd=spent["total"], unmetered_runs=unmetered["n"])
+                        cost_usd=spent["total"],
+                        unmetered_runs=unmetered["n"],
+                    )
             if not stored:
                 # Labelled approved with nothing to implement. Building anyway
                 # would mean an unplanned T2 feature carrying an approval it
                 # never received.
                 _notify("add_labels", issue.id, ["blocked"])
-                _notify("comment",
+                _notify(
+                    "comment",
                     issue.id,
                     f"Issue is labelled {plan_approved_label!r} but no approved plan is "
                     f"stored at {plan_file or '(no repo root configured)'}. Remove the "
-                    "label and re-run to produce a plan to approve.")
+                    "label and re-run to produce a plan to approve.",
+                )
                 return BuildOutcome(
-                    issue.id, BuildStatus.BLOCKED, tier=tier,
+                    issue.id,
+                    BuildStatus.BLOCKED,
+                    tier=tier,
                     reason=f"{plan_approved_label!r} set but no stored plan to implement",
-                    cost_usd=spent["total"], unmetered_runs=unmetered["n"])
+                    cost_usd=spent["total"],
+                    unmetered_runs=unmetered["n"],
+                )
             # Fall through and build it — with a build team, not the planner-only
             # team formed above. The planning halt this issue is standing at has
             # already been satisfied by a human.
@@ -2320,30 +2548,47 @@ def run_build(
                     pending = ""
                 if pending:
                     return BuildOutcome(
-                        issue.id, BuildStatus.PLAN_PENDING, tier=tier,
-                        reason=(f"T2 feature: a plan is already awaiting approval at "
-                                f"`{plan_file}`; not replanning. Add `{plan_approved_label}` "
-                                "to build it, or delete the file to plan again."),
+                        issue.id,
+                        BuildStatus.PLAN_PENDING,
+                        tier=tier,
+                        reason=(
+                            f"T2 feature: a plan is already awaiting approval at "
+                            f"`{plan_file}`; not replanning. Add `{plan_approved_label}` "
+                            "to build it, or delete the file to plan again."
+                        ),
                         plan=pending,
-                        cost_usd=spent["total"], unmetered_runs=unmetered["n"])
+                        cost_usd=spent["total"],
+                        unmetered_runs=unmetered["n"],
+                    )
             try:
-                r = runner.run_agent(planner_brief(issue), model=team.planner_model,
-                                     system=team.planner or "planner")
+                r = runner.run_agent(
+                    planner_brief(issue), model=team.planner_model, system=team.planner or "planner"
+                )
                 _charge(r)
             except BudgetExceeded as e:
-                return BuildOutcome(issue.id, BuildStatus.HALTED, tier=tier,
-                                    reason=f"budget: {e}", cost_usd=spent["total"],
-                                    unmetered_runs=unmetered["n"])
+                return BuildOutcome(
+                    issue.id,
+                    BuildStatus.HALTED,
+                    tier=tier,
+                    reason=f"budget: {e}",
+                    cost_usd=spent["total"],
+                    unmetered_runs=unmetered["n"],
+                )
             # A failed planner used to return PLAN_PENDING saying "plan produced",
             # which is both false and unapprovable: the gate halts for a human who
             # then has nothing to read. Fail closed instead.
             plan = (r.output or "").strip()
             if not r.ok or not plan:
                 return BuildOutcome(
-                    issue.id, BuildStatus.BLOCKED, tier=tier,
-                    reason=("T2 feature: the planner failed, so there is no plan to approve"
-                            + (f" ({r.error})" if getattr(r, "error", None) else "")),
-                    cost_usd=spent["total"], unmetered_runs=unmetered["n"],
+                    issue.id,
+                    BuildStatus.BLOCKED,
+                    tier=tier,
+                    reason=(
+                        "T2 feature: the planner failed, so there is no plan to approve"
+                        + (f" ({r.error})" if getattr(r, "error", None) else "")
+                    ),
+                    cost_usd=spent["total"],
+                    unmetered_runs=unmetered["n"],
                 )
             stored_at = ""
             if plan_file is not None:
@@ -2356,21 +2601,219 @@ def run_build(
             # The plan also goes on the board, where the person who has to
             # approve it is actually looking.
             try:
-                _notify("comment",
+                _notify(
+                    "comment",
                     issue.id,
                     f"**T2 plan awaiting approval.** No code was written.\n\n{plan}\n\n"
                     f"---\nApprove by adding the `{plan_approved_label}` label and "
-                    "re-running the build; reject by closing the issue.")
+                    "re-running the build; reject by closing the issue.",
+                )
                 _notify("add_labels", issue.id, ["plan-pending"])
             except Exception:
-                pass          # the plan is still on disk and in the outcome
+                pass  # the plan is still on disk and in the outcome
             return BuildOutcome(
-                issue.id, BuildStatus.PLAN_PENDING, tier=tier,
-                reason=(f"T2 feature: plan produced; awaiting human approval "
-                        f"(label `{plan_approved_label}`) before build.{stored_at}"),
+                issue.id,
+                BuildStatus.PLAN_PENDING,
+                tier=tier,
+                reason=(
+                    f"T2 feature: plan produced; awaiting human approval "
+                    f"(label `{plan_approved_label}`) before build.{stored_at}"
+                ),
                 plan=plan,
-                cost_usd=spent['total'], unmetered_runs=unmetered['n'],
+                cost_usd=spent["total"],
+                unmetered_runs=unmetered["n"],
             )
+
+    def _refresh_design_authority(boundary_name: str) -> BuildOutcome | None:
+        """Replay the exact Design gate without granting an author another turn."""
+        nonlocal publication_design_authority
+        if approved_design is None:
+            return None
+        assert selected_design_protocol == "design_ir_v1"
+        assert approved_design_envelope is not None
+        assert design_store is not None
+        assert design_gate_store is not None
+        assert workflow_protocol_store is not None
+        assert approval_store is not None
+        assert repository is not None
+        assert accepted_contract_digest is not None
+        assert accepted_contract_text is not None
+        assert accepted_contract_document is not None
+
+        contract_block = _contract_boundary(f"{boundary_name} design authority preflight")
+        if contract_block is not None:
+            contract_block.design_protocol = selected_design_protocol
+            return contract_block
+
+        phase = None
+        author_dispatch_attempted = False
+        try:
+            if not _state_roots_are_separate(
+                workflow_protocol_store.root,
+                design_store.store_root,
+                design_gate_store.store_root,
+                approval_store.root,
+                decision_log.root,
+            ):
+                raise ValueError("Design controller state separation changed")
+            protocol_before = workflow_protocol_store.read(
+                repository=repository,
+                issue=issue.id,
+                parent_digest=accepted_contract_digest,
+            )
+            if (
+                protocol_before is None
+                or protocol_before.protocol != "design_ir_v1"
+                or protocol_before.parent_digest != accepted_contract_digest
+            ):
+                raise ValueError("workflow protocol authority changed")
+            fresh_declaration = runner.capability_declaration()
+            fresh_observation = runner.observe_capabilities(
+                workspace_path=workspace.path,
+                repo_root=workspace.path,
+            )
+            controller_capabilities = frozenset(
+                {
+                    Capability.CONTROLLER_STATE_SEPARATION,
+                    Capability.ARTIFACT_FINGERPRINTING,
+                }
+            )
+            controller_declaration = RunnerCapabilityDeclaration(
+                "runner-capability-v1",
+                "aifactory-controller",
+                controller_capabilities,
+            )
+            controller_observation = CapabilityObservation(
+                "capability-observation-v1",
+                "aifactory-controller",
+                controller_capabilities,
+                frozenset(),
+            )
+            required = derive_required_capabilities(
+                design_protocol="design_ir_v1",
+                tier="T2",
+                analyzers=design_analyzers,
+                design=approved_design_envelope.design_document,
+            )
+            fresh_capabilities = assess_capabilities(
+                declarations=(fresh_declaration, controller_declaration),
+                observations=(fresh_observation, controller_observation),
+                required=required,
+            )
+
+            def _forbid_design_author(role: str, prompt: str) -> RunResult:
+                nonlocal author_dispatch_attempted
+                author_dispatch_attempted = True
+                raise RuntimeError("Design continuation cannot dispatch an author")
+
+            phase = run_design_phase(
+                issue=issue,
+                repository=repository,
+                contract_text=accepted_contract_text,
+                contract_document=accepted_contract_document,
+                contract_digest=accepted_contract_digest,
+                dispatch=_forbid_design_author,
+                parent_boundary=_design_parent_boundary,
+                workspace=workspace,
+                repo_root=workspace.path,
+                capabilities=fresh_capabilities,
+                analyzer_specs=design_analyzers,
+                approval_store=approval_store,
+                design_store=design_store,
+                gate_store=design_gate_store,
+                finding_overrides=_finding_overrides,
+                decision_log=decision_log,
+                run_id=lifecycle_run_id,
+                timestamp=lifecycle_timestamp,
+                policy_version=contract_policy_version,
+                design_author_role=design_author_role,
+                allow_author_dispatch=False,
+            )
+            current_design = design_store.require_current(
+                repository=repository,
+                issue=issue.id,
+                digest=approved_design_envelope.artifact_digest,
+                parent_digest=accepted_contract_digest,
+                policy_version=approved_design_envelope.policy_version,
+                config_digest=approved_design_envelope.config_digest,
+            )
+            current_gate = design_gate_store.read_current(
+                repository=repository,
+                issue=issue.id,
+            )
+            current_approval = approval_store.require(
+                repository=repository,
+                issue=issue.id,
+                artifact_kind=ArtifactKind.DESIGN,
+                artifact_digest=approved_design_envelope.artifact_digest,
+                parent_digest=accepted_contract_digest,
+            )
+            current_protocol = workflow_protocol_store.read(
+                repository=repository,
+                issue=issue.id,
+                parent_digest=accepted_contract_digest,
+            )
+            current_fingerprint = workspace.review_fingerprint()
+            if current_gate is None:
+                raise ValueError("current Design gate is absent")
+            replayed_gate = DesignGateStore._replay_envelope(current_gate.envelope)
+            if (
+                phase.disposition.value != "pass"
+                or phase.design != approved_design_envelope
+                or phase.gate is None
+                or author_dispatch_attempted
+                or fresh_capabilities.missing
+                or fresh_capabilities.unverifiable
+                or capability_sha256(fresh_capabilities) != replayed_gate.capability_digest
+                or current_gate.envelope.capability_document
+                != capability_document(fresh_capabilities)
+                or current_design.envelope != approved_design_envelope
+                or replayed_gate != phase.gate
+                or replayed_gate.state is not DesignGateState.PASS
+                or design_gate_sha256(replayed_gate) != current_gate.envelope.gate_result_digest
+                or current_gate.envelope.design_digest != approved_design_envelope.artifact_digest
+                or current_gate.envelope.parent_digest != accepted_contract_digest
+                or current_gate.envelope.config_digest != approved_design_envelope.config_digest
+                or current_fingerprint != current_gate.envelope.expected_artifact_fingerprint
+                or type(current_approval) is not ApprovalRecord
+                or current_approval.repository != repository
+                or current_approval.issue != issue.id
+                or current_approval.artifact_kind is not ArtifactKind.DESIGN
+                or current_approval.artifact_digest != approved_design_envelope.artifact_digest
+                or current_approval.parent_digest != accepted_contract_digest
+                or current_protocol is None
+                or current_protocol.protocol != "design_ir_v1"
+                or current_protocol.parent_digest != accepted_contract_digest
+            ):
+                raise ValueError("Design authority is stale")
+            publication_design_authority = (
+                current_gate.envelope.gate_result_digest,
+                current_gate.envelope.gate_result_document["evidence_digest"],
+                current_gate.envelope.config_digest,
+            )
+        except BaseException:
+            return _terminalize(
+                BuildOutcome(
+                    issue.id,
+                    BuildStatus.BLOCKED,
+                    tier=tier,
+                    reason=(
+                        "Design authority or runtime capabilities changed; "
+                        "a fresh gate and exact approval are required"
+                    ),
+                    cost_usd=spent["total"],
+                    unmetered_runs=unmetered["n"],
+                    design_text=approved_design,
+                    gate_state="unavailable",
+                    design_protocol=selected_design_protocol,
+                )
+            )
+
+        contract_block = _contract_boundary(f"{boundary_name} design authority replay")
+        if contract_block is not None:
+            contract_block.design_protocol = selected_design_protocol
+            return contract_block
+        return None
 
     # T0/T1 → build in an isolated workspace.
     revise = 0
@@ -2397,21 +2840,36 @@ def run_build(
                 # blown — a nightly loop burns one turn a night forever while
                 # reporting "at cap".
                 return _terminalize(
-                    BuildOutcome(issue.id, BuildStatus.HALTED, tier=tier,
-                                 reason=f"budget: {over}", revisions=revise,
-                                 cost_usd=spent['total'], unmetered_runs=unmetered['n'],
-                                 judge_history=history)
+                    BuildOutcome(
+                        issue.id,
+                        BuildStatus.HALTED,
+                        tier=tier,
+                        reason=f"budget: {over}",
+                        revisions=revise,
+                        cost_usd=spent["total"],
+                        unmetered_runs=unmetered["n"],
+                        judge_history=history,
+                    )
                 )
 
             # worker pass
             if contract_mode:
                 clear_verdict(workspace.path)
+            if approved_design is not None:
+                design_block = _refresh_design_authority("implementation")
+                if design_block is not None:
+                    return design_block
             r, contract_block = _run_guarded_agent(
                 "implementation",
                 lambda required=required, learnings=learnings: runner.run_agent(
-                    implementer_brief(issue, required_changes=required,
-                                      approved_plan=approved_plan, learnings=learnings,
-                                      contract=accepted_contract_text),
+                    implementer_brief(
+                        issue,
+                        required_changes=required,
+                        approved_plan=approved_plan,
+                        design=approved_design,
+                        learnings=learnings,
+                        contract=accepted_contract_text,
+                    ),
                     model=team.worker_model,
                     system=team.worker,
                     cwd=workspace.path,
@@ -2427,10 +2885,16 @@ def run_build(
                 _notify("add_labels", issue.id, ["blocked"])
                 _notify("comment", issue.id, f"Agent run failed: {r.output[:500]}")
                 return _terminalize(
-                    BuildOutcome(issue.id, BuildStatus.BLOCKED, tier=tier,
-                                 reason=f"agent run failed: {r.output[:200]}",
-                                 revisions=revise, cost_usd=spent['total'], unmetered_runs=unmetered['n'],
-                                 judge_history=history)
+                    BuildOutcome(
+                        issue.id,
+                        BuildStatus.BLOCKED,
+                        tier=tier,
+                        reason=f"agent run failed: {r.output[:200]}",
+                        revisions=revise,
+                        cost_usd=spent["total"],
+                        unmetered_runs=unmetered["n"],
+                        judge_history=history,
+                    )
                 )
 
             # objective gate: the project's own tests must be green
@@ -2454,28 +2918,40 @@ def run_build(
                     parent_digest=accepted_contract_digest,
                     source_version=contract_checkpoint or "controller",
                     policy_version=contract_policy_version,
-                    rationale="project objective tests passed" if passed else "project objective tests failed",
+                    rationale="project objective tests passed"
+                    if passed
+                    else "project objective tests failed",
                     findings=({"passed": passed, "gate": "project-verify"},),
                 )
                 if not recorded:
-                    return _terminalize(BuildOutcome(
+                    return _terminalize(
+                        BuildOutcome(
+                            issue.id,
+                            BuildStatus.BLOCKED,
+                            tier=tier,
+                            reason=decision_reason,
+                            revisions=revise,
+                            cost_usd=spent["total"],
+                            unmetered_runs=unmetered["n"],
+                            keep_workspace=_keep.setdefault("workspace", True),
+                        )
+                    )
+            if not passed:
+                _notify("add_labels", issue.id, ["blocked"])
+                _notify(
+                    "comment", issue.id, "Build could not reach a green test suite — needs a human."
+                )
+                return _terminalize(
+                    BuildOutcome(
                         issue.id,
                         BuildStatus.BLOCKED,
                         tier=tier,
-                        reason=decision_reason,
+                        reason="tests not green",
                         revisions=revise,
                         cost_usd=spent["total"],
                         unmetered_runs=unmetered["n"],
-                        keep_workspace=_keep.setdefault("workspace", True),
-                    ))
-            if not passed:
-                _notify("add_labels", issue.id, ["blocked"])
-                _notify("comment", issue.id, "Build could not reach a green test suite — needs a human.")
-                return _terminalize(
-                    BuildOutcome(issue.id, BuildStatus.BLOCKED, tier=tier,
-                                 reason="tests not green", revisions=revise,
-                                 cost_usd=spent['total'], unmetered_runs=unmetered['n'],
-                                 judge_history=history)
+                        judge_history=history,
+                    )
                 )
 
             # T0 is gated by the test suite alone; T1 and up run the judge. The
@@ -2517,48 +2993,54 @@ def run_build(
                     else:
                         clear_verdict(workspace.path)
                 except (FindingsUnreadable, VerdictUnreadable):
-                    return _terminalize(BuildOutcome(
-                        issue.id,
-                        BuildStatus.BLOCKED,
-                        tier=tier,
-                        reason=f"could not clear stale review evidence for {name}",
-                        revisions=revise,
-                        cost_usd=spent["total"],
-                        unmetered_runs=unmetered["n"],
-                        judge_history=history,
-                        keep_workspace=_keep.setdefault("workspace", True),
-                    ))
+                    return _terminalize(
+                        BuildOutcome(
+                            issue.id,
+                            BuildStatus.BLOCKED,
+                            tier=tier,
+                            reason=f"could not clear stale review evidence for {name}",
+                            revisions=revise,
+                            cost_usd=spent["total"],
+                            unmetered_runs=unmetered["n"],
+                            judge_history=history,
+                            keep_workspace=_keep.setdefault("workspace", True),
+                        )
+                    )
                 sensor_input_fingerprint: str | None = None
                 if protocol == "findings_v2":
                     try:
                         sensor_input_fingerprint = workspace.review_fingerprint()
                     except Exception:
-                        return _terminalize(BuildOutcome(
-                            issue.id,
-                            BuildStatus.BLOCKED,
-                            tier=tier,
-                            reason=f"reviewer {name} input fingerprint is unreadable",
-                            revisions=revise,
-                            cost_usd=spent["total"],
-                            unmetered_runs=unmetered["n"],
-                            judge_history=history,
-                            keep_workspace=_keep.setdefault("workspace", True),
-                        ))
+                        return _terminalize(
+                            BuildOutcome(
+                                issue.id,
+                                BuildStatus.BLOCKED,
+                                tier=tier,
+                                reason=f"reviewer {name} input fingerprint is unreadable",
+                                revisions=revise,
+                                cost_usd=spent["total"],
+                                unmetered_runs=unmetered["n"],
+                                judge_history=history,
+                                keep_workspace=_keep.setdefault("workspace", True),
+                            )
+                        )
                     if (
                         review_artifact_fingerprint is not None
                         and sensor_input_fingerprint != review_artifact_fingerprint
                     ):
-                        return _terminalize(BuildOutcome(
-                            issue.id,
-                            BuildStatus.BLOCKED,
-                            tier=tier,
-                            reason="reviewed artifact changed between required sensors",
-                            revisions=revise,
-                            cost_usd=spent["total"],
-                            unmetered_runs=unmetered["n"],
-                            judge_history=history,
-                            keep_workspace=_keep.setdefault("workspace", True),
-                        ))
+                        return _terminalize(
+                            BuildOutcome(
+                                issue.id,
+                                BuildStatus.BLOCKED,
+                                tier=tier,
+                                reason="reviewed artifact changed between required sensors",
+                                revisions=revise,
+                                cost_usd=spent["total"],
+                                unmetered_runs=unmetered["n"],
+                                judge_history=history,
+                                keep_workspace=_keep.setdefault("workspace", True),
+                            )
+                        )
                     review_artifact_fingerprint = sensor_input_fingerprint
                 if contract_mode:
                     reviewed_surface_digest = _code_surface_digest(f"reviewer {name}")
@@ -2569,9 +3051,8 @@ def run_build(
                             expected=authorized_surface_digest,
                             actual=reviewed_surface_digest,
                         )
-                def _dispatch_reviewer(
-                    name=name, model=model, lens=lens, extra=extra
-                ):
+
+                def _dispatch_reviewer(name=name, model=model, lens=lens, extra=extra):
                     try:
                         return runner.run_agent(
                             (
@@ -2583,9 +3064,7 @@ def run_build(
                                     contract=accepted_contract_text,
                                 )
                                 if protocol == "findings_v2"
-                                else judge_brief(
-                                    issue, lens=lens, contract=accepted_contract_text
-                                )
+                                else judge_brief(issue, lens=lens, contract=accepted_contract_text)
                             ),
                             model=model,
                             system=(
@@ -2611,17 +3090,13 @@ def run_build(
                             meta={"cost_known": False},
                         )
 
-                jr, contract_block = _run_guarded_agent(
-                    f"reviewer {name}", _dispatch_reviewer
-                )
+                jr, contract_block = _run_guarded_agent(f"reviewer {name}", _dispatch_reviewer)
                 if contract_block is not None:
                     if protocol == "findings_v2":
                         try:
                             clear_findings(workspace.path)
                         except FindingsUnreadable:
-                            contract_block.keep_workspace = _keep.setdefault(
-                                "workspace", True
-                            )
+                            contract_block.keep_workspace = _keep.setdefault("workspace", True)
                             contract_block.reason = (
                                 f"{contract_block.reason}; review scratch cleanup failed"
                             )
@@ -2647,40 +3122,41 @@ def run_build(
                         clear_findings(workspace.path)
                         post_sensor_fingerprint = workspace.review_fingerprint()
                     except Exception:
-                        return _terminalize(BuildOutcome(
-                            issue.id,
-                            BuildStatus.BLOCKED,
-                            tier=tier,
-                            reason=f"reviewer {name} output fingerprint is unreadable",
-                            revisions=revise,
-                            cost_usd=spent["total"],
-                            unmetered_runs=unmetered["n"],
-                            judge_history=history,
-                            keep_workspace=_keep.setdefault("workspace", True),
-                        ))
+                        return _terminalize(
+                            BuildOutcome(
+                                issue.id,
+                                BuildStatus.BLOCKED,
+                                tier=tier,
+                                reason=f"reviewer {name} output fingerprint is unreadable",
+                                revisions=revise,
+                                cost_usd=spent["total"],
+                                unmetered_runs=unmetered["n"],
+                                judge_history=history,
+                                keep_workspace=_keep.setdefault("workspace", True),
+                            )
+                        )
                     assert sensor_input_fingerprint is not None
                     if post_sensor_fingerprint != sensor_input_fingerprint:
-                        return _terminalize(BuildOutcome(
-                            issue.id,
-                            BuildStatus.BLOCKED,
-                            tier=tier,
-                            reason=f"reviewer {name} mutated the reviewed artifact",
-                            revisions=revise,
-                            cost_usd=spent["total"],
-                            unmetered_runs=unmetered["n"],
-                            judge_history=history,
-                            keep_workspace=_keep.setdefault("workspace", True),
-                        ))
+                        return _terminalize(
+                            BuildOutcome(
+                                issue.id,
+                                BuildStatus.BLOCKED,
+                                tier=tier,
+                                reason=f"reviewer {name} mutated the reviewed artifact",
+                                revisions=revise,
+                                cost_usd=spent["total"],
+                                unmetered_runs=unmetered["n"],
+                                judge_history=history,
+                                keep_workspace=_keep.setdefault("workspace", True),
+                            )
+                        )
                     report_evidence = _evidence((report,))[0] if report is not None else None
                     recorded, decision_reason = _record_lifecycle_decision(
                         "review-result",
                         "OBSERVED" if report is not None else "UNAVAILABLE",
                         artifact_digest=sensor_input_fingerprint,
                         parent_digest=accepted_contract_digest,
-                        source_version=(
-                            reviewed_surface_digest
-                            or sensor_input_fingerprint
-                        ),
+                        source_version=(reviewed_surface_digest or sensor_input_fingerprint),
                         policy_version="review-policy-v2",
                         authority="deterministic-controller",
                         rationale=(
@@ -2707,17 +3183,19 @@ def run_build(
                         config_version_override="review-routing-v2",
                     )
                     if not recorded:
-                        return _terminalize(BuildOutcome(
-                            issue.id,
-                            BuildStatus.BLOCKED,
-                            tier=tier,
-                            reason=decision_reason,
-                            revisions=revise,
-                            cost_usd=spent["total"],
-                            unmetered_runs=unmetered["n"],
-                            judge_history=history,
-                            keep_workspace=_keep.setdefault("workspace", True),
-                        ))
+                        return _terminalize(
+                            BuildOutcome(
+                                issue.id,
+                                BuildStatus.BLOCKED,
+                                tier=tier,
+                                reason=decision_reason,
+                                revisions=revise,
+                                cost_usd=spent["total"],
+                                unmetered_runs=unmetered["n"],
+                                judge_history=history,
+                                keep_workspace=_keep.setdefault("workspace", True),
+                            )
+                        )
                     authority_block = _review_evidence_boundary(
                         f"review-result evidence for {name}",
                         expected_fingerprint=sensor_input_fingerprint,
@@ -2739,9 +3217,7 @@ def run_build(
                     # before it ever looks at the text.
                     if contract_mode:
                         clear_verdict(workspace.path)
-                        post_review_surface = _code_surface_digest(
-                            f"reviewer {name} output"
-                        )
+                        post_review_surface = _code_surface_digest(f"reviewer {name} output")
                         assert authorized_surface_digest is not None
                         if post_review_surface != authorized_surface_digest:
                             return _surface_drift_outcome(
@@ -2769,31 +3245,38 @@ def run_build(
                             ),
                         )
                         if not recorded:
-                            return _terminalize(BuildOutcome(
-                                issue.id,
-                                BuildStatus.BLOCKED,
-                                tier=tier,
-                                reason=decision_reason,
-                                revisions=revise,
-                                cost_usd=spent["total"],
-                                unmetered_runs=unmetered["n"],
-                                judge_history=history,
-                                keep_workspace=_keep.setdefault("workspace", True),
-                            ))
+                            return _terminalize(
+                                BuildOutcome(
+                                    issue.id,
+                                    BuildStatus.BLOCKED,
+                                    tier=tier,
+                                    reason=decision_reason,
+                                    revisions=revise,
+                                    cost_usd=spent["total"],
+                                    unmetered_runs=unmetered["n"],
+                                    judge_history=history,
+                                    keep_workspace=_keep.setdefault("workspace", True),
+                                )
+                            )
                     _notify("add_labels", issue.id, ["blocked"])
-                    _notify("comment", issue.id,
-                                   f"Judge run failed ({name}); nothing was reviewed: "
-                                   f"{(jr.output or '')[:500]}")
+                    _notify(
+                        "comment",
+                        issue.id,
+                        f"Judge run failed ({name}); nothing was reviewed: "
+                        f"{(jr.output or '')[:500]}",
+                    )
                     return _terminalize(
-                        BuildOutcome(issue.id, BuildStatus.BLOCKED, tier=tier,
-                                     reason=f"judge run failed ({name}): "
-                                            f"{(jr.output or '')[:200]}",
-                                     revisions=revise, cost_usd=spent['total'],
-                                     unmetered_runs=unmetered['n'],
-                                     judge_history=history,
-                                     keep_workspace=_keep.setdefault(
-                                         "workspace", True
-                                     ))
+                        BuildOutcome(
+                            issue.id,
+                            BuildStatus.BLOCKED,
+                            tier=tier,
+                            reason=f"judge run failed ({name}): {(jr.output or '')[:200]}",
+                            revisions=revise,
+                            cost_usd=spent["total"],
+                            unmetered_runs=unmetered["n"],
+                            judge_history=history,
+                            keep_workspace=_keep.setdefault("workspace", True),
+                        )
                     )
                 # The verdict is the FILE, never the reply. `jr.output` is not
                 # consulted for any decision — it is log material. Three review
@@ -2807,14 +3290,13 @@ def run_build(
                 except VerdictUnreadable as e:
                     # Fail closed, and say why — a judge that cannot follow the
                     # protocol is a judge that reviewed nothing usable.
-                    jv = JudgeVerdict(verdict=Verdict.REVISE,
-                                      required_changes=f"(no usable verdict: {e})")
+                    jv = JudgeVerdict(
+                        verdict=Verdict.REVISE, required_changes=f"(no usable verdict: {e})"
+                    )
                     history.append(f"unreadable:{name}")
                 if contract_mode:
                     clear_verdict(workspace.path)
-                    post_review_surface = _code_surface_digest(
-                        f"reviewer {name} output"
-                    )
+                    post_review_surface = _code_surface_digest(f"reviewer {name} output")
                     assert authorized_surface_digest is not None
                     if post_review_surface != authorized_surface_digest:
                         return _surface_drift_outcome(
@@ -2834,6 +3316,8 @@ def run_build(
                         findings=(
                             {
                                 "reviewer": name,
+                                "revision": model,
+                                "role": ("security" if name == _SECURITY_ROLE else "general"),
                                 "lens": lens,
                                 "verdict": jv.verdict.value,
                                 "security_block": jv.security_block,
@@ -2842,17 +3326,19 @@ def run_build(
                         ),
                     )
                     if not recorded:
-                        return _terminalize(BuildOutcome(
-                            issue.id,
-                            BuildStatus.BLOCKED,
-                            tier=tier,
-                            reason=decision_reason,
-                            revisions=revise,
-                            cost_usd=spent["total"],
-                            unmetered_runs=unmetered["n"],
-                            judge_history=history,
-                            keep_workspace=_keep.setdefault("workspace", True),
-                        ))
+                        return _terminalize(
+                            BuildOutcome(
+                                issue.id,
+                                BuildStatus.BLOCKED,
+                                tier=tier,
+                                reason=decision_reason,
+                                revisions=revise,
+                                cost_usd=spent["total"],
+                                unmetered_runs=unmetered["n"],
+                                judge_history=history,
+                                keep_workspace=_keep.setdefault("workspace", True),
+                            )
+                        )
                 verdicts.append(jv.verdict)
                 sec = sec or jv.security_block
                 block_vote = block_vote or jv.verdict is Verdict.BLOCK
@@ -2877,17 +3363,13 @@ def run_build(
                     unambiguous = matches and all_finding_id_list.count(override.finding_id) == 1
                     exact_artifact = (
                         fingerprint_valid
-                        and
-                        override.artifact_fingerprint == review_artifact_fingerprint
+                        and override.artifact_fingerprint == review_artifact_fingerprint
                     )
                     immutable = any(
                         finding.id == override.finding_id
                         and (
                             finding.severity == "critical"
-                            or (
-                                finding.category == "security"
-                                and finding.severity == "high"
-                            )
+                            or (finding.category == "security" and finding.severity == "high")
                         )
                         for report in findings_reports.values()
                         for finding in report.findings
@@ -2914,9 +3396,7 @@ def run_build(
                         "APPLIED" if applied else "REJECTED",
                         artifact_digest=review_artifact_fingerprint,
                         parent_digest=accepted_contract_digest,
-                        source_version=(
-                            reviewed_surface_digest or review_artifact_fingerprint
-                        ),
+                        source_version=(reviewed_surface_digest or review_artifact_fingerprint),
                         policy_version="review-policy-v2",
                         authority=(
                             override.authority.strip()
@@ -2949,17 +3429,19 @@ def run_build(
                         config_version_override="review-routing-v2",
                     )
                     if not recorded:
-                        return _terminalize(BuildOutcome(
-                            issue.id,
-                            BuildStatus.BLOCKED,
-                            tier=tier,
-                            reason=decision_reason,
-                            revisions=revise,
-                            cost_usd=spent["total"],
-                            unmetered_runs=unmetered["n"],
-                            judge_history=history,
-                            keep_workspace=_keep.setdefault("workspace", True),
-                        ))
+                        return _terminalize(
+                            BuildOutcome(
+                                issue.id,
+                                BuildStatus.BLOCKED,
+                                tier=tier,
+                                reason=decision_reason,
+                                revisions=revise,
+                                cost_usd=spent["total"],
+                                unmetered_runs=unmetered["n"],
+                                judge_history=history,
+                                keep_workspace=_keep.setdefault("workspace", True),
+                            )
+                        )
                 authority_block = _review_evidence_boundary(
                     "review routing preflight",
                     expected_fingerprint=review_artifact_fingerprint,
@@ -2986,8 +3468,9 @@ def run_build(
                 overall = decision.verdict
                 asks = list(decision.required_changes)
             else:
-                overall = combine(verdicts, revise_count=revise, security_block=sec,
-                                  revise_cap=max_revise)
+                overall = combine(
+                    verdicts, revise_count=revise, security_block=sec, revise_cap=max_revise
+                )
                 # A BLOCK the judge calls an architectural dead-end is worth one
                 # fresh attempt before a human is paged. decide_restart holds the
                 # rules — including that a security block is never restartable.
@@ -3044,9 +3527,7 @@ def run_build(
                         else review_artifact_fingerprint
                     ),
                     policy_version=(
-                        "review-policy-v2"
-                        if protocol == "findings_v2"
-                        else contract_policy_version
+                        "review-policy-v2" if protocol == "findings_v2" else contract_policy_version
                     ),
                     findings=routing_findings,
                     rationale=(
@@ -3065,17 +3546,19 @@ def run_build(
                     ),
                 )
                 if not recorded:
-                    return _terminalize(BuildOutcome(
-                        issue.id,
-                        BuildStatus.BLOCKED,
-                        tier=tier,
-                        reason=decision_reason,
-                        revisions=revise,
-                        cost_usd=spent["total"],
-                        unmetered_runs=unmetered["n"],
-                        judge_history=history,
-                        keep_workspace=_keep.setdefault("workspace", True),
-                    ))
+                    return _terminalize(
+                        BuildOutcome(
+                            issue.id,
+                            BuildStatus.BLOCKED,
+                            tier=tier,
+                            reason=decision_reason,
+                            revisions=revise,
+                            cost_usd=spent["total"],
+                            unmetered_runs=unmetered["n"],
+                            judge_history=history,
+                            keep_workspace=_keep.setdefault("workspace", True),
+                        )
+                    )
                 if protocol == "findings_v2":
                     assert review_artifact_fingerprint is not None
                     authority_block = _review_evidence_boundary(
@@ -3098,9 +3581,14 @@ def run_build(
                 # The fresh worker knows nothing about the attempt just thrown
                 # away. Handing it the judge's reasoning is the difference
                 # between a second attempt and the same attempt again.
-                learnings = "\n\n".join(asks) if asks else (
-                    "The judge called the approach itself wrong but did not say why. "
-                    "Choose a materially different approach from the obvious one.")
+                learnings = (
+                    "\n\n".join(asks)
+                    if asks
+                    else (
+                        "The judge called the approach itself wrong but did not say why. "
+                        "Choose a materially different approach from the obvious one."
+                    )
+                )
                 if contract_mode:
                     assert contract_checkpoint is not None
                     workspace.reset_to(contract_checkpoint)
@@ -3109,27 +3597,43 @@ def run_build(
                         return contract_block
                 else:
                     workspace.reset()
-                _notify("comment",
+                _notify(
+                    "comment",
                     issue.id,
                     f"Judge called the approach wrong; discarding the branch and "
-                    f"restarting once (restart {restarts}/{RESTART_CAP}).")
+                    f"restarting once (restart {restarts}/{RESTART_CAP}).",
+                )
                 continue
             if overall is Verdict.BLOCK:
                 _notify("add_labels", issue.id, ["blocked"])
                 detail = ("\n\n" + "\n\n".join(asks)) if asks else ""
-                _notify("comment", issue.id,
-                               f"Judge BLOCK after {revise} revision(s) and {restarts} "
-                               f"restart(s); escalating to a human.{detail}")
+                _notify(
+                    "comment",
+                    issue.id,
+                    f"Judge BLOCK after {revise} revision(s) and {restarts} "
+                    f"restart(s); escalating to a human.{detail}",
+                )
                 return _terminalize(
-                    BuildOutcome(issue.id, BuildStatus.BLOCKED, tier=tier,
-                                 reason="judge blocked", revisions=revise,
-                                 cost_usd=spent['total'], unmetered_runs=unmetered['n'],
-                                 judge_history=history)
+                    BuildOutcome(
+                        issue.id,
+                        BuildStatus.BLOCKED,
+                        tier=tier,
+                        reason="judge blocked",
+                        revisions=revise,
+                        cost_usd=spent["total"],
+                        unmetered_runs=unmetered["n"],
+                        judge_history=history,
+                    )
                 )
             # REVISE → loop with the judge's actual asks, verbatim.
-            required = "\n\n".join(asks) if asks else (
-                "The judge asked for changes but did not list them. Re-read the "
-                "issue's expected outcome and address the most likely gap.")
+            required = (
+                "\n\n".join(asks)
+                if asks
+                else (
+                    "The judge asked for changes but did not list them. Re-read the "
+                    "issue's expected outcome and address the most likely gap."
+                )
+            )
             revise += 1
 
         # The judges ran INSIDE the worktree, after the gate went green. A tool
@@ -3159,37 +3663,49 @@ def run_build(
                     parent_digest=accepted_contract_digest,
                     source_version=contract_checkpoint or "controller",
                     policy_version=contract_policy_version,
-                    rationale="post-review objective tests passed" if passed else "post-review objective tests failed",
+                    rationale="post-review objective tests passed"
+                    if passed
+                    else "post-review objective tests failed",
                     findings=({"passed": passed, "gate": "post-review-verify"},),
                 )
                 if not recorded:
-                    return _terminalize(BuildOutcome(
-                        issue.id,
-                        BuildStatus.BLOCKED,
-                        tier=tier,
-                        reason=decision_reason,
-                        revisions=revise,
-                        cost_usd=spent["total"],
-                        unmetered_runs=unmetered["n"],
-                        judge_history=history,
-                        keep_workspace=_keep.setdefault("workspace", True),
-                    ))
+                    return _terminalize(
+                        BuildOutcome(
+                            issue.id,
+                            BuildStatus.BLOCKED,
+                            tier=tier,
+                            reason=decision_reason,
+                            revisions=revise,
+                            cost_usd=spent["total"],
+                            unmetered_runs=unmetered["n"],
+                            judge_history=history,
+                            keep_workspace=_keep.setdefault("workspace", True),
+                        )
+                    )
                 contract_block = _contract_boundary("reverify")
                 if contract_block is not None:
                     return contract_block
             if not passed:
                 _notify("add_labels", issue.id, ["blocked"])
-                _notify("comment",
+                _notify(
+                    "comment",
                     issue.id,
                     "The test suite was green when the judge was dispatched and is red "
                     "now, so the reviewed tree was modified after it was verified. "
-                    "Nothing was pushed; the worktree is kept for inspection.")
+                    "Nothing was pushed; the worktree is kept for inspection.",
+                )
                 return _terminalize(
-                    BuildOutcome(issue.id, BuildStatus.BLOCKED, tier=tier,
-                                 reason="tests not green on re-verify after judging",
-                                 revisions=revise, cost_usd=spent['total'],
-                                 unmetered_runs=unmetered['n'], judge_history=history,
-                                 keep_workspace=_keep.setdefault("workspace", True))
+                    BuildOutcome(
+                        issue.id,
+                        BuildStatus.BLOCKED,
+                        tier=tier,
+                        reason="tests not green on re-verify after judging",
+                        revisions=revise,
+                        cost_usd=spent["total"],
+                        unmetered_runs=unmetered["n"],
+                        judge_history=history,
+                        keep_workspace=_keep.setdefault("workspace", True),
+                    )
                 )
 
         # PASS (or T0) → ship: commit, push, open the PR. Ceiling re-checked.
@@ -3206,9 +3722,7 @@ def run_build(
         contract_block = _contract_boundary("publication scan preflight")
         if contract_block is not None:
             return contract_block
-        scan_fingerprint = (
-            _code_surface_digest("publication scan") if contract_mode else None
-        )
+        scan_fingerprint = _code_surface_digest("publication scan") if contract_mode else None
         if contract_mode:
             assert authorized_surface_digest is not None
             assert scan_fingerprint is not None
@@ -3225,7 +3739,9 @@ def run_build(
                 return contract_block
             recorded, decision_reason = _record_lifecycle_decision(
                 "publication-scan",
-                IntentDisposition.BLOCKED.value if (scan_error or leaked) else IntentDisposition.PASS.value,
+                IntentDisposition.BLOCKED.value
+                if (scan_error or leaked)
+                else IntentDisposition.PASS.value,
                 artifact_digest=scan_fingerprint,
                 parent_digest=accepted_contract_digest,
                 source_version=contract_checkpoint or "controller",
@@ -3244,17 +3760,19 @@ def run_build(
                 ),
             )
             if not recorded:
-                return _terminalize(BuildOutcome(
-                    issue.id,
-                    BuildStatus.BLOCKED,
-                    tier=tier,
-                    reason=decision_reason,
-                    revisions=revise,
-                    cost_usd=spent["total"],
-                    unmetered_runs=unmetered["n"],
-                    judge_history=history,
-                    keep_workspace=_keep.setdefault("workspace", True),
-                ))
+                return _terminalize(
+                    BuildOutcome(
+                        issue.id,
+                        BuildStatus.BLOCKED,
+                        tier=tier,
+                        reason=decision_reason,
+                        revisions=revise,
+                        cost_usd=spent["total"],
+                        unmetered_runs=unmetered["n"],
+                        judge_history=history,
+                        keep_workspace=_keep.setdefault("workspace", True),
+                    )
+                )
         # No `scanned == 0` guard here, deliberately. Zero blobs is the correct
         # and safe result for a build that only DELETES files — deletions
         # contribute no blob, and treating that as "looked at nothing" would
@@ -3263,16 +3781,30 @@ def run_build(
         # clean) is closed at its source instead: nothing is skipped, and
         # `_scan_for_secrets` errors if anything ever is.
         if scan_error or leaked:
-            detail = (f"possible secrets in the produced diff: {', '.join(leaked)}"
-                      if leaked else f"the diff could not be scanned — {scan_error}")
+            detail = (
+                f"possible secrets in the produced diff: {', '.join(leaked)}"
+                if leaked
+                else f"the diff could not be scanned — {scan_error}"
+            )
             _notify("add_labels", issue.id, ["blocked"])
-            _notify("comment", issue.id, f"Build blocked: {detail}. Nothing was pushed. "
-                           "The worktree is kept so you can inspect it.")
+            _notify(
+                "comment",
+                issue.id,
+                f"Build blocked: {detail}. Nothing was pushed. "
+                "The worktree is kept so you can inspect it.",
+            )
             return _terminalize(
-                BuildOutcome(issue.id, BuildStatus.BLOCKED, tier=tier,
-                             reason=detail, revisions=revise, cost_usd=spent['total'], unmetered_runs=unmetered['n'],
-                             judge_history=history, keep_workspace=_keep.setdefault(
-                                 "workspace", True))
+                BuildOutcome(
+                    issue.id,
+                    BuildStatus.BLOCKED,
+                    tier=tier,
+                    reason=detail,
+                    revisions=revise,
+                    cost_usd=spent["total"],
+                    unmetered_runs=unmetered["n"],
+                    judge_history=history,
+                    keep_workspace=_keep.setdefault("workspace", True),
+                )
             )
 
         # Did THIS run produce anything? The branch is kept across runs by
@@ -3280,23 +3812,29 @@ def run_build(
         # in which the agent wrote nothing at all re-ships the previous, rejected
         # tree and reports it as a fresh build.
         produced = getattr(workspace, "produced_anything", None)
-        produced_this_run = (
-            bool(produced()) if callable(produced) else not contract_mode
-        )
+        produced_this_run = bool(produced()) if callable(produced) else not contract_mode
         if contract_mode and not implementation_surface_changed:
             produced_this_run = False
         if not produced_this_run:
             _notify("add_labels", issue.id, ["blocked"])
-            _notify("comment", issue.id,
-                           "This run produced no changes. The branch still carries a "
-                           "previous attempt, which will not be shipped as if it were "
-                           "new work.")
+            _notify(
+                "comment",
+                issue.id,
+                "This run produced no changes. The branch still carries a "
+                "previous attempt, which will not be shipped as if it were "
+                "new work.",
+            )
             return _terminalize(
-                BuildOutcome(issue.id, BuildStatus.BLOCKED, tier=tier,
-                             reason="this run produced no changes; the branch "
-                                    "carries a previous attempt",
-                             revisions=revise, cost_usd=spent['total'],
-                             unmetered_runs=unmetered['n'], judge_history=history)
+                BuildOutcome(
+                    issue.id,
+                    BuildStatus.BLOCKED,
+                    tier=tier,
+                    reason="this run produced no changes; the branch carries a previous attempt",
+                    revisions=revise,
+                    cost_usd=spent["total"],
+                    unmetered_runs=unmetered["n"],
+                    judge_history=history,
+                )
             )
 
         contract_block = _contract_boundary("final commit")
@@ -3344,6 +3882,10 @@ def run_build(
                         keep_workspace=True,
                     )
                 )
+            if approved_design is not None:
+                design_block = _refresh_design_authority("publication")
+                if design_block is not None:
+                    return design_block
             recorded, decision_reason = _record_lifecycle_decision(
                 "final-disposition",
                 BuildStatus.SHIPPED.value.upper(),
@@ -3357,34 +3899,38 @@ def run_build(
                 ),
             )
             if not recorded:
-                return _terminalize(BuildOutcome(
-                    issue.id,
-                    BuildStatus.BLOCKED,
-                    tier=tier,
-                    reason=decision_reason,
-                    revisions=revise,
-                    cost_usd=spent["total"],
-                    unmetered_runs=unmetered["n"],
-                    judge_history=history,
-                    keep_workspace=_keep.setdefault("workspace", True),
-                ))
+                return _terminalize(
+                    BuildOutcome(
+                        issue.id,
+                        BuildStatus.BLOCKED,
+                        tier=tier,
+                        reason=decision_reason,
+                        revisions=revise,
+                        cost_usd=spent["total"],
+                        unmetered_runs=unmetered["n"],
+                        judge_history=history,
+                        keep_workspace=_keep.setdefault("workspace", True),
+                    )
+                )
         contract_block = _contract_boundary("push")
         if contract_block is not None:
             return contract_block
         if contract_mode:
             replayed, decision_reason = _replay_lifecycle_decisions("push")
             if not replayed:
-                return _terminalize(BuildOutcome(
-                    issue.id,
-                    BuildStatus.BLOCKED,
-                    tier=tier,
-                    reason=decision_reason,
-                    revisions=revise,
-                    cost_usd=spent["total"],
-                    unmetered_runs=unmetered["n"],
-                    judge_history=history,
-                    keep_workspace=_keep.setdefault("workspace", True),
-                ))
+                return _terminalize(
+                    BuildOutcome(
+                        issue.id,
+                        BuildStatus.BLOCKED,
+                        tier=tier,
+                        reason=decision_reason,
+                        revisions=revise,
+                        cost_usd=spent["total"],
+                        unmetered_runs=unmetered["n"],
+                        judge_history=history,
+                        keep_workspace=_keep.setdefault("workspace", True),
+                    )
+                )
             contract_block = _contract_boundary("publication replay")
             if contract_block is not None:
                 return contract_block
@@ -3408,32 +3954,38 @@ def run_build(
         if contract_block is not None:
             return contract_block
         try:
-            pr = source.open_pr(PRDraft(
-                title=f"fix: {issue.title}",
-                body=(f"Resolves #{issue.id}.\n\nBuilt by the factory at tier {tier.value}; "
-                      f"{revise} revision(s). Auto-merges to {dev_branch} on green CI; "
-                      "main remains a human gate."),
-                base=dev_branch,
-                head=head,
-                labels=("auto-filed",),
-            ))
+            pr = source.open_pr(
+                PRDraft(
+                    title=f"fix: {issue.title}",
+                    body=(
+                        f"Resolves #{issue.id}.\n\nBuilt by the factory at tier {tier.value}; "
+                        f"{revise} revision(s). Auto-merges to {dev_branch} on green CI; "
+                        "main remains a human gate."
+                    ),
+                    base=dev_branch,
+                    head=head,
+                    labels=("auto-filed",),
+                )
+            )
         except Exception:
             _keep["workspace"] = True
             reason = (
                 f"remote branch {head!r} was pushed, but PR creation or confirmation "
                 "failed; provider PR state is unknown and manual recovery is required"
             )
-            outcome = _terminalize(BuildOutcome(
-                issue.id,
-                BuildStatus.BLOCKED,
-                tier=tier,
-                reason=reason,
-                revisions=revise,
-                cost_usd=spent["total"],
-                unmetered_runs=unmetered["n"],
-                judge_history=history,
-                keep_workspace=True,
-            ))
+            outcome = _terminalize(
+                BuildOutcome(
+                    issue.id,
+                    BuildStatus.BLOCKED,
+                    tier=tier,
+                    reason=reason,
+                    revisions=revise,
+                    cost_usd=spent["total"],
+                    unmetered_runs=unmetered["n"],
+                    judge_history=history,
+                    keep_workspace=True,
+                )
+            )
             _notify("add_labels", issue.id, ["blocked"])
             _notify("comment", issue.id, reason)
             return outcome
@@ -3443,43 +3995,79 @@ def run_build(
         except Exception:
             pass  # board move is best-effort; the PR is what matters
         _keep["shipped"] = True
-        return BuildOutcome(issue.id, BuildStatus.SHIPPED, tier=tier, pr=pr,
-                            revisions=revise, cost_usd=spent['total'], unmetered_runs=unmetered['n'], judge_history=history,
-                            reason=f"PR #{pr.number} opened into {dev_branch}")
+        return BuildOutcome(
+            issue.id,
+            BuildStatus.SHIPPED,
+            tier=tier,
+            pr=pr,
+            revisions=revise,
+            cost_usd=spent["total"],
+            unmetered_runs=unmetered["n"],
+            judge_history=history,
+            reason=f"PR #{pr.number} opened into {dev_branch}",
+        )
     except NothingToCommit as e:
         _notify("add_labels", issue.id, ["blocked"])
         _notify("comment", issue.id, f"Build produced no changes: {e}")
         return _terminalize(
-            BuildOutcome(issue.id, BuildStatus.BLOCKED, tier=tier, reason=str(e),
-                         revisions=revise, cost_usd=spent['total'], unmetered_runs=unmetered['n'],
-                         judge_history=history)
+            BuildOutcome(
+                issue.id,
+                BuildStatus.BLOCKED,
+                tier=tier,
+                reason=str(e),
+                revisions=revise,
+                cost_usd=spent["total"],
+                unmetered_runs=unmetered["n"],
+                judge_history=history,
+            )
         )
     except BudgetExceeded as e:
         return _terminalize(
-            BuildOutcome(issue.id, BuildStatus.HALTED, tier=tier,
-                         reason=f"budget: {e}", revisions=revise, cost_usd=spent['total'], unmetered_runs=unmetered['n'],
-                         judge_history=history)
+            BuildOutcome(
+                issue.id,
+                BuildStatus.HALTED,
+                tier=tier,
+                reason=f"budget: {e}",
+                revisions=revise,
+                cost_usd=spent["total"],
+                unmetered_runs=unmetered["n"],
+                judge_history=history,
+            )
         )
     except FactoryHalted as e:
         return _terminalize(
-            BuildOutcome(issue.id, BuildStatus.HALTED, tier=tier, reason=str(e),
-                         revisions=revise, cost_usd=spent['total'], unmetered_runs=unmetered['n'],
-                         judge_history=history)
+            BuildOutcome(
+                issue.id,
+                BuildStatus.HALTED,
+                tier=tier,
+                reason=str(e),
+                revisions=revise,
+                cost_usd=spent["total"],
+                unmetered_runs=unmetered["n"],
+                judge_history=history,
+            )
         )
     except RuntimeError as e:
         # A workspace that cannot be prepared is a blocked build, not a crash.
         _notify("add_labels", issue.id, ["blocked"])
         _notify("comment", issue.id, f"Build could not prepare a workspace: {e}")
         return _terminalize(
-            BuildOutcome(issue.id, BuildStatus.BLOCKED, tier=tier, reason=str(e),
-                         revisions=revise, cost_usd=spent["total"],
-                         unmetered_runs=unmetered["n"], judge_history=history)
+            BuildOutcome(
+                issue.id,
+                BuildStatus.BLOCKED,
+                tier=tier,
+                reason=str(e),
+                revisions=revise,
+                cost_usd=spent["total"],
+                unmetered_runs=unmetered["n"],
+                judge_history=history,
+            )
         )
     finally:
         if not created:
-            pass                        # nothing was set up; nothing to tear down
+            pass  # nothing was set up; nothing to tear down
         elif _keep.get("workspace"):
-            pass                        # left on disk for a human to inspect
+            pass  # left on disk for a human to inspect
         else:
             # Snapshot unfinished work before the worktree goes away — but only
             # when the build did NOT ship. After a successful ship the branch
@@ -3490,7 +4078,7 @@ def run_build(
                 try:
                     workspace.preserve()
                 except Exception:
-                    pass                # a Workspace without preserve(); best effort
+                    pass  # a Workspace without preserve(); best effort
             try:
                 workspace.cleanup()
             except Exception:

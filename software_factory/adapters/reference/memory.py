@@ -109,6 +109,29 @@ def _build_memory_source(config: Mapping[str, Any]) -> MemorySource:
 # Runner — echoes the prompt back; deterministic, no model call
 # --------------------------------------------------------------------------- #
 class EchoRunner:
+    def capability_declaration(self):
+        from software_factory.core.design.capabilities import RunnerCapabilityDeclaration
+        from software_factory.core.design.capability_names import Capability
+
+        return RunnerCapabilityDeclaration(
+            schema_version="runner-capability-v1",
+            source="echo",
+            capabilities=frozenset(
+                {Capability.MERGE_FORBIDDEN, Capability.DEPLOYMENT_FORBIDDEN}
+            ),
+        )
+
+    def observe_capabilities(self, *, workspace_path: str, repo_root: str):
+        from software_factory.core.design.capabilities import CapabilityObservation
+
+        del workspace_path, repo_root
+        return CapabilityObservation(
+            schema_version="capability-observation-v1",
+            source="echo",
+            confirmed=self.capability_declaration().capabilities,
+            failed=frozenset(),
+        )
+
     def run_agent(self, prompt, *, model, system=None, tools=None, cwd=None) -> RunResult:
         return RunResult(ok=True, output=f"[echo:{model}] {prompt[:200]}", model=model)
 

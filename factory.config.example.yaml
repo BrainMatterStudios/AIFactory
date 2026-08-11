@@ -79,6 +79,14 @@ factory:
     # findings-only sensors. verdict_v1 is deprecated v0.x compatibility only.
     require_contract: true
     review_protocol: findings_v2
+    # New 0.3 projects use immutable Design IR authority. Existing projects can
+    # retain `design_protocol: legacy_plan`; an in-progress Contract keeps the
+    # protocol first recorded for that exact parent even if this config changes.
+    design_protocol: design_ir_v1
+    design_author_role: design-author
+    design_analyzers:
+      - name: harness
+        required: true
     contracts_dir: contracts
     contract_author_role: contract-author
     # Controller approvals/decision events must resolve outside this repository

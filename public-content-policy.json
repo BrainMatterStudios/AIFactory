@@ -27,7 +27,7 @@
       "path": "tests/fixtures/synthetic_sensitive_values.py",
       "git_mode": "100644",
       "object_type": "blob",
-      "sha256": "87c31e0a748031a19cf0d1f3459f32fd5291b4873adc62f895eb349541b68ce8",
+      "sha256": "14897e0de1b5e3f6b1e6c1ab7656c33291d4cc91410c6fad1b30fcadffcae5bd",
       "license": "Apache-2.0",
       "source": "project-original:synthetic-sensitive-values-v1",
       "rule_ids": [

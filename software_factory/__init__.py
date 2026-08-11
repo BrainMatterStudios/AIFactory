@@ -21,13 +21,7 @@ remembering a rule (tier floor, judge-verdict combination) are pure functions
 in software_factory.core.orchestrate.
 """
 
-from importlib.metadata import PackageNotFoundError as _PNF
-from importlib.metadata import version as _pkg_version
-
-try:
-    __version__ = _pkg_version("software-factory")
-except _PNF:
-    __version__ = "unknown"
+__version__ = "0.3.0"
 
 from software_factory.core.orchestrate import (
     REVISE_CAP,
