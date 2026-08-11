@@ -1,0 +1,179 @@
+{
+  "meta": {
+    "note": "author:prompt personas are promoted to author:file by evidence — once a prompt persona proves repeatedly useful, author a `<name>.md` for it and flip the field.\n"
+  },
+  "personas": [
+    {
+      "name": "contract-author",
+      "model": "opus",
+      "tier_lock": "floor",
+      "author": "file",
+      "frequency": "standard",
+      "phase": "intake",
+      "role": "Declares strict Contract v2 intent and questions before any implementation begins."
+    },
+    {
+      "name": "judge",
+      "model": "opus",
+      "tier_lock": "floor",
+      "author": "file",
+      "frequency": "always",
+      "phase": "review",
+      "role": "Independent quality gate; scores a deliverable against the rubric and returns PASS/REVISE/BLOCK."
+    },
+    {
+      "name": "product-manager",
+      "model": "opus",
+      "tier_lock": "floor",
+      "author": "file",
+      "frequency": "feature",
+      "phase": "intake",
+      "role": "Owns prioritization, scope arbitration, and turning business goals into engineering-ready specs + success metrics."
+    },
+    {
+      "name": "requirements-analyst",
+      "model": "sonnet",
+      "author": "file",
+      "frequency": "feature",
+      "phase": "intake",
+      "role": "Turns briefs/tickets/feedback into unambiguous, testable acceptance criteria and edge-case inventories."
+    },
+    {
+      "name": "security-specialist",
+      "model": "opus",
+      "tier_lock": "floor",
+      "author": "file",
+      "frequency": "always",
+      "phase": "review",
+      "role": "Audits for vulnerabilities (OWASP, secrets, authz, injection, supply-chain); can BLOCK a merge."
+    },
+    {
+      "name": "test-author",
+      "model": "sonnet",
+      "tier_lock": "thorough",
+      "author": "file",
+      "frequency": "standard",
+      "phase": "implement",
+      "role": "Writes missing unit/integration/E2E tests from spec + implementation (distinct from pr-test-analyzer which reviews)."
+    },
+    {
+      "name": "ux-researcher",
+      "model": "sonnet",
+      "author": "prompt",
+      "frequency": "frontend",
+      "phase": "intake",
+      "role": "Synthesizes user research/usability heuristics into design constraints and flows."
+    },
+    {
+      "name": "api-contract-designer",
+      "model": "sonnet",
+      "tier_lock": "thorough",
+      "author": "prompt",
+      "frequency": "standard",
+      "phase": "design",
+      "role": "OpenAPI/GraphQL schema design + backward-compatibility analysis."
+    },
+    {
+      "name": "data-modeler",
+      "model": "sonnet",
+      "tier_lock": "thorough",
+      "author": "prompt",
+      "frequency": "standard",
+      "phase": "design",
+      "role": "Schema/index/migration design + query-plan review."
+    },
+    {
+      "name": "performance-profiler",
+      "model": "sonnet",
+      "author": "prompt",
+      "frequency": "context",
+      "phase": "review",
+      "role": "CPU/memory/query/render bottleneck diagnosis + before/after benchmarks."
+    },
+    {
+      "name": "accessibility-auditor",
+      "model": "haiku",
+      "author": "prompt",
+      "frequency": "frontend",
+      "phase": "review",
+      "role": "WCAG 2.2 AA / keyboard / screen-reader / contrast checklist audit."
+    },
+    {
+      "name": "dependency-auditor",
+      "model": "haiku",
+      "author": "prompt",
+      "frequency": "context",
+      "phase": "review",
+      "role": "Dependency CVE/license/health/version-drift review."
+    },
+    {
+      "name": "qa-scenario-designer",
+      "model": "sonnet",
+      "author": "prompt",
+      "frequency": "standard",
+      "phase": "review",
+      "role": "Exploratory/regression test plans, edge-case matrices, E2E user-flow scripts."
+    },
+    {
+      "name": "release-manager",
+      "model": "haiku",
+      "author": "prompt",
+      "frequency": "context",
+      "phase": "release",
+      "role": "Changelogs, migration guides, rollback plans, go/no-go safety summary for a diff."
+    },
+    {
+      "name": "devops-engineer",
+      "model": "sonnet",
+      "author": "prompt",
+      "frequency": "context",
+      "phase": "release",
+      "role": "CI/CD, container, IaC, deployment-manifest correctness + env parity."
+    },
+    {
+      "name": "incident-responder",
+      "model": "opus",
+      "author": "prompt",
+      "frequency": "context",
+      "phase": "review",
+      "role": "Diagnose live incidents from logs/metrics/traces; RCA + mitigation."
+    },
+    {
+      "name": "observability-engineer",
+      "model": "sonnet",
+      "author": "prompt",
+      "frequency": "context",
+      "phase": "implement",
+      "role": "Logging/metrics/alerting/tracing coverage + signal quality."
+    },
+    {
+      "name": "technical-writer",
+      "model": "haiku",
+      "author": "prompt",
+      "frequency": "context",
+      "phase": "release",
+      "role": "User docs, API reference, runbooks (distinct from comment-analyzer)."
+    },
+    {
+      "name": "implementer",
+      "model": "sonnet",
+      "author": "prompt",
+      "frequency": "standard",
+      "phase": "implement",
+      "role": "Writes the change against acceptance criteria, failing-test-first, following repo conventions."
+    }
+  ],
+  "builtins": {
+    "code-reviewer": "sonnet",
+    "silent-failure-hunter": "sonnet",
+    "type-design-analyzer": "sonnet",
+    "pr-test-analyzer": "sonnet",
+    "code-architect": null,
+    "Plan": null,
+    "code-explorer": "haiku",
+    "Explore": "haiku",
+    "code-simplifier": "haiku",
+    "comment-analyzer": "haiku",
+    "general-purpose": null
+  }
+}

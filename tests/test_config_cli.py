@@ -1,5 +1,6 @@
 """Config manifest loading + adapter construction + CLI smoke."""
 
+import builtins
 import json
 import os
 import shlex
@@ -1211,6 +1212,31 @@ def test_cli_doctor_offline(tmp_path, capsys, monkeypatch):
     out = _combined_output(capsys)
     assert "offline-test" in out
     assert "no drift" in out
+    assert rc == 0
+
+
+def test_cli_doctor_with_json_manifest_does_not_require_yaml_extra(
+    tmp_path, capsys, monkeypatch
+):
+    """Removing the bundled JSON fallback must break this real doctor path."""
+    monkeypatch.delenv("KILL_FACTORY", raising=False)
+    manifest = _write_manifest(tmp_path)
+    real_import = builtins.__import__
+
+    def import_without_yaml(name, *args, **kwargs):
+        if name == "yaml":
+            raise ImportError("PyYAML is absent in the bare installation")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_yaml)
+    try:
+        rc = main(["--config", str(manifest), "doctor"])
+    except RuntimeError as exc:
+        pytest.fail(f"JSON-config doctor imported the optional YAML stack: {exc}")
+
+    out = _combined_output(capsys)
+    assert "offline-test" in out
+    assert "persona catalog : no drift" in out
     assert rc == 0
 
 
