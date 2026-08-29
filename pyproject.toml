@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "software-factory"
-version = "0.2.0"
+version = "0.3.0"
 description = "A reusable, extensible, resilient AI software factory — orchestrate doctrine + observe→fix→verify loop, behind swappable provider adapters."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -80,10 +80,10 @@ factory = "software_factory.cli:main"
 include = ["software_factory*"]
 
 # Ship the non-Python data files (doctrine/conventions .md, persona catalog + packs
-# .yaml) inside the wheel. Without this a non-editable install omits them and
-# `factory doctor`/`personas` crash with FileNotFoundError on catalog.yaml.
+# .yaml, and the dependency-free built-in catalog fallback) inside the wheel.
+# Without this a non-editable install cannot run `factory doctor`/`personas`.
 [tool.setuptools.package-data]
-software_factory = ["**/*.md", "**/*.yaml", "**/*.yml"]
+software_factory = ["**/*.md", "**/*.yaml", "**/*.yml", "core/personas/catalog.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

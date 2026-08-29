@@ -65,6 +65,32 @@ def test_contract_store_round_trips_exact_pending_bytes(tmp_path):
     assert loaded.artifact_digest == digest
 
 
+def test_contract_store_inspect_is_noncreating_for_absent_storage(tmp_path):
+    module = _contract_store_module()
+    repo = _repo(tmp_path)
+    store = module.ContractEnvelopeStore(repo)
+
+    assert store.inspect(
+        repository="example-repo", issue="7", policy_version="intent-v1"
+    ) is None
+    assert not (repo / ".factory").exists()
+
+
+def test_contract_store_inspect_preserves_load_lifecycle_semantics(tmp_path):
+    module = _contract_store_module()
+    store = module.ContractEnvelopeStore(_repo(tmp_path))
+    _write(store)
+
+    inspected = store.inspect(
+        repository="example-repo", issue="7", policy_version="intent-v1"
+    )
+    loaded = store.load(
+        repository="example-repo", issue="7", policy_version="intent-v1"
+    )
+
+    assert inspected == loaded
+
+
 def test_contract_store_promotes_pending_to_immutable_accepted_authority(tmp_path):
     module = _contract_store_module()
     store = module.ContractEnvelopeStore(_repo(tmp_path))

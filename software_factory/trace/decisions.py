@@ -12,6 +12,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from software_factory.core.authority import AuthorityFailureKind, classify_read_error
 from software_factory.core.contracts import artifact_sha256, canonical_json_bytes
 from software_factory.loop.state import default_state_dir
 from software_factory.trace.redact import redact
@@ -27,6 +28,8 @@ _GIT_OBJECT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", None)
 _DIRECTORY = getattr(os, "O_DIRECTORY", None)
 _OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
+_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+_MAX_HISTORY_BYTES = 16 * 1024 * 1024
 _FIELDS = {
     "event_schema_version",
     "repository",
@@ -55,6 +58,12 @@ _AUTHORITY_DIGEST_FIELDS = {"artifact_digest", "parent_digest"}
 
 class DecisionLogUnreadable(RuntimeError):
     """Decision authority is absent, unsafe, corrupt, or could not be appended."""
+
+    def __init__(
+        self, message: str, *, kind: AuthorityFailureKind = AuthorityFailureKind.INTEGRITY
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
 
 
 def _close_quietly(descriptor: int) -> None:
@@ -278,11 +287,16 @@ class DecisionLog:
         try:
             os.lseek(descriptor, 0, os.SEEK_SET)
             with os.fdopen(os.dup(descriptor), "rb") as source:
-                raw = source.read()
+                raw = source.read(_MAX_HISTORY_BYTES + 1)
         except OSError:
             read_failed = True
         if read_failed:
-            raise DecisionLogUnreadable("decision history is unreadable")
+            raise DecisionLogUnreadable(
+                "decision history is unreadable",
+                kind=AuthorityFailureKind.UNREADABLE_RUNTIME,
+            )
+        if len(raw) > _MAX_HISTORY_BYTES:
+            raise DecisionLogUnreadable("decision history is corrupt")
         if not raw:
             if absent_ok:
                 return ()
@@ -429,25 +443,42 @@ class DecisionLog:
 
         descriptor: int | None = None
         open_failure: str | None = None
+        open_kind = AuthorityFailureKind.INTEGRITY
         try:
             descriptor = os.open(name, os.O_RDONLY | _DIRECTORY | _NOFOLLOW, dir_fd=root)
         except FileNotFoundError:
             open_failure = "decision history is absent"
-        except (NotImplementedError, OSError, TypeError):
+            open_kind = AuthorityFailureKind.ABSENT
+        except OSError as exc:
             open_failure = (
                 "decision history cannot be appended"
                 if for_write
                 else "decision history is unreadable"
             )
+            open_kind = classify_read_error(exc) if not for_write else AuthorityFailureKind.INTEGRITY
+        except (NotImplementedError, TypeError):
+            open_failure = (
+                "decision history cannot be appended"
+                if for_write
+                else "decision history is unreadable"
+            )
+            open_kind = (
+                AuthorityFailureKind.INTEGRITY
+                if for_write
+                else AuthorityFailureKind.UNREADABLE_RUNTIME
+            )
         _close_quietly(root)
         if open_failure is not None or descriptor is None:
-            raise DecisionLogUnreadable(open_failure or "decision history is unreadable")
+            raise DecisionLogUnreadable(
+                open_failure or "decision history is unreadable", kind=open_kind
+            )
         self._validate_secure_descriptor(descriptor, directory=True)
         return descriptor
 
     def _open_root(self, *, for_write: bool) -> int:
         descriptor: int | None = None
         open_failure: str | None = None
+        open_kind = AuthorityFailureKind.INTEGRITY
         try:
             if for_write:
                 self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -458,14 +489,29 @@ class DecisionLog:
                 if for_write
                 else "decision history is absent"
             )
-        except (NotImplementedError, OSError, TypeError):
+            open_kind = AuthorityFailureKind.ABSENT if not for_write else AuthorityFailureKind.INTEGRITY
+        except OSError as exc:
             open_failure = (
                 "decision history cannot be appended"
                 if for_write
                 else "decision history is unreadable"
             )
+            open_kind = classify_read_error(exc) if not for_write else AuthorityFailureKind.INTEGRITY
+        except (NotImplementedError, TypeError):
+            open_failure = (
+                "decision history cannot be appended"
+                if for_write
+                else "decision history is unreadable"
+            )
+            open_kind = (
+                AuthorityFailureKind.INTEGRITY
+                if for_write
+                else AuthorityFailureKind.UNREADABLE_RUNTIME
+            )
         if open_failure is not None or descriptor is None:
-            raise DecisionLogUnreadable(open_failure or "decision history is unreadable")
+            raise DecisionLogUnreadable(
+                open_failure or "decision history is unreadable", kind=open_kind
+            )
         self._validate_secure_descriptor(descriptor, directory=True)
         return descriptor
 
@@ -474,6 +520,7 @@ class DecisionLog:
         created = False
         descriptor: int | None = None
         open_failure: str | None = None
+        open_kind = AuthorityFailureKind.INTEGRITY
         if for_write:
             missing = False
             try:
@@ -499,13 +546,22 @@ class DecisionLog:
                     open_failure = "decision history cannot be appended"
         else:
             try:
-                descriptor = os.open(name, os.O_RDONLY | _NOFOLLOW, dir_fd=directory)
+                descriptor = os.open(
+                    name, os.O_RDONLY | _NONBLOCK | _NOFOLLOW, dir_fd=directory
+                )
             except FileNotFoundError:
                 open_failure = "decision history is absent"
-            except (NotImplementedError, OSError, TypeError):
+                open_kind = AuthorityFailureKind.ABSENT
+            except OSError as exc:
                 open_failure = "decision history is unreadable"
+                open_kind = classify_read_error(exc)
+            except (NotImplementedError, TypeError):
+                open_failure = "decision history is unreadable"
+                open_kind = AuthorityFailureKind.UNREADABLE_RUNTIME
         if open_failure is not None or descriptor is None:
-            raise DecisionLogUnreadable(open_failure or "decision history is unreadable")
+            raise DecisionLogUnreadable(
+                open_failure or "decision history is unreadable", kind=open_kind
+            )
         self._validate_secure_descriptor(descriptor, directory=False)
         return descriptor, created
 
@@ -524,7 +580,7 @@ class DecisionLog:
         if (
             not expected_type(metadata.st_mode)
             or metadata.st_uid != os.geteuid()
-            or stat.S_IMODE(metadata.st_mode) & 0o077
+            or stat.S_IMODE(metadata.st_mode) != (0o700 if directory else 0o600)
         ):
             _close_quietly(descriptor)
             raise DecisionLogUnreadable("decision history filesystem state is unsafe")

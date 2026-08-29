@@ -23,17 +23,20 @@ The package supports two ways of building the fix, and they are not equal.
 
 Both share observing, queueing, tier rules, and the production ceiling. The
 human-supervised doctrine uses an independent judge under operator control. The
-experimental autonomous path adds the 0.2 architecture-first controller:
-Contract v2, exact approvals, findings-only model sensors, and deterministic
-disposition.
+experimental autonomous path adds the architecture-first controller: Contract
+v2, a sticky per-parent workflow protocol, Design IR v1, conservative
+capabilities, bounded analyzer evidence, exact approvals, findings-only model
+sensors, and deterministic disposition.
 
 This guide assumes the doctrine path. §6 covers the other one.
 
-> **0.2 release-candidate note:** the `findings_v2` parser, controller-owned
-> routing, semantic authority replay, and adversarial tests described below are
-> now present and locally verified. This does not make 0.2.0 released. Adoption
-> from a release artifact remains gated on the complete release checklist,
-> sanitized candidate history, and separately approved shared-state actions.
+> **macOS adoption blocker for new scaffolds:** ordinary current macOS APFS
+> volumes cannot prove no-atime reads. Because new configurations require the
+> harness analyzer, any present supported harness file produces fail-closed
+> high-security evidence and blocks the Design gate. Preview first with `factory
+> doctor`. Use a verifiable no-atime volume/environment or leave existing
+> workflows on `legacy_plan`; making the required analyzer optional does not
+> preserve the scaffold's Design-authority guarantees.
 
 ---
 
@@ -79,7 +82,7 @@ comments: [`factory.config.example.yaml`](../factory.config.example.yaml).
 > imports. Keep your manifest at the project root and be aware of this if you
 > work across multiple projects on one machine.
 
-The three fields worth thinking about:
+The fields worth thinking about:
 
 ```yaml
 build:
@@ -87,6 +90,11 @@ build:
   verify_cmd: "pytest -q"    # YOUR gate. Must be runnable and must actually fail on bad code.
   require_contract: true     # current guidance: freeze Contract v2 before code
   review_protocol: findings_v2
+  design_protocol: design_ir_v1
+  design_author_role: design-author
+  design_analyzers:
+    - name: harness
+      required: true
 
 governance:
   prod_refs: [main, release] # ADDS to main/master/production/prod — never replaces
@@ -95,6 +103,45 @@ governance:
 `verify_cmd` is load-bearing. It is the objective gate between an agent's opinion
 that the work is done and the work actually being done. If your test suite does
 not fail on broken code, the factory inherits that.
+
+Before opting in, use the read-only inspection surface:
+
+```bash
+factory doctor
+factory design validate <file>
+factory design gate <file>
+factory analyze <adapter>
+factory capabilities
+factory status [issue]
+```
+
+The four Design inspection commands and `status` accept `--json`. None repairs,
+approves, migrates, refreshes, or stores evidence. `doctor` reports the active
+protocol, analyzer requirements, controller separation, and capability gaps
+without invoking models or analyzers. Exit `0` means a successful passing
+inspection (or ready/degraded/complete status), `1` means a runtime/authority or
+non-pass result, and `2` means invalid invocation, input, or configuration.
+
+Capability names are guarantees, not requested tools:
+
+| Capability | Meaning |
+|---|---|
+| `isolated_worktree` | implementation runs on an isolated repository surface |
+| `approval_pause` | the runner can stop and resume around external approval |
+| `controller_state_separation` | authority state is outside runner-writable worktrees |
+| `artifact_fingerprinting` | exact repository surfaces can be observed and rebound |
+| `bounded_writable_paths` | runner writes are confined to declared paths |
+| `analyzer_evidence` | configured analyzers can produce bounded evidence |
+| `objective_verification` | a non-model verification command is enforced |
+| `credential_scan` | produced content receives the objective credential scan |
+| `merge_forbidden` / `deployment_forbidden` | the lifecycle does not grant those actions |
+
+Trusted adapter code declares capabilities; runtime observation may confirm or
+remove them, never add an undeclared guarantee. `factory capabilities` reports
+declared, confirmed, failed, effective, required, missing, and unverifiable sets.
+The reference Echo runner declares only merge/deployment prohibition. The
+reference Claude Code runner declares none because command deny patterns are not
+a sandbox.
 
 ---
 
@@ -268,22 +315,27 @@ factory build 42     # EXPERIMENTAL
 ```
 
 A narrower controller-driven loop, with no human supervising each agent turn. It
-uses this lifecycle for T1/T2 work:
+uses this lifecycle for an adopted T2 Design workflow:
 
 ```text
-issue -> isolated worktree -> contract-only author turn
+issue -> isolated worktree -> Contract-only author turn
       -> deterministic intent gate -> frozen Contract v2 checkpoint
-      -> T2 plan and exact plan approval when applicable
+      -> sticky protocol -> capability preflight -> Design IR v1
+      -> bounded analyzers -> deterministic Design gate
+      -> exact Design-and-parent approval
       -> implementation -> objective verify_cmd
       -> findings_v2 model sensors -> deterministic disposition
-      -> reverify -> objective secret scan -> PR into the development branch
+      -> reverify -> refreshed Design gate -> objective secret scan
+      -> publication replay -> PR into the development branch
 ```
 
 An unresolved blocking ambiguity returns `SPEC_PENDING`; no implementer runs.
 A human-owned irreversible choice returns `APPROVAL_PENDING` with the exact
-contract digest. T2 planning happens only after intent passes, and the plan is
-bound to both its own digest and its parent contract digest. Labels do not grant
-authority.
+Contract digest. Design authoring happens only after intent and capability
+preflight pass; the Design is bound to its own digest, parent Contract,
+configuration, capabilities, repository fingerprint, and analyzer evidence.
+Compatibility-mode parents retain the parent-bound plan path. Labels do not
+grant authority.
 
 When a contract needs human authority, the controller persists its exact text,
 document, digest, repository/issue identity, and policy version as **pending**.
@@ -313,9 +365,13 @@ factory approve contract demo-42 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 factory approve plan demo-42 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
   --parent aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   --approver demo-operator --reason "synthetic plan review"
+
+factory approve design demo-42 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+  --parent aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --approver demo-operator --reason "synthetic design review"
 ```
 
-The plan command requires the exact parent digest. Any changed, stale, missing,
+Plan and Design commands require the exact parent digest. Any changed, stale, missing,
 unreadable, corrupt, or wrong-parent approval fails closed. Manifest
 `factory.build.state_dir` selects approval/decision storage first; when absent,
 `FACTORY_STATE_DIR` is used, then the controller default. That location must be
@@ -348,7 +404,29 @@ finite cost, and controller state needs a tested backup. Directory separation
 alone does not isolate state from an unrestricted runner; sandbox the runner and
 give it least-privilege credentials.
 
-## 7. Migrating an existing project to 0.2
+## 7. Migrating an existing project to Design IR v1
+
+Migration is explicit and applies only to a new exact Contract parent. There is
+no automatic migration, and `doctor` never rewrites the manifest.
+
+1. **Preview:** run `factory doctor`, `factory capabilities`, and each configured
+   `factory analyze <adapter>` against the intended environment. A missing
+   `design_protocol` selects `legacy_plan` and emits one actionable warning.
+2. **Validate:** resolve every missing or unverifiable capability and every
+   required analyzer failure. On ordinary current macOS APFS, move the project
+   to a verifiable no-atime volume/environment if supported harness files exist.
+   Metadata restoration is not a safe workaround because it is another mutation.
+3. **Opt in a new parent:** select `design_ir_v1`, author a new exact Contract,
+   and follow the real Design/gate/approval lifecycle. The recorded protocol is
+   sticky for that repository, issue, and parent digest.
+4. **Rollback for later work:** restore `legacy_plan` only before creating a
+   later new Contract parent. The already selected parent stays Design IR; an
+   existing legacy parent stays legacy. Old Plan, Design, gate, approval, and
+   decision records remain readable and are not erased or converted.
+
+A legacy plan approval never becomes a Design approval. Disabling a required
+analyzer may change configured policy, but does not preserve the released Design
+authority and must not be described as a compatibility fix.
 
 ### Contract migration
 
@@ -363,8 +441,9 @@ and is not current authoring guidance. For Contract v2:
 4. Run the intent gate and resolve `SPEC_PENDING` questions without inventing
    facts.
 5. Obtain a new exact contract approval if policy requires human authority.
-6. Regenerate any T2 plan from that contract and approve the plan's new digest
-   with the exact parent contract digest.
+6. For a Design IR parent, author and approve a new Design digest after a fresh
+   passing gate. For a compatibility parent, regenerate and approve the legacy
+   plan with the exact parent Contract digest.
 
 Changing intent invalidates downstream plan authority. Do not copy a label,
 filename, or old approval record to the new artifact.
@@ -379,6 +458,12 @@ but new scaffolds and current guidance use `findings_v2`.
 Before the first real run, verify that your runner can write the single findings
 scratch file, cannot read controller state, and cannot mutate the reviewed code
 surface without the fingerprint check detecting it.
+
+Installed analyzers are trusted code, not an OS sandbox. Process and output
+normalization bounds evidence and persistent fingerprinting detects lasting
+workspace mutation; neither can prove there was no transient mutation or
+external side effect. Native analyzer execution requires the `fork` broker and
+is supported for this release on macOS/Linux; Windows fails unavailable.
 
 ---
 

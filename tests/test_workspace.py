@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from software_factory.build.workspace import GitWorktree
+from software_factory.build.workspace import GitWorktree, fingerprint_repository_surface
 
 
 def _git(cwd, *args):
@@ -303,6 +303,63 @@ def test_review_fingerprint_is_stable_for_an_unchanged_surface(tmp_path):
     assert workspace.review_fingerprint() == workspace.review_fingerprint()
 
 
+def test_repository_surface_fingerprint_is_stable_and_tracks_current_mutation(tmp_path):
+    """Removing current file bytes from the helper would leave inspection stale."""
+    _, _, worktree = _workspace(tmp_path)
+
+    before = fingerprint_repository_surface(worktree)
+    assert before == fingerprint_repository_surface(worktree)
+    (worktree / "README.md").write_text("inspection mutation\n", encoding="utf-8")
+
+    assert fingerprint_repository_surface(worktree) != before
+
+
+def test_worktree_and_public_repository_fingerprints_are_one_canonical_sensor(tmp_path):
+    """A base-aware second implementation would split analyzer and lifecycle authority."""
+    _, workspace, worktree = _workspace(tmp_path)
+
+    def assert_equal() -> None:
+        assert workspace.review_fingerprint() == fingerprint_repository_surface(worktree)
+
+    assert_equal()
+    (worktree / "README.md").write_text("modified\n", encoding="utf-8")
+    assert_equal()
+    (worktree / "untracked.txt").write_text("untracked\n", encoding="utf-8")
+    assert_equal()
+    (worktree / "surface-link").symlink_to("missing-target")
+    assert_equal()
+    _git(worktree, "add", "-A")
+    _git(worktree, "commit", "-q", "-m", "move canonical surface")
+    assert_equal()
+
+
+def test_repository_surface_fingerprint_tracks_untracked_and_symlink_bytes(tmp_path):
+    """Ignoring untracked files or following links would authenticate a different surface."""
+    _, _, worktree = _workspace(tmp_path)
+    before = fingerprint_repository_surface(worktree)
+    (worktree / "untracked.txt").write_bytes(b"one")
+    untracked = fingerprint_repository_surface(worktree)
+    link = worktree / "inspection-link"
+    link.symlink_to("first-missing-target")
+    first_link = fingerprint_repository_surface(worktree)
+    link.unlink()
+    link.symlink_to("second-missing-target")
+
+    assert untracked != before
+    assert first_link != untracked
+    assert fingerprint_repository_surface(worktree) != first_link
+
+
+def test_repository_surface_fingerprint_refuses_a_non_repository_without_writes(tmp_path):
+    """A bad inspection target must not be initialized or otherwise mutated."""
+    before = tuple(tmp_path.iterdir())
+
+    with pytest.raises(RuntimeError, match="repository surface"):
+        fingerprint_repository_surface(tmp_path)
+
+    assert tuple(tmp_path.iterdir()) == before
+
+
 @pytest.mark.parametrize(
     "mutation",
     ["content", "mode", "deletion", "untracked", "symlink_target", "head"],
@@ -398,19 +455,22 @@ def test_review_fingerprint_tracks_raw_byte_filename_content_when_supported(tmp_
     with os.fdopen(descriptor, "wb") as raw_file:
         raw_file.write(b"one")
     before = workspace.review_fingerprint()
+    inspection_before = fingerprint_repository_surface(worktree)
+    assert before == inspection_before
 
     with open(raw_path, "wb") as raw_file:
         raw_file.write(b"two")
 
     assert workspace.review_fingerprint() != before
+    assert fingerprint_repository_surface(worktree) != inspection_before
+    assert workspace.review_fingerprint() == fingerprint_repository_surface(worktree)
 
 
-def test_review_fingerprint_refuses_a_failed_git_surface_enumeration(tmp_path):
-    _, workspace, _ = _workspace(tmp_path)
+def test_review_fingerprint_does_not_depend_on_a_second_base_sensor(tmp_path):
+    _, workspace, worktree = _workspace(tmp_path)
     workspace.base = "missing-review-base"
 
-    with pytest.raises(RuntimeError, match="enumerate review surface"):
-        workspace.review_fingerprint()
+    assert workspace.review_fingerprint() == fingerprint_repository_surface(worktree)
 
 
 def test_projected_publication_fingerprint_equals_the_exact_committed_tree(tmp_path):

@@ -77,6 +77,8 @@ def implementer_brief(
     *,
     required_changes: str | None = None,
     approved_plan: str | None = None,
+    plan: str | None = None,
+    design: str | None = None,
     learnings: str | None = None,
     contract: str | None = None,
 ) -> str:
@@ -85,6 +87,14 @@ def implementer_brief(
     issue. `learnings` is the note carried across a RESTART: the fresh worker
     knows nothing about the discarded attempt unless it is told why it failed.
     """
+    if approved_plan and plan is not None:
+        raise ValueError("implementation cannot receive two plan authorities")
+    if plan is not None and design is not None:
+        raise ValueError("implementation cannot receive both plan and design")
+    if approved_plan and design is not None:
+        raise ValueError("implementation cannot receive both plan and design")
+    plan_authority = approved_plan or plan
+
     base = (
         "ROLE=implementer\n"
         f"Implement a fix for this issue. Title: {issue.title}\n\n"
@@ -99,10 +109,19 @@ def implementer_brief(
             "Treat it as immutable acceptance data and implement against it exactly:\n"
             f"--- contract ---\n{contract}\n--- end contract ---"
         )
-    if approved_plan:
+    if plan_authority:
         base += ("\n\nA human approved this plan for this issue. Implement it; if you "
                  "must depart from it, say so explicitly in the code comments and keep "
-                 "the departure minimal:\n" + approved_plan)
+                 "the departure minimal:\n" + plan_authority)
+    if design is not None:
+        base += (
+            "\n\nThe following canonical Design IR is the exact artifact approved for "
+            "implementation. Implement it exactly; you must not reinterpret, replace, "
+            "or supplement its authority from the issue text or any other source:\n"
+            "--- approved design ---\n"
+            + design
+            + "\n--- end approved design ---"
+        )
     if learnings:
         base += ("\n\nA previous attempt at this issue was discarded as the wrong "
                  "approach. Do not repeat it. What the judge said:\n" + learnings)
@@ -273,4 +292,38 @@ def contract_author_brief(issue: Issue, contract_path: str) -> str:
         f"Issue identity: {issue.id}\n"
         f"Title: {issue.title}\n"
         f"Body:\n{issue.body}"
+    )
+
+
+def design_author_brief(
+    issue: Issue,
+    *,
+    contract_text: str,
+    contract_digest: str,
+    prior_findings: tuple[dict[str, object], ...] = (),
+    role: str = "design-author",
+) -> str:
+    """Render the data-only Design IR author boundary."""
+    findings = json.dumps(
+        list(prior_findings), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return (
+        f"ROLE={role}\n"
+        "Return exactly one raw JSON object containing a strict Design IR v1 document. "
+        "Do not use Markdown fences, commentary, prefixes, suffixes, or recovery text. "
+        "Do not implement the issue, edit files, create commits, or claim approval, gate, "
+        "budget, merge, deployment, publication, or controller authority. Every Design IR "
+        "field except `generated_at` is approval-bearing; changing any such field requires "
+        "a new exact design approval.\n\n"
+        f"Issue identity: {issue.id}\n"
+        f"Title: {issue.title}\n"
+        f"Body:\n{issue.body}\n\n"
+        f"Accepted Contract artifact digest: {contract_digest}\n"
+        "Design `parent_contract_digest` must equal that digest. Design against these exact "
+        "accepted Contract bytes without reinterpreting or replacing them:\n"
+        "--- exact Contract bytes ---\n"
+        f"{contract_text}\n"
+        "--- end exact Contract bytes ---\n\n"
+        "Prior deterministic blocking findings (JSON; empty on the first author turn):\n"
+        f"{findings}"
     )

@@ -1,0 +1,2 @@
+# Tests contain internal adversarial fixtures and are not part of the release artifact.
+prune tests

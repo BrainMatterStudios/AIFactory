@@ -22,6 +22,130 @@ class NothingToCommit(RuntimeError):
     """The build produced no file changes. An outcome, not a crash."""
 
 
+def _fingerprint_frame(digest, value: bytes) -> None:
+    """Hash one collision-safe field as length plus uninterpreted bytes."""
+    digest.update(len(value).to_bytes(8, "big"))
+    digest.update(value)
+
+
+def _git_surface_bytes(root: Path, *args: str | bytes) -> subprocess.CompletedProcess[bytes]:
+    command = [b"git", *(os.fsencode(argument) for argument in args)]
+    return subprocess.run(command, cwd=os.fsencode(root), capture_output=True)
+
+
+def _surface_paths(root: Path) -> list[bytes]:
+    commands = (
+        ("diff", "--name-only", "-z", "HEAD"),
+        ("ls-files", "-z", "--others", "--exclude-standard"),
+    )
+    paths: set[bytes] = set()
+    for command in commands:
+        result = _git_surface_bytes(root, *command)
+        if result.returncode != 0:
+            raise RuntimeError("could not enumerate review surface")
+        if result.stdout and not result.stdout.endswith(b"\0"):
+            raise RuntimeError("could not enumerate review surface")
+        paths.update(path for path in result.stdout.split(b"\0") if path)
+    return sorted(paths)
+
+
+def _surface_index_entry(root: Path, path: bytes) -> tuple[bytes, bytes] | None:
+    result = _git_surface_bytes(root, "ls-files", "--stage", "-z", "--", path)
+    if result.returncode != 0:
+        raise RuntimeError("could not enumerate review surface")
+    if not result.stdout:
+        return None
+    metadata, separator, _ = result.stdout.partition(b"\t")
+    if not separator:
+        return None
+    fields = metadata.split()
+    if len(fields) != 3 or fields[2] != b"0":
+        return None
+    return fields[0], fields[1]
+
+
+def _embedded_surface_head(root: Path, path: bytes) -> bytes:
+    result = _git_surface_bytes(
+        root, "-C", path, "rev-parse", "--verify", "--quiet", "HEAD^{commit}"
+    )
+    head = result.stdout.strip()
+    if result.returncode != 0 or not head:
+        raise RuntimeError("could not fingerprint repository surface")
+    return head
+
+
+def fingerprint_repository_surface(repo_root: str | Path) -> str:
+    """Hash one repository's canonical current HEAD and pushable working bytes."""
+    root = Path(repo_root).resolve()
+    head_result = _git_surface_bytes(
+        root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}"
+    )
+    head = head_result.stdout.strip()
+    if head_result.returncode != 0 or not head:
+        raise RuntimeError("could not fingerprint repository surface")
+
+    digest = hashlib.sha256()
+    _fingerprint_frame(digest, b"software-factory-review-v1")
+    _fingerprint_frame(digest, head)
+    encoded_root = os.fsencode(root)
+    for reported_path in _surface_paths(root):
+        raw_path = reported_path.rstrip(b"/") if reported_path.endswith(b"/") else reported_path
+        if (
+            not raw_path
+            or os.path.isabs(reported_path)
+            or b"\0" in raw_path
+            or b".." in raw_path.split(os.sep.encode())
+        ):
+            raise RuntimeError("Git reported an unsafe repository surface path")
+        full_path = os.path.join(encoded_root, reported_path)
+        index_entry = _surface_index_entry(root, raw_path)
+        try:
+            info = os.lstat(full_path)
+        except FileNotFoundError:
+            mode, kind, deleted, content = b"000000", b"deleted", b"1", b""
+        else:
+            deleted = b"0"
+            if stat.S_ISLNK(info.st_mode):
+                mode, kind = b"120000", b"symlink"
+                content = os.readlink(full_path)
+                if isinstance(content, str):
+                    content = os.fsencode(content)
+            elif stat.S_ISREG(info.st_mode):
+                mode = b"100755" if info.st_mode & 0o111 else b"100644"
+                kind = b"file"
+                with open(full_path, "rb") as source:
+                    content = source.read()
+            elif stat.S_ISDIR(info.st_mode) and (
+                reported_path.endswith(b"/") or (index_entry and index_entry[0] == b"160000")
+            ):
+                mode, kind = b"160000", b"gitlink"
+                if reported_path.endswith(b"/"):
+                    content = _embedded_surface_head(root, full_path)
+                elif os.path.lexists(os.path.join(full_path, b".git")):
+                    submodule = _git_surface_bytes(
+                        root,
+                        "-C",
+                        full_path,
+                        "rev-parse",
+                        "--verify",
+                        "--quiet",
+                        "HEAD^{commit}",
+                    )
+                    content = (
+                        submodule.stdout.strip()
+                        if submodule.returncode == 0 and submodule.stdout.strip()
+                        else index_entry[1]
+                    )
+                else:
+                    content = index_entry[1]
+            else:
+                mode = f"{stat.S_IFMT(info.st_mode):06o}".encode("ascii")
+                kind, content = b"special", b""
+        for value in (b"record", raw_path, mode, kind, deleted, content):
+            _fingerprint_frame(digest, value)
+    return digest.hexdigest()
+
+
 @runtime_checkable
 class Workspace(Protocol):
     """An isolated working tree for one build."""
@@ -310,72 +434,6 @@ class GitWorktree:
                 f"{clean.stderr.strip() or clean.stdout.strip()}"
             )
 
-    @staticmethod
-    def _fingerprint_frame(digest, value: bytes) -> None:
-        """Hash one collision-safe field (length first, then uninterpreted bytes)."""
-        digest.update(len(value).to_bytes(8, "big"))
-        digest.update(value)
-
-    def _review_paths(self) -> list[bytes]:
-        """Strictly enumerate the complete push/working surface as raw paths."""
-        commands = (
-            ("diff", "--name-only", "-z", f"{self.base}...HEAD"),
-            ("diff", "--name-only", "-z", "HEAD"),
-            ("ls-files", "-z", "--others", "--exclude-standard"),
-        )
-        paths: set[bytes] = set()
-        for command in commands:
-            result = self._git_bytes(*command, cwd=self.path)
-            if result.returncode != 0:
-                detail = os.fsdecode(result.stderr).strip() or "unknown Git error"
-                rendered = "git " + " ".join(command)
-                raise RuntimeError(
-                    f"could not enumerate review surface with {rendered}: {detail}"
-                )
-            if result.stdout and not result.stdout.endswith(b"\0"):
-                raise RuntimeError(
-                    "could not enumerate review surface: Git returned a malformed "
-                    f"NUL-delimited path stream for {' '.join(command)}"
-                )
-            paths.update(path for path in result.stdout.split(b"\0") if path)
-        return sorted(paths)
-
-    def _index_entry(self, path: bytes) -> tuple[bytes, bytes] | None:
-        """Return (Git mode, object id) for a stage-zero index entry."""
-        result = self._git_bytes(
-            "ls-files", "--stage", "-z", "--", path, cwd=self.path
-        )
-        if result.returncode != 0:
-            detail = os.fsdecode(result.stderr).strip() or "unknown Git error"
-            raise RuntimeError(
-                f"could not enumerate review surface index entry for "
-                f"{os.fsdecode(path)!r}: {detail}"
-            )
-        if not result.stdout:
-            return None
-        metadata, separator, _ = result.stdout.partition(b"\t")
-        if not separator:
-            return None
-        fields = metadata.split()
-        if len(fields) != 3 or fields[2] != b"0":
-            return None
-        return fields[0], fields[1]
-
-    def _embedded_repository_head(self, path: bytes) -> bytes:
-        """Resolve an untracked embedded repo exactly as `git add -A` stages it."""
-        result = self._git_bytes(
-            "-C", path, "rev-parse", "--verify", "--quiet", "HEAD^{commit}",
-            cwd=self.path,
-        )
-        head = result.stdout.strip()
-        if result.returncode != 0 or not head:
-            detail = os.fsdecode(result.stderr).strip() or "HEAD is not a commit"
-            raise RuntimeError(
-                f"could not fingerprint embedded repository {os.fsdecode(path)!r}: "
-                f"{detail}"
-            )
-        return head
-
     def review_fingerprint(self) -> str:
         """Hash HEAD and every path exactly as a subsequent ``git add -A`` sees it.
 
@@ -385,77 +443,7 @@ class GitWorktree:
         Length-framing every field makes odd paths and arbitrary bytes
         unambiguous without relying on a delimiter that Git permits in a name.
         """
-        digest = hashlib.sha256()
-        self._fingerprint_frame(digest, b"software-factory-review-v1")
-        self._fingerprint_frame(digest, self.head_revision().encode("ascii"))
-
-        root = os.fsencode(self.path)
-        for reported_path in self._review_paths():
-            raw_path = reported_path.rstrip(b"/") if reported_path.endswith(b"/") \
-                else reported_path
-            if (not raw_path or os.path.isabs(reported_path) or b"\0" in raw_path
-                    or b".." in raw_path.split(os.sep.encode())):
-                raise RuntimeError(
-                    f"Git reported unsafe review path {os.fsdecode(raw_path)!r}"
-                )
-            full_path = os.path.join(root, reported_path)
-            index_entry = self._index_entry(raw_path)
-
-            try:
-                info = os.lstat(full_path)
-            except FileNotFoundError:
-                mode = b"000000"
-                kind = b"deleted"
-                deleted = b"1"
-                content = b""
-            else:
-                deleted = b"0"
-                if stat.S_ISLNK(info.st_mode):
-                    mode = b"120000"
-                    kind = b"symlink"
-                    content = os.readlink(full_path)
-                    if isinstance(content, str):
-                        content = os.fsencode(content)
-                elif stat.S_ISREG(info.st_mode):
-                    mode = b"100755" if info.st_mode & 0o111 else b"100644"
-                    kind = b"file"
-                    with open(full_path, "rb") as source:
-                        content = source.read()
-                elif stat.S_ISDIR(info.st_mode) and (
-                    reported_path.endswith(b"/")
-                    or (index_entry and index_entry[0] == b"160000")
-                ):
-                    mode = b"160000"
-                    kind = b"gitlink"
-                    if reported_path.endswith(b"/"):
-                        content = self._embedded_repository_head(full_path)
-                    elif os.path.lexists(os.path.join(full_path, b".git")):
-                        submodule_head = self._git_bytes(
-                            "-C", full_path, "rev-parse", "--verify", "--quiet",
-                            "HEAD^{commit}", cwd=self.path,
-                        )
-                        content = (submodule_head.stdout.strip()
-                                   if submodule_head.returncode == 0
-                                   and submodule_head.stdout.strip()
-                                   else index_entry[1])
-                    else:
-                        content = index_entry[1]
-                else:
-                    # Git cannot add sockets/FIFOs/devices, but including their
-                    # exact filesystem type keeps the review sensor fail-closed
-                    # until the normal commit gate rejects them.
-                    mode = f"{stat.S_IFMT(info.st_mode):06o}".encode("ascii")
-                    kind = b"special"
-                    content = b""
-
-            self._fingerprint_frame(digest, b"record")
-            self._fingerprint_frame(digest, raw_path)
-            self._fingerprint_frame(digest, mode)
-            self._fingerprint_frame(digest, kind)
-            self._fingerprint_frame(digest, deleted)
-            self._fingerprint_frame(digest, content)
-
-        return digest.hexdigest()
+        return fingerprint_repository_surface(self.path)
 
     def publication_fingerprint(self, revision: str | None = None) -> str:
         """Hash the exact Git tree that publication would create or already created."""

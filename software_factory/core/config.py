@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from software_factory.adapters.registry import VALID_KINDS, get_registry
+from software_factory.core.design.configuration import VALID_DESIGN_PROTOCOLS, AnalyzerSpec
 from software_factory.core.orchestrate.routing import Thresholds
 
 DEFAULT_MANIFEST_NAMES = ("factory.config.yaml", "factory.config.yml", "factory.config.json")
@@ -37,7 +38,14 @@ def _read_manifest(path: Path) -> dict[str, Any]:
                 "PyYAML is required to read a YAML manifest. Install with "
                 "`pip install software-factory[yaml]` or use a .json manifest."
             ) from e
-        data = yaml.safe_load(text)
+        try:
+            data = yaml.safe_load(text)
+        except Exception:
+            # PyYAML diagnostics include the offending source line. Manifests
+            # should reference secrets through environment-variable names, but
+            # a malformed file may still contain a value that must not be
+            # copied into terminal or CI logs.
+            raise ValueError("YAML manifest could not be parsed") from None
     else:
         data = json.loads(text)
     if not isinstance(data, dict):
@@ -96,6 +104,9 @@ class BuildConfig:
     review_protocol: str = "verdict_v1"
     state_dir: str | None = None
     contract_author_role: str = "contract-author"
+    design_protocol: str = "legacy_plan"
+    design_analyzers: tuple[AnalyzerSpec, ...] = ()
+    design_author_role: str = "design-author"
 
 
 @dataclass(frozen=True)
@@ -195,6 +206,57 @@ class FactoryConfig:
         contract_author_role = bd.get("contract_author_role", "contract-author")
         if not isinstance(contract_author_role, str) or not contract_author_role.strip():
             raise ValueError("factory.build.contract_author_role must be a non-empty string")
+        design_protocol = bd.get("design_protocol", "legacy_plan")
+        if (
+            type(design_protocol) is not str
+            or design_protocol not in VALID_DESIGN_PROTOCOLS
+        ):
+            raise ValueError(
+                "factory.build.design_protocol must be one of "
+                f"{sorted(VALID_DESIGN_PROTOCOLS)!r}"
+            )
+        if "design_protocol" not in bd:
+            warnings.warn(
+                "factory.build.design_protocol is missing; using legacy_plan "
+                "compatibility behavior",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        design_author_role = bd.get("design_author_role", "design-author")
+        if type(design_author_role) is not str or not design_author_role.strip():
+            raise ValueError("factory.build.design_author_role must be a non-empty string")
+        raw_analyzers = bd.get("design_analyzers", [])
+        if type(raw_analyzers) is not list:
+            raise TypeError("factory.build.design_analyzers must be a list")
+        design_analyzers: list[AnalyzerSpec] = []
+        analyzer_names: set[str] = set()
+        for index, raw_analyzer in enumerate(raw_analyzers):
+            where = f"factory.build.design_analyzers[{index}]"
+            if not isinstance(raw_analyzer, Mapping):
+                raise TypeError(f"{where} must be a mapping")
+            unknown = set(raw_analyzer) - {"name", "required", "options"}
+            if unknown:
+                raise ValueError(f"{where} has unknown fields: {sorted(unknown)!r}")
+            name = raw_analyzer.get("name")
+            if type(name) is not str or not name.strip():
+                raise ValueError(f"{where}.name must be a non-empty string")
+            if name in analyzer_names:
+                raise ValueError(
+                    "factory.build.design_analyzers must have unique names; "
+                    f"duplicate {name!r}"
+                )
+            required = raw_analyzer.get("required")
+            if type(required) is not bool:
+                raise TypeError(f"{where}.required must be a bool")
+            options = raw_analyzer.get("options", {})
+            if not isinstance(options, Mapping):
+                raise TypeError(f"{where}.options must be a mapping")
+            try:
+                spec = AnalyzerSpec(name=name, required=required, options=options)
+            except (TypeError, ValueError) as exc:
+                raise type(exc)(f"{where}.options: {exc}") from exc
+            design_analyzers.append(spec)
+            analyzer_names.add(name)
         build = BuildConfig(
             dev_branch=bd.get("dev_branch", "develop"),
             verify_cmd=bd.get("verify_cmd", "pytest -q"),
@@ -211,6 +273,9 @@ class FactoryConfig:
             review_protocol=review_protocol,
             state_dir=state_dir,
             contract_author_role=contract_author_role,
+            design_protocol=design_protocol,
+            design_analyzers=tuple(design_analyzers),
+            design_author_role=design_author_role,
         )
 
         plugins = tuple(f.get("plugins") or ())

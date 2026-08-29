@@ -16,6 +16,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from software_factory.core.authority import AuthorityFailureKind, classify_read_error
 from software_factory.loop.state import default_state_dir
 
 SCHEMA_VERSION = 1
@@ -34,15 +35,27 @@ _RECORD_FIELDS = {
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", None)
 _DIRECTORY = getattr(os, "O_DIRECTORY", None)
 _OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
+_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+_MAX_RECORD_BYTES = 1024 * 1024
 
 
 class ApprovalError(RuntimeError):
     """Approval authority is absent, invalid, unreadable, or does not match."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: AuthorityFailureKind = AuthorityFailureKind.INTEGRITY,
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+
 
 class ArtifactKind(str, Enum):
     CONTRACT = "contract"
     PLAN = "plan"
+    DESIGN = "design"
 
 
 @dataclass(frozen=True)
@@ -96,7 +109,10 @@ class ApprovalStore:
             or record.artifact_digest != artifact_digest
             or record.parent_digest != parent_digest
         ):
-            raise ApprovalError("approval authority does not match the requested artifact")
+            raise ApprovalError(
+                "approval authority does not match the requested artifact",
+                kind=AuthorityFailureKind.POLICY_STALE,
+            )
         return record
 
     def _filename_for(self, repository: str, issue: str, artifact_kind: ArtifactKind) -> str:
@@ -129,21 +145,44 @@ class ApprovalStore:
     def _read_record(self, directory: int, filename: str) -> ApprovalRecord:
         descriptor: int | None = None
         try:
-            descriptor = os.open(filename, os.O_RDONLY | _NOFOLLOW, dir_fd=directory)
+            descriptor = os.open(
+                filename, os.O_RDONLY | _NONBLOCK | _NOFOLLOW, dir_fd=directory
+            )
         except FileNotFoundError as exc:
-            raise ApprovalError("approval authority is absent") from exc
-        except (NotImplementedError, OSError, TypeError) as exc:
-            raise ApprovalError("approval authority is unreadable") from exc
+            raise ApprovalError(
+                "approval authority is absent", kind=AuthorityFailureKind.ABSENT
+            ) from exc
+        except OSError as exc:
+            raise ApprovalError(
+                "approval authority is unreadable",
+                kind=classify_read_error(exc),
+            ) from exc
+        except (NotImplementedError, TypeError) as exc:
+            raise ApprovalError(
+                "approval authority is unreadable",
+                kind=AuthorityFailureKind.UNREADABLE_RUNTIME,
+            ) from exc
 
         try:
-            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+            ):
                 raise ApprovalError("approval authority is unreadable")
-            with os.fdopen(descriptor, "r", encoding="utf-8") as source:
+            with os.fdopen(descriptor, "rb") as source:
                 descriptor = None
-                data = json.load(source)
-        except (OSError, UnicodeDecodeError) as exc:
-            raise ApprovalError("approval authority is unreadable") from exc
-        except json.JSONDecodeError as exc:
+                raw = source.read(_MAX_RECORD_BYTES + 1)
+            if len(raw) > _MAX_RECORD_BYTES:
+                raise ApprovalError("approval authority is corrupt")
+            data = json.loads(raw.decode("utf-8"))
+        except OSError as exc:
+            raise ApprovalError(
+                "approval authority is unreadable",
+                kind=AuthorityFailureKind.UNREADABLE_RUNTIME,
+            ) from exc
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ApprovalError("approval authority is corrupt") from exc
         finally:
             if descriptor is not None:
@@ -189,13 +228,27 @@ class ApprovalStore:
         except FileNotFoundError as exc:
             if for_write:
                 raise ApprovalError("approval authority cannot be written") from exc
-            raise ApprovalError("approval authority is absent") from exc
+            raise ApprovalError(
+                "approval authority is absent", kind=AuthorityFailureKind.ABSENT
+            ) from exc
         except (NotImplementedError, OSError, TypeError) as exc:
             message = "approval authority cannot be written" if for_write else "approval authority is unreadable"
-            raise ApprovalError(message) from exc
+            raise ApprovalError(
+                message,
+                kind=(
+                    AuthorityFailureKind.UNREADABLE_RUNTIME
+                    if not for_write
+                    else AuthorityFailureKind.INTEGRITY
+                ),
+            ) from exc
 
         try:
-            if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o700
+            ):
                 raise ApprovalError("approval authority is unreadable")
             return descriptor
         except ApprovalError:
@@ -296,7 +349,7 @@ class ApprovalStore:
                 raise ApprovalError("contract approvals cannot carry a parent digest")
             return
         if parent_digest is None:
-            raise ApprovalError("plan approvals require a parent contract digest")
+            raise ApprovalError(f"{artifact_kind.value} approvals require a parent contract digest")
         ApprovalStore._validate_digest(parent_digest)
 
     @staticmethod

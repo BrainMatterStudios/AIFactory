@@ -4,6 +4,64 @@ All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project uses semantic versioning.
 
+## [0.3.0] - 2026-08-29
+
+### Added
+
+- Strict Design IR v1 with canonical identity, immutable generations, exact
+  Contract parentage, and exact Design approval.
+- Versioned runner capability declarations, observations, and conservative
+  effective-capability assessment; model or analyzer output cannot elevate a
+  capability.
+- Bounded analyzer execution, a strict SARIF importer, and a native read-only
+  harness posture analyzer.
+- A deterministic, replayable Design gate that binds the exact Contract,
+  Design, configuration, capabilities, repository fingerprint, and analyzer
+  evidence.
+- Read-only `design validate`, `design gate`, `analyze`, `capabilities`, and
+  `status` inspection commands with versioned JSON output.
+
+### Changed
+
+- New scaffolds select `design_ir_v1` for T2 work and require the harness
+  analyzer. Existing Contract parents keep their sticky recorded workflow.
+- New scaffolds include a safe, dev-only cron schedule for previewing with
+  `factory schedule render`; older manifests without a scheduler now receive a
+  configuration error instead of an internal traceback.
+- The T2 Design path supersedes opaque plan approval: implementation requires a
+  current passing gate and approval of the exact Design digest and parent
+  Contract digest.
+- Publication replay uses one shared verifier for legacy and Design workflows.
+
+### Compatibility and migration
+
+- Existing configurations default to `legacy_plan` with a migration warning;
+  there is no automatic migration.
+- Existing Contract, Plan, Approval, Decision, Design, and gate records remain
+  readable. A new Contract parent can explicitly opt into Design IR; restoring
+  `legacy_plan` affects only a later new parent because protocol selection is
+  sticky per exact Contract parent.
+
+### Security and known limitations
+
+- Malformed YAML parser diagnostics are normalized before reaching the CLI, so
+  source lines containing accidentally embedded private values are not echoed
+  into terminal or CI logs.
+- Installed analyzers are trusted code. Process isolation and normalized output
+  are not a sandbox; persistent workspace mutation is detected, but transient
+  mutation and external side effects cannot be disproved.
+- Ordinary current macOS APFS volumes cannot prove no-atime reads. A required
+  harness analyzer fails closed for each present supported harness file unless
+  it is on a volume or environment with a verifiable no-atime policy.
+- Schema validity is not design correctness. Analyzers may miss defects or
+  report false positives. Local approval identity is not a cryptographic
+  signature, and directory separation is not an OS sandbox.
+- Status is a linearizable "as observed" read-only projection, not a repository
+  snapshot or cooperative lock.
+
+See the [0.3.0 release notes](docs/releases/0.3.0.md) for the complete lifecycle,
+migration procedure, threat model, and non-claims.
+
 ## [0.2.0] - 2026-08-09
 
 ### Added
@@ -66,3 +124,4 @@ See the [0.2.0 release notes](docs/releases/0.2.0.md) for migration guidance,
 the threat model, and the complete operating limits.
 
 [0.2.0]: docs/releases/0.2.0.md
+[0.3.0]: docs/releases/0.3.0.md

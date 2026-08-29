@@ -10,10 +10,12 @@ So these tests are deliberately multi-step: two builds in a row, a moved base
 between them, a secret that appears and then disappears. That is the shape the
 defects lived in.
 """
+
 import hashlib
 import json
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -42,7 +44,9 @@ T2 = {"source": "feature", "files_changed": 12, "lines_changed": 800}
 def _repo_stub_dir():
     """A real git repo for stub workspaces — the gate fails closed without one."""
     import tempfile
+
     d = Path(tempfile.mkdtemp())
+
     def run(*a):
         return subprocess.run(["git", *a], cwd=d, check=True, capture_output=True)
 
@@ -68,8 +72,11 @@ def _src():
 def _repo_with_remote(tmp_path):
     """A repo with a real bare remote, so `push` is exercised for real."""
     subprocess.run(["git", "init", "-q", "--bare", str(tmp_path / "upstream.git")], check=True)
-    subprocess.run(["git", "clone", "-q", str(tmp_path / "upstream.git"), str(tmp_path / "repo")],
-                   check=True, capture_output=True)
+    subprocess.run(
+        ["git", "clone", "-q", str(tmp_path / "upstream.git"), str(tmp_path / "repo")],
+        check=True,
+        capture_output=True,
+    )
     repo = tmp_path / "repo"
     for a in (["config", "user.email", "t@e.com"], ["config", "user.name", "t"]):
         subprocess.run(["git", *a], cwd=repo, check=True)
@@ -82,8 +89,7 @@ def _repo_with_remote(tmp_path):
 
 
 def _ws(repo, verify):
-    return GitWorktree(repo_dir=repo, branch="factory/issue-7", base="develop",
-                       verify_cmd=verify)
+    return GitWorktree(repo_dir=repo, branch="factory/issue-7", base="develop", verify_cmd=verify)
 
 
 class _Agent:
@@ -101,8 +107,14 @@ class _Agent:
 
 def _build(repo, verify, writes, signals=T0):
     ws = _ws(repo, verify)
-    outcome = run_build(_issue(), runner=_Agent(ws, writes), source=_src(),
-                        workspace=ws, dev_branch="develop", signals=signals)
+    outcome = run_build(
+        _issue(),
+        runner=_Agent(ws, writes),
+        source=_src(),
+        workspace=ws,
+        dev_branch="develop",
+        signals=signals,
+    )
     return outcome, ws
 
 
@@ -112,8 +124,12 @@ def _remote_contains(bare, needle):
 
 
 def _branch_commits(repo):
-    return subprocess.run(["git", "log", "--oneline", "develop..factory/issue-7"],
-                          cwd=repo, capture_output=True, text=True).stdout.strip()
+    return subprocess.run(
+        ["git", "log", "--oneline", "develop..factory/issue-7"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -145,11 +161,16 @@ def test_the_stopped_work_is_still_recoverable(tmp_path):
     """Not shipping it is not the same as throwing it away."""
     repo, _ = _repo_with_remote(tmp_path)
     _build(repo, "false", {"half.py": "partial\n"})
-    ref = subprocess.run(["git", "rev-parse", "refs/factory/wip/factory/issue-7"],
-                         cwd=repo, capture_output=True, text=True)
+    ref = subprocess.run(
+        ["git", "rev-parse", "refs/factory/wip/factory/issue-7"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
     assert ref.returncode == 0, "the work should be in the side ref"
-    show = subprocess.run(["git", "show", f"{ref.stdout.strip()}:half.py"],
-                          cwd=repo, capture_output=True, text=True)
+    show = subprocess.run(
+        ["git", "show", f"{ref.stdout.strip()}:half.py"], cwd=repo, capture_output=True, text=True
+    )
     assert "partial" in show.stdout
 
 
@@ -161,16 +182,16 @@ def test_a_secret_added_then_deleted_is_still_caught(tmp_path):
     ws.create()
     Path(ws.path, "leak.py").write_text(f'TOKEN = "{TOKEN}"\n')
     subprocess.run(["git", "add", "-A"], cwd=ws.path, check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-qm", "agent turn 1"], cwd=ws.path, check=True,
-                   capture_output=True)
-    Path(ws.path, "leak.py").unlink()          # a later turn removes it
+    subprocess.run(
+        ["git", "commit", "-qm", "agent turn 1"], cwd=ws.path, check=True, capture_output=True
+    )
+    Path(ws.path, "leak.py").unlink()  # a later turn removes it
 
     from software_factory.build.orchestrator import _scan_for_secrets
 
     hits, scanned, err = _scan_for_secrets(ws)
     assert err is None
-    assert any("leak.py" in h for h in hits), \
-        "content still in the pushed commits must be scanned"
+    assert any("leak.py" in h for h in hits), "content still in the pushed commits must be scanned"
     assert not _remote_contains(bare, TOKEN)
 
 
@@ -200,7 +221,7 @@ def test_a_run_that_writes_nothing_after_a_stop_does_not_ship_the_old_work(tmp_p
     repo, bare = _repo_with_remote(tmp_path)
     _build(repo, "false", {"half.py": "failed the gate\n"})
 
-    outcome, _ = _build(repo, "true", {})          # the agent writes nothing
+    outcome, _ = _build(repo, "true", {})  # the agent writes nothing
     assert outcome.status is BuildStatus.BLOCKED
     # Caught by the produced-anything check rather than by NothingToCommit. The
     # distinction matters: NothingToCommit only fires when the *index* is empty,
@@ -218,8 +239,9 @@ def test_a_workspace_that_cannot_be_prepared_is_a_blocked_outcome(tmp_path):
     Path(ws.path, "junk.txt").write_text("in the way")
 
     src = _src()
-    outcome = run_build(_issue(), runner=_Agent(ws), source=src, workspace=ws,
-                        dev_branch="develop", signals=T0)
+    outcome = run_build(
+        _issue(), runner=_Agent(ws), source=src, workspace=ws, dev_branch="develop", signals=T0
+    )
     assert outcome.status is BuildStatus.BLOCKED
     assert "not a git worktree" in outcome.reason
     assert "blocked" in src.get_issue("7").labels
@@ -247,11 +269,25 @@ def test_an_exhausted_budget_does_not_spawn_the_t2_planner(tmp_path):
         guard.charge(5.0)
 
     runner = _Counting()
-    outcome = run_build(_issue(), runner=runner, source=_src(),
-                        workspace=type("W", (), {"path": _repo_stub_dir(), "branch": "b", "base": "HEAD",
-                                                 "create": lambda s: None,
-                                                 "cleanup": lambda s: None})(),
-                        dev_branch="develop", budget=guard, signals=T2)
+    outcome = run_build(
+        _issue(),
+        runner=runner,
+        source=_src(),
+        workspace=type(
+            "W",
+            (),
+            {
+                "path": _repo_stub_dir(),
+                "branch": "b",
+                "base": "HEAD",
+                "create": lambda s: None,
+                "cleanup": lambda s: None,
+            },
+        )(),
+        dev_branch="develop",
+        budget=guard,
+        signals=T2,
+    )
     assert outcome.status is BuildStatus.HALTED
     assert runner.spawns == [], "no agent may be spawned once the cap is blown"
 
@@ -260,12 +296,25 @@ def test_a_zero_cap_spawns_nothing():
     """`monthly_usd: 0` means spend nothing. A strict `>` made `0 > 0` false, so
     the pre-flight funded one more turn."""
     runner = _Counting()
-    outcome = run_build(_issue(), runner=runner, source=_src(),
-                        workspace=type("W", (), {"path": _repo_stub_dir(), "branch": "b", "base": "HEAD",
-                                                 "create": lambda s: None,
-                                                 "cleanup": lambda s: None})(),
-                        dev_branch="develop", budget=BudgetGuard(period_usd=0.0),
-                        signals=T0)
+    outcome = run_build(
+        _issue(),
+        runner=runner,
+        source=_src(),
+        workspace=type(
+            "W",
+            (),
+            {
+                "path": _repo_stub_dir(),
+                "branch": "b",
+                "base": "HEAD",
+                "create": lambda s: None,
+                "cleanup": lambda s: None,
+            },
+        )(),
+        dev_branch="develop",
+        budget=BudgetGuard(period_usd=0.0),
+        signals=T0,
+    )
     assert outcome.status is BuildStatus.HALTED
     assert runner.spawns == []
 
@@ -275,11 +324,25 @@ def test_the_halting_turn_is_included_in_the_reported_cost():
     was billed to the ledger and reported as $0.00."""
     guard = BudgetGuard(period_usd=2.0)
     runner = _Counting()
-    outcome = run_build(_issue(), runner=runner, source=_src(),
-                        workspace=type("W", (), {"path": _repo_stub_dir(), "branch": "b", "base": "HEAD",
-                                                 "create": lambda s: None,
-                                                 "cleanup": lambda s: None})(),
-                        dev_branch="develop", budget=guard, signals=T0)
+    outcome = run_build(
+        _issue(),
+        runner=runner,
+        source=_src(),
+        workspace=type(
+            "W",
+            (),
+            {
+                "path": _repo_stub_dir(),
+                "branch": "b",
+                "base": "HEAD",
+                "create": lambda s: None,
+                "cleanup": lambda s: None,
+            },
+        )(),
+        dev_branch="develop",
+        budget=guard,
+        signals=T0,
+    )
     assert outcome.status is BuildStatus.HALTED
     assert outcome.cost_usd == pytest.approx(guard.period_spent)
     assert outcome.cost_usd > 0
@@ -388,6 +451,8 @@ def test_contract_lifecycle_dispatches_and_records_in_trust_boundary_order(tmp_p
     assert review.schema_version == "verdict-v1"
     assert dict(review.findings[0]) == {
         "reviewer": "judge",
+        "revision": "opus",
+        "role": "general",
         "lens": "correctness",
         "verdict": "PASS",
         "security_block": False,
@@ -397,6 +462,105 @@ def test_contract_lifecycle_dispatches_and_records_in_trust_boundary_order(tmp_p
     assert dict(routing.findings[0])["restart_count"] == 0
     assert final.disposition == "SHIPPED"
     assert final.rule == "build.final-disposition"
+
+
+def test_publication_rejects_operator_to_contract_author_downgrade(tmp_path):
+    """Publication trusts the current exact operator, never a legacy role string."""
+    from .test_build import write_verdict_fixture
+    from .test_contract_phase import _valid_v2
+
+    repo, _bare = _repo_with_remote(tmp_path)
+    pushed = False
+
+    class RecordingWorkspace(GitWorktree):
+        def push(self, revision=None, *, expected_remote_tip=...):
+            nonlocal pushed
+            pushed = True
+            return super().push(
+                revision,
+                expected_remote_tip=expected_remote_tip,
+            )
+
+    class ForgedReadView(DecisionLog):
+        def read_verified(self, *, repository, issue):
+            return tuple(
+                replace(event, authority="contract-author") if event.stage == "contract" else event
+                for event in super().read_verified(repository=repository, issue=issue)
+            )
+
+    class LifecycleRunner:
+        def run_agent(self, prompt, *, model, system=None, tools=None, cwd=None):
+            if prompt.startswith("ROLE=contract-author"):
+                target = Path(cwd, "contracts", "7.json")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(json.dumps(_valid_v2(human_owned=True)) + "\n", encoding="utf-8")
+            elif system == "implementer":
+                Path(cwd, "feature.py").write_text("implemented = True\n", encoding="utf-8")
+            elif system == "judge":
+                write_verdict_fixture(cwd, "verdict: PASS")
+            return RunResult(ok=True, output="done", model=model, cost_usd=0.0)
+
+    issue = Issue("7", "implement accepted intent", "build it", labels=("type:bug",))
+    source = MemorySource()
+    source.seed(issue)
+    approvals = ApprovalStore(tmp_path / "controller-approvals")
+    decisions = ForgedReadView(tmp_path / "controller-decisions")
+    common = {
+        "runner": LifecycleRunner(),
+        "source": source,
+        "dev_branch": "develop",
+        "signals": {"source": "bug"},
+        "require_contract": True,
+        "contracts_dir": "contracts",
+        "repository": "example-repo",
+        "repo_root": str(repo),
+        "approval_store": approvals,
+        "decision_log": decisions,
+    }
+    first = run_build(
+        issue,
+        workspace=RecordingWorkspace(
+            repo_dir=repo,
+            branch="factory/issue-7",
+            base="develop",
+            verify_cmd="true",
+        ),
+        run_id="run-real-8a",
+        timestamp="2026-08-05T12:00:00Z",
+        **common,
+    )
+    assert first.status is BuildStatus.APPROVAL_PENDING
+    assert first.artifact_digest is not None
+
+    approvals.approve(
+        ApprovalRecord(
+            schema_version=APPROVAL_SCHEMA_VERSION,
+            repository="example-repo",
+            issue="7",
+            artifact_kind=ArtifactKind.CONTRACT,
+            artifact_digest=first.artifact_digest,
+            parent_digest=None,
+            approver="operator@example.invalid",
+            approved_at="2026-08-05T12:05:00Z",
+            rationale="Approved the exact contract",
+        )
+    )
+    outcome = run_build(
+        issue,
+        workspace=RecordingWorkspace(
+            repo_dir=repo,
+            branch="factory/issue-7",
+            base="develop",
+            verify_cmd="true",
+        ),
+        run_id="run-real-8b",
+        timestamp="2026-08-05T12:06:00Z",
+        **common,
+    )
+
+    assert outcome.status is BuildStatus.BLOCKED
+    assert "contract-authority" in outcome.reason
+    assert pushed is False
 
 
 def test_exact_pending_contract_resumes_without_a_second_author_turn(tmp_path):
@@ -532,9 +696,7 @@ def test_exact_pending_contract_resumes_without_a_second_author_turn(tmp_path):
     resumed = [event for event in history if event.run_id == "run-contract-pending-2"]
     contract = next(event for event in resumed if event.stage == "contract")
     contract_outcome = next(event for event in resumed if event.stage == "contract-outcome")
-    implementation = next(
-        event for event in resumed if event.stage == "implementation-objective"
-    )
+    implementation = next(event for event in resumed if event.stage == "implementation-objective")
     assert contract.artifact_digest == expected_digest
     assert contract.source_version == contract_checkpoint
     assert contract.authority == "operator@example.invalid"
@@ -719,7 +881,9 @@ def test_a_failing_alert_does_not_change_the_exit_code(tmp_path, monkeypatch, ca
     manifest = tmp_path / "factory.config.yaml"
     manifest.write_text(
         "factory:\n  name: demo\n  source: memory\n  observe: 'null'\n"
-        "  data: dict\n  alert: stdout\n", encoding="utf-8")
+        "  data: dict\n  alert: stdout\n",
+        encoding="utf-8",
+    )
 
     cfg = cli._load_config(str(manifest))
     original = cfg.build
@@ -728,15 +892,24 @@ def test_a_failing_alert_does_not_change_the_exit_code(tmp_path, monkeypatch, ca
         def send(self, text, *, severity=None):
             raise KeyError("SLACK_WEBHOOK_URL")
 
-    monkeypatch.setattr(type(cfg), "build",
-                        lambda self, kind: Exploding() if kind == "alert" else original(kind))
+    monkeypatch.setattr(
+        type(cfg), "build", lambda self, kind: Exploding() if kind == "alert" else original(kind)
+    )
     monkeypatch.setattr(cli, "_load_config", lambda path: cfg)
     # a real finding, so the alert path is actually taken
-    monkeypatch.setattr(cli, "run_verify", lambda **kw: Report(
-        target="dev", checks=[CheckResult("boom", CheckVerdict.FAIL, {"detail": "x"})]))
+    monkeypatch.setattr(
+        cli,
+        "run_verify",
+        lambda **kw: Report(
+            target="dev", checks=[CheckResult("boom", CheckVerdict.FAIL, {"detail": "x"})]
+        ),
+    )
 
-    args = type("A", (), {"config": str(manifest), "target": "dev", "apply": False,
-                          "alert": True, "repo": None})()
+    args = type(
+        "A",
+        (),
+        {"config": str(manifest), "target": "dev", "apply": False, "alert": True, "repo": None},
+    )()
     rc = cli.cmd_observe(args)
     out = capsys.readouterr().out
     assert "alert: FAILED" in out, out
@@ -747,10 +920,12 @@ def test_a_failing_alert_does_not_change_the_exit_code(tmp_path, monkeypatch, ca
 # Every module still imports cold (the previous panel's blocker)
 # --------------------------------------------------------------------------- #
 def test_the_package_still_imports_from_a_cold_start():
-    r = subprocess.run([sys.executable, "-c",
-                        "from software_factory.loop.collectors import CheckResult"],
-                       cwd=Path(__file__).resolve().parent.parent,
-                       capture_output=True, text=True)
+    r = subprocess.run(
+        [sys.executable, "-c", "from software_factory.loop.collectors import CheckResult"],
+        cwd=Path(__file__).resolve().parent.parent,
+        capture_output=True,
+        text=True,
+    )
     assert r.returncode == 0, r.stderr
 
 
@@ -758,8 +933,7 @@ def test_the_package_still_imports_from_a_cold_start():
 # The gate must derive its set the way `push` does — panel 4
 # --------------------------------------------------------------------------- #
 def _wt(repo):
-    ws = GitWorktree(repo_dir=repo, branch="factory/issue-7", base="develop",
-                     verify_cmd="true")
+    ws = GitWorktree(repo_dir=repo, branch="factory/issue-7", base="develop", verify_cmd="true")
     ws.create()
     return ws
 
@@ -789,20 +963,22 @@ def test_a_secret_only_in_a_merge_commit_is_scanned(tmp_path):
 
     repo, _ = _repo_with_remote(tmp_path)
     ws = _wt(repo)
-    subprocess.run(["git", "checkout", "-q", "-b", "side"], cwd=ws.path, check=True,
-                   capture_output=True)
+    subprocess.run(
+        ["git", "checkout", "-q", "-b", "side"], cwd=ws.path, check=True, capture_output=True
+    )
     Path(ws.path, "cfg.py").write_text("side\n")
     _commit(ws, "side")
-    subprocess.run(["git", "checkout", "-q", "factory/issue-7"], cwd=ws.path, check=True,
-                   capture_output=True)
+    subprocess.run(
+        ["git", "checkout", "-q", "factory/issue-7"], cwd=ws.path, check=True, capture_output=True
+    )
     Path(ws.path, "other.py").write_text("main\n")
     _commit(ws, "main")
-    subprocess.run(["git", "merge", "--no-edit", "-q", "side"], cwd=ws.path,
-                   capture_output=True)
-    Path(ws.path, "cfg.py").write_text(f'api_key = "{TOKEN}"\n')   # resolved in the merge
+    subprocess.run(["git", "merge", "--no-edit", "-q", "side"], cwd=ws.path, capture_output=True)
+    Path(ws.path, "cfg.py").write_text(f'api_key = "{TOKEN}"\n')  # resolved in the merge
     subprocess.run(["git", "add", "-A"], cwd=ws.path, check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-q", "--amend", "--no-edit"], cwd=ws.path,
-                   capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-q", "--amend", "--no-edit"], cwd=ws.path, capture_output=True
+    )
     Path(ws.path, "cfg.py").write_text("scrubbed\n")
     _commit(ws, "scrub")
 
@@ -844,7 +1020,7 @@ def test_a_large_binary_asset_does_not_wedge_the_build(tmp_path):
 
 
 def test_a_workspace_without_a_base_fails_closed(tmp_path):
-    """"Cannot determine the commit range" and "the range is empty" are opposite
+    """ "Cannot determine the commit range" and "the range is empty" are opposite
     facts about what is about to be pushed."""
     from software_factory.build.orchestrator import _scan_for_secrets
 

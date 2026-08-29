@@ -1,10 +1,79 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_release_documentation_matches_the_current_public_surface() -> None:
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    adopting = (REPO_ROOT / "docs" / "ADOPTING.md").read_text(encoding="utf-8")
+    operating = (REPO_ROOT / "docs" / "OPERATING.md").read_text(encoding="utf-8")
+    known = (REPO_ROOT / "KNOWN_ISSUES.md").read_text(encoding="utf-8")
+    security = (REPO_ROOT / "SECURITY.md").read_text(encoding="utf-8")
+    release = (REPO_ROOT / "docs" / "releases" / "0.3.0.md").read_text(encoding="utf-8")
+
+    for command in (
+        "factory design validate <file>",
+        "factory design gate <file>",
+        "factory analyze <adapter>",
+        "factory capabilities",
+        "factory status [issue]",
+        "factory doctor",
+    ):
+        assert command in readme
+        assert command in adopting or command in operating
+
+    combined = "\n".join((readme, adopting, operating, known, security, release))
+    normalized_release = " ".join(release.split())
+    for required_claim in (
+        "ordinary current macOS APFS",
+        "installed analyzers are trusted code",
+        "transient or external side effects",
+        'linearizable "as observed"',
+        "not a cryptographic signature",
+        "not an OS sandbox",
+    ):
+        assert required_claim.lower() in normalized_release.lower()
+
+    for stale_claim in (
+        "**Status:** 0.2.0",
+        "0.2 release-candidate note",
+        "There is no separate general design gate",
+        "Version 0.2 separates three writable surfaces",
+    ):
+        assert stale_claim not in combined
+
+
+def test_release_documentation_local_links_resolve() -> None:
+    documents = (
+        REPO_ROOT / "README.md",
+        REPO_ROOT / "CHANGELOG.md",
+        REPO_ROOT / "KNOWN_ISSUES.md",
+        REPO_ROOT / "SECURITY.md",
+        REPO_ROOT / "docs" / "ADOPTING.md",
+        REPO_ROOT / "docs" / "OPERATING.md",
+        REPO_ROOT / "docs" / "RELEASE_CHECKLIST.md",
+        REPO_ROOT / "docs" / "releases" / "0.3.0.md",
+    )
+    pattern = re.compile(r"(?<!!)\[[^]]+\]\(([^)]+)\)")
+
+    for document in documents:
+        for target in pattern.findall(document.read_text(encoding="utf-8")):
+            path = target.split("#", 1)[0]
+            if not path or "://" in path or path.startswith("mailto:"):
+                continue
+            assert (document.parent / path).resolve().exists(), (document, target)
+
+
+def test_core_release_keeps_zero_hard_dependencies() -> None:
+    project = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    project_section = project.split("[project]", 1)[1].split("[project.optional-dependencies]", 1)[0]
+
+    assert re.search(r"(?m)^dependencies = \[\]$", project_section)
 
 
 def _source_script(command: str, tmp_path: Path) -> subprocess.CompletedProcess[str]:

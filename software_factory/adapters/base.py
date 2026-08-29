@@ -13,7 +13,13 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from software_factory.core.design.capabilities import (
+        CapabilityObservation,
+        RunnerCapabilityDeclaration,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -180,6 +186,17 @@ class RunnerAdapter(Protocol):
         tools: Sequence[str] | None = None,
         cwd: str | None = None,
     ) -> RunResult: ...
+
+
+@runtime_checkable
+class CapabilityAwareRunner(Protocol):
+    """Optional trusted declaration and runtime observation surface."""
+
+    def capability_declaration(self) -> RunnerCapabilityDeclaration: ...
+
+    def observe_capabilities(
+        self, *, workspace_path: str, repo_root: str
+    ) -> CapabilityObservation: ...
 
 
 # --------------------------------------------------------------------------- #

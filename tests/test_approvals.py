@@ -194,6 +194,52 @@ def test_plan_cannot_omit_its_parent_digest(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    ("artifact_kind", "artifact_digest", "parent_digest"),
+    [
+        ("contract", CONTRACT_DIGEST, None),
+        ("plan", PLAN_DIGEST, CONTRACT_DIGEST),
+    ],
+    ids=("contract", "plan"),
+)
+def test_legacy_contract_and_plan_records_parse_without_migration(
+    tmp_path, artifact_kind, artifact_digest, parent_digest
+):
+    """Records written before Design approvals remain usable without rewriting."""
+    store = ApprovalStore(tmp_path)
+    parsed_kind = ArtifactKind(artifact_kind)
+    filename = store._filename_for("acme/widgets", "42", parsed_kind)
+    path = tmp_path / filename
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "repository": "acme/widgets",
+                "issue": "42",
+                "artifact_kind": artifact_kind,
+                "artifact_digest": artifact_digest,
+                "parent_digest": parent_digest,
+                "approver": "operator@example.test",
+                "approved_at": "2026-08-05T12:00:00Z",
+                "rationale": "Approved after review.",
+            }
+        ),
+        encoding="utf-8",
+    )
+    path.chmod(0o600)
+
+    record = store.require(
+        repository="acme/widgets",
+        issue="42",
+        artifact_kind=parsed_kind,
+        artifact_digest=artifact_digest,
+        parent_digest=parent_digest,
+    )
+
+    assert record.artifact_kind is parsed_kind
+    assert json.loads((tmp_path / filename).read_text(encoding="utf-8"))["artifact_kind"] == artifact_kind
+
+
 @pytest.mark.parametrize("field", ["approver", "rationale"])
 def test_missing_operator_metadata_fails_before_creating_state(tmp_path, field):
     """Anonymous or unexplained approvals must not leave a state directory behind."""
@@ -346,6 +392,7 @@ def test_pinned_directory_descriptor_survives_root_replacement_race(tmp_path, mo
 
     root = tmp_path / "approvals"
     root.mkdir()
+    root.chmod(0o700)
     outside = tmp_path / "outside"
     outside.mkdir()
     parked = tmp_path / "parked"
