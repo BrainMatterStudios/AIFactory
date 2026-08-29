@@ -714,9 +714,14 @@ def _replace_with_special(path: Path, kind: str):
 
 
 def test_every_status_authority_reader_rejects_special_files_without_blocking():
+    safe_temp_root = Path(tempfile.gettempdir()).resolve()
     for authority in ("contract", "design", "gate", "approval", "decision"):
         for kind in ("fifo", "socket"):
-            case = Path(tempfile.mkdtemp(prefix=f"sf-{authority[0]}{kind[0]}-", dir="/private/tmp"))
+            case = Path(
+                tempfile.mkdtemp(
+                    prefix=f"sf-{authority[0]}{kind[0]}-", dir=safe_temp_root
+                )
+            )
             repo = case / "repo"
             state = case / "state"
             repo.mkdir(parents=True)
