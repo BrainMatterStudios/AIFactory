@@ -1,8 +1,8 @@
 # AIFactory roadmap
 
-**Last updated:** 2026-08-10
+**Last updated:** 2026-08-29
 
-This roadmap records the intended sequence after the public 0.2.0 release. It
+This roadmap records the intended sequence after the public 0.3.0 release. It
 is an ordering and dependency document, not a promise of dates. A release enters
 implementation only after its own design is approved, its predecessor satisfies
 the relevant exit criteria, and an implementation plan is reviewed.
@@ -23,14 +23,42 @@ the relevant exit criteria, and an implementation plan is reviewed.
 
 ## Release sequence
 
-| Release | Theme | Primary result | Depends on |
-|---|---|---|---|
-| 0.2.0 | Architecture before code | Contract v2, exact approvals, findings-only sensors, deterministic routing | Released |
-| 0.3.0 | Design authority and capability honesty | Design IR v1, deterministic design gate, runner capability contracts, analyzer adapters, status projection | 0.2.0 |
-| 0.4.0 | Human review and evidence UX | Digest-bound Review Canvas, anchored feedback, evidence views, approval handoff, notifications | Stable 0.3 schemas |
-| 0.5.0 | Managed adoption and harness posture | Plan/apply lifecycle, ownership, drift, repair/uninstall, harness analyzers, context/tool budgets | 0.3 contracts and 0.4 review UX |
-| 0.6.0 | Governed evolution | Code-to-design sensing, design-drift detection, improvement proposals, replay evaluation, human admission | 0.3 authority and 0.5 ownership |
-| 0.7.0 | Portable knowledge and ecosystem | Provenance-bearing handoffs, cross-runner context, curated capability packs, optional read-only dashboard | 0.4 review, 0.5 lifecycle, 0.6 promotion controls |
+| Release | Theme | Primary result | Depends on | Status |
+|---|---|---|---|---|
+| 0.2.0 | Architecture before code | Contract v2, exact approvals, findings-only sensors, deterministic routing | — | Released |
+| 0.3.0 | Design authority and capability honesty | Design IR v1, deterministic design gate, runner capability contracts, analyzer adapters, status projection | 0.2.0 | Released 2026-08-29; operational validation active |
+| 0.4.0 | Human review and evidence UX | Digest-bound Review Canvas, anchored feedback, evidence views, approval handoff, notifications | Stable 0.3 schemas and recorded operational evidence | Roadmap brief |
+| 0.5.0 | Managed adoption and harness posture | Plan/apply lifecycle, ownership, drift, repair/uninstall, harness analyzers, context/tool budgets | 0.3 contracts and 0.4 review UX | Roadmap brief |
+| 0.6.0 | Governed evolution | Code-to-design sensing, design-drift detection, improvement proposals, replay evaluation, human admission | 0.3 authority and 0.5 ownership | Roadmap brief |
+| 0.7.0 | Portable knowledge and ecosystem | Provenance-bearing handoffs, cross-runner context, curated capability packs, optional read-only dashboard | 0.4 review, 0.5 lifecycle, 0.6 promotion controls | Roadmap brief |
+
+## Current operational validation gate
+
+The release of 0.3.0 publishes the first Design IR and capability-authority
+surfaces; it does not by itself prove that the workflow is usable or that a real
+runner can supply the guarantees it requires. Before 0.4.0 enters detailed
+design, recorded evidence must establish all of the following:
+
+1. Representative real work exercises the complete Contract -> Design IR ->
+   gate -> exact approval -> implementation path.
+2. At least one non-toy supported runner or execution backend supplies and
+   observes every capability required by a representative T2 workflow.
+3. Each primary operator platform has an explicit supported path or safe
+   fallback. In particular, the current macOS APFS harness-analyzer limitation
+   must be resolved, isolated behind a supported execution environment, or
+   documented as requiring the legacy workflow.
+4. The evaluation records capability gaps and failed observations, analyzer
+   unavailable states and confirmed false positives or negatives, design
+   revisions, review time, task outcome, latency, and cost under the existing
+   data-minimization and public-boundary rules.
+5. The evidence identifies the minimum useful 0.4.0 review views and any
+   threat-model-driven capability vocabulary changes. It must not be used to
+   justify a second approval language or parallel authority system.
+
+AIFactory continues to own capability requirements, normalized observations,
+deterministic gating, and exact approval. Runtime sandboxing and enforcement may
+be supplied by optional runner backends; they do not become hard core
+dependencies or independent approval authorities.
 
 ## Canonical release documents
 
@@ -40,11 +68,10 @@ the relevant exit criteria, and an implementation plan is reviewed.
 - [0.6.0 governed evolution brief](superpowers/specs/2026-08-10-aifactory-0.6.0-governed-evolution-brief.md)
 - [0.7.0 portable knowledge and ecosystem brief](superpowers/specs/2026-08-10-aifactory-0.7.0-portable-knowledge-brief.md)
 
-The 0.3.0 document is detailed enough to produce an executable implementation
-plan after written-spec review. The 0.4.0 through 0.7.0 documents are design-grade
-briefs: they preserve objectives, boundaries, dependencies, non-goals, risks,
-and promotion criteria without inventing file-level work against APIs that do
-not exist yet.
+The 0.3.0 document records the approved design that shipped in the public
+release. The 0.4.0 through 0.7.0 documents are design-grade briefs: they
+preserve objectives, boundaries, dependencies, non-goals, risks, and promotion
+criteria without inventing file-level work against APIs that do not exist yet.
 
 ## Promotion rules
 
@@ -56,6 +83,9 @@ A release may begin detailed design when:
 3. Known production or adoption evidence does not invalidate the proposed
    scope.
 4. Authority and rollback boundaries are explicitly approved.
+5. When a release builds over an operational workflow, at least one supported
+   end-to-end path has been exercised on representative real work; shipped
+   schemas alone are insufficient evidence.
 
 A release may ship only when its own adversarial exit criteria pass. Push, pull
 request, merge, tag, GitHub release, and registry publication remain separately
