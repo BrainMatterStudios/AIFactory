@@ -1374,8 +1374,10 @@ def test_release_identity_is_consistent(capsys):
 
     assert '\nversion = "0.3.0"\n' in project
     assert changelog.startswith("# Changelog\n")
-    assert "## [0.3.0] - 2026-08-11" in changelog
+    assert "## [0.3.0] - 2026-08-29" in changelog
     assert release.startswith("# AIFactory 0.3.0\n")
+    assert "**Release date:** 2026-08-29" in release
+    assert "**Status:** source-only GitHub release; not published to PyPI" in release
     assert "`<candidate-version>`" in checklist
     assert "exact `<candidate-version>` tag" in checklist
     assert "exact `0.2.0` tag" not in checklist
