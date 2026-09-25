@@ -1,6 +1,6 @@
 # AIFactory roadmap
 
-**Last updated:** 2026-08-29
+**Last updated:** 2026-09-25
 
 This roadmap records the intended sequence after the public 0.3.0 release. It
 is an ordering and dependency document, not a promise of dates. A release enters
@@ -34,15 +34,40 @@ the relevant exit criteria, and an implementation plan is reviewed.
 
 ## Current operational validation gate
 
-The release of 0.3.0 publishes the first Design IR and capability-authority
-surfaces; it does not by itself prove that the workflow is usable or that a real
-runner can supply the guarantees it requires. Before 0.4.0 enters detailed
-design, recorded evidence must establish all of the following:
+The provider-aware role obligations, local-only publication ceiling,
+controller-bound contract revision path, and optional validation-cell lifecycle
+are implemented on the Stage 1 candidate branch. They are reusable factory
+mechanisms: no repository-specific canary, target patch, target credential, or
+operator evidence belongs in the AIFactory product repository.
+
+Field validation established that the pinned upstream Leash v1.1.7 runtime
+cannot satisfy the Stage 1 filesystem claim: its Linux file-open program skips
+policy paths longer than 64 bytes and treats accepted paths as prefixes without
+honoring file-versus-directory identity. A context-scoped AIFactory workspace
+rule already exceeds that limit, while shortening the rule would authorize
+neighboring workspaces.
+
+A corrected Linux/aarch64 backend is therefore an optional validation
+dependency inside the existing 0.3.0 gate. Its local admission binds the image
+archive, upstream base, correction source, generated BPF objects, build record,
+test record, and loaded immutable image ID. It remains outside AIFactory core
+and has no approval authority. The corrected artifact has been built and
+admitted locally, but the digest-bound one-shot synthetic containment evidence
+is still pending. Upstream v1.1.7 remains available only for historical replay;
+it cannot satisfy this gate.
+
+This work does not promote 0.3.0, change the numbered release sequence, or make
+0.4.0 eligible for detailed design. Before 0.4.0 enters detailed design,
+recorded evidence must establish all of the following:
 
 1. Representative real work exercises the complete Contract -> Design IR ->
    gate -> exact approval -> implementation path.
 2. At least one non-toy supported runner or execution backend supplies and
-   observes every capability required by a representative T2 workflow.
+   observes every capability required by a representative T2 workflow. For the
+   Stage 1 candidate, the fresh synthetic gate must pass against the exact
+   digest-bound corrected Leash artifact, including neighboring-workspace
+   denial, firewall evidence, cleanup, freshness equality, and confirmed
+   terminal stop.
 3. Each primary operator platform has an explicit supported path or safe
    fallback. In particular, the current macOS APFS harness-analyzer limitation
    must be resolved, isolated behind a supported execution environment, or
@@ -54,6 +79,12 @@ design, recorded evidence must establish all of the following:
 5. The evidence identifies the minimum useful 0.4.0 review views and any
    threat-model-driven capability vocabulary changes. It must not be used to
    justify a second approval language or parallel authority system.
+
+Repository-specific field trials are deliberately outside this roadmap's
+implementation deliverables. An operator may run one only as a separately
+approved, rollbackable activity using controller-owned inputs and private
+evidence storage. Such a trial may validate the gate, but its target identity,
+runbook, patches, transcripts, and evidence are not merged into AIFactory.
 
 AIFactory continues to own capability requirements, normalized observations,
 deterministic gating, and exact approval. Runtime sandboxing and enforcement may

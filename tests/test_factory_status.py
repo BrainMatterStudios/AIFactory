@@ -13,6 +13,7 @@ import tempfile
 import threading
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,6 +24,13 @@ from software_factory.build.design_store import DesignEnvelopeStore
 from software_factory.build.lifecycle_replay import (
     PublishedLifecycleAuthority,
     verify_published_lifecycle,
+)
+from software_factory.build.local_artifacts import local_artifact_policy_sha256
+from software_factory.build.operational_evidence import (
+    OPERATIONAL_EVIDENCE_SCHEMA_VERSION,
+    OperationalDisposition,
+    OperationalEvidence,
+    OperationalEvidenceStore,
 )
 from software_factory.build.review_policy import FindingOverride
 from software_factory.build.status import (
@@ -37,6 +45,7 @@ from software_factory.build.workflow_protocol_store import (
 )
 from software_factory.build.workspace import fingerprint_repository_surface
 from software_factory.core.approvals import (
+    ApprovalError,
     ApprovalRecord,
     ApprovalStore,
     ArtifactKind,
@@ -46,14 +55,31 @@ from software_factory.core.contracts import artifact_sha256
 from software_factory.core.design.capabilities import (
     CapabilityObservation,
     RunnerCapabilityDeclaration,
+    assess_capabilities,
     capability_document,
 )
 from software_factory.core.design.capability_names import Capability
-from software_factory.core.design.gate import analyzer_execution_document
+from software_factory.core.design.gate import (
+    analyzer_execution_document,
+    analyzer_execution_from_document,
+    capability_authority_document,
+    capability_authority_from_document,
+    evaluate_design_gate,
+    finding_override_from_document,
+)
 from software_factory.trace import DecisionEvent, DecisionLog
+from software_factory.trace.decisions import EVENT_SCHEMA_VERSION
 
-from .test_contract_phase import _valid_v2
-from .test_design_gate import capabilities, evaluate, execution, finding, traced_design
+from .test_contract_phase import _constraints, _valid_v2
+from .test_design_gate import (
+    capabilities,
+    evaluate,
+    execution,
+    finding,
+    provider_capabilities,
+    traced_design,
+    v2_config_document,
+)
 from .test_design_gate_store import inputs as gate_inputs
 
 REPOSITORY = "acme/widgets"
@@ -98,6 +124,31 @@ def _pending_contract(repo: Path):
     return store, envelope
 
 
+def _pending_constrained_contract(repo: Path):
+    document = _valid_v2(human_owned=True)
+    document["repo"] = REPOSITORY
+    document["issue"] = int(ISSUE)
+    text = json.dumps(document, indent=2, ensure_ascii=False) + "\n"
+    digest = artifact_sha256(document)
+    constraints, constraint_digest = _constraints(
+        repository=REPOSITORY, issue=ISSUE, tier="T2"
+    )
+    store = ContractEnvelopeStore(repo)
+    store.write(
+        repository=REPOSITORY,
+        issue=ISSUE,
+        contract_text=text,
+        contract_document=document,
+        artifact_digest=digest,
+        policy_version="intent-v2",
+        constraint_document=constraints,
+        constraint_digest=constraint_digest,
+    )
+    pending = store.inspect(repository=REPOSITORY, issue=ISSUE, policy_version=None)
+    assert pending is not None
+    return store, pending
+
+
 def _git_repo(repo: Path) -> None:
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     (repo / "README.md").write_text("test\n", encoding="utf-8")
@@ -119,12 +170,49 @@ def _git_repo(repo: Path) -> None:
     )
 
 
-def _ready_lifecycle(repo: Path, state: Path, *, values=None):
-    values = gate_inputs() if values is None else values
+def _ready_lifecycle(
+    repo: Path,
+    state: Path,
+    *,
+    values=None,
+    policy_version: str = "intent-v1",
+    use_repository_fingerprint: bool = False,
+):
+    values = dict(gate_inputs()) if values is None else dict(values)
+    values["policy_version"] = policy_version
+    values["result"] = evaluate_design_gate(
+        contract_document=values["contract_document"],
+        contract_digest=values["contract_digest"],
+        contract_approved=values["contract_approved"],
+        design_document=values["design_document"],
+        design_digest=values["design_digest"],
+        policy_version=policy_version,
+        design_config_document=values["design_config_document"],
+        config_digest=values["config_digest"],
+        expected_artifact_fingerprint=values["expected_artifact_fingerprint"],
+        capabilities=capability_authority_from_document(values["capability_document"]),
+        analyzers=tuple(
+            analyzer_execution_from_document(item)
+            for item in values["analyzer_documents"]
+        ),
+        overrides=tuple(
+            finding_override_from_document(item)
+            for item in values["override_documents"]
+        ),
+    )
     state.mkdir(parents=True, exist_ok=True)
     contract_document = values["contract_document"]
     contract_text = json.dumps(contract_document, indent=2, ensure_ascii=False) + "\n"
     contract_store = ContractEnvelopeStore(repo)
+    contract_arguments = {}
+    if policy_version == "intent-v2":
+        constraints, constraint_digest = _constraints(
+            repository=REPOSITORY, issue=ISSUE, tier="T2"
+        )
+        contract_arguments = {
+            "constraint_document": constraints,
+            "constraint_digest": constraint_digest,
+        }
     contract_store.write(
         repository=REPOSITORY,
         issue=ISSUE,
@@ -132,6 +220,7 @@ def _ready_lifecycle(repo: Path, state: Path, *, values=None):
         contract_document=contract_document,
         artifact_digest=values["contract_digest"],
         policy_version=values["policy_version"],
+        **contract_arguments,
     )
     pending = contract_store.load(
         repository=REPOSITORY,
@@ -140,6 +229,37 @@ def _ready_lifecycle(repo: Path, state: Path, *, values=None):
     )
     assert pending is not None
     accepted = contract_store.accept(pending)
+    if use_repository_fingerprint:
+        values["expected_artifact_fingerprint"] = fingerprint_repository_surface(repo)
+        values["analyzer_documents"] = tuple(
+            analyzer_execution_document(
+                replace(
+                    analyzer_execution_from_document(item),
+                    artifact_fingerprint=values["expected_artifact_fingerprint"],
+                )
+            )
+            for item in values["analyzer_documents"]
+        )
+        values["result"] = evaluate_design_gate(
+            contract_document=values["contract_document"],
+            contract_digest=values["contract_digest"],
+            contract_approved=values["contract_approved"],
+            design_document=values["design_document"],
+            design_digest=values["design_digest"],
+            policy_version=policy_version,
+            design_config_document=values["design_config_document"],
+            config_digest=values["config_digest"],
+            expected_artifact_fingerprint=values["expected_artifact_fingerprint"],
+            capabilities=capability_authority_from_document(values["capability_document"]),
+            analyzers=tuple(
+                analyzer_execution_from_document(item)
+                for item in values["analyzer_documents"]
+            ),
+            overrides=tuple(
+                finding_override_from_document(item)
+                for item in values["override_documents"]
+            ),
+        )
     design = DesignEnvelopeStore(state / "designs").store(
         repository=REPOSITORY,
         issue=ISSUE,
@@ -201,6 +321,36 @@ def _human_owned_gate_inputs():
     return values
 
 
+def _provider_gate_inputs():
+    analyzer = execution()
+    values = gate_inputs(analyzer=analyzer)
+    config = v2_config_document()
+    config["design_analyzers"] = [
+        {"name": analyzer.name, "required": analyzer.required, "options": {}}
+    ]
+    config_digest = artifact_sha256(config)
+    assessment = provider_capabilities(
+        required_analyzer=analyzer.required,
+        parent_digest=values["contract_digest"],
+        config_digest=config_digest,
+    )
+    result = evaluate(
+        contract=values["contract_document"],
+        design=values["design_document"],
+        assessment=assessment,
+        analyzers=(analyzer,),
+        config_document=config,
+        expected_fingerprint=analyzer.artifact_fingerprint,
+    )
+    values.update(
+        design_config_document=config,
+        config_digest=config_digest,
+        capability_document=capability_authority_document(assessment),
+        result=result,
+    )
+    return values, assessment
+
+
 def test_no_state_is_unavailable_and_creates_nothing(tmp_path):
     repo = tmp_path / "repo"
     state = tmp_path / "state"
@@ -214,6 +364,48 @@ def test_no_state_is_unavailable_and_creates_nothing(tmp_path):
     assert _snapshot(tmp_path) == before
     assert not state.exists()
     assert not (repo / ".factory").exists()
+
+
+def test_controller_bound_contract_authority_is_explicit_and_cannot_be_redirected(
+    tmp_path,
+):
+    cell = tmp_path / "validation-cell-test"
+    controller = cell / "controller-authority"
+    unrelated = tmp_path / "unrelated-authority"
+    controller.mkdir(parents=True)
+    unrelated.mkdir()
+    _pending_contract(controller)
+    _pending_contract(unrelated)
+    before = _snapshot(tmp_path)
+
+    implicit = issue_status(
+        repository=REPOSITORY,
+        issue=ISSUE,
+        repo_root=cell,
+        state_root=controller,
+        contract_root=controller,
+    )
+    redirected = issue_status(
+        repository=REPOSITORY,
+        issue=ISSUE,
+        repo_root=cell,
+        state_root=controller,
+        contract_root=unrelated,
+        controller_bound=True,
+    )
+    authenticated = issue_status(
+        repository=REPOSITORY,
+        issue=ISSUE,
+        repo_root=cell,
+        state_root=controller,
+        contract_root=controller,
+        controller_bound=True,
+    )
+
+    assert implicit.state is FactoryStatusState.BLOCKED
+    assert redirected.state is FactoryStatusState.BLOCKED
+    assert authenticated.state is FactoryStatusState.APPROVAL_PENDING
+    assert _snapshot(tmp_path) == before
 
 
 def test_pending_contract_without_exact_approval_is_approval_pending_and_read_only(
@@ -260,6 +452,168 @@ def test_pending_contract_exact_approval_is_ready_for_lifecycle_resume(tmp_path)
     assert result.phase == "contract"
     assert result.approval_current is True
     assert _snapshot(tmp_path) == before
+
+
+def test_pending_constrained_contract_status_binds_approval_to_constraint(tmp_path):
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    repo.mkdir()
+    _store, pending = _pending_constrained_contract(repo)
+    constraint_digest = pending.envelope.constraint_digest
+    assert constraint_digest is not None
+    ApprovalStore(state / "approvals").approve(
+        ApprovalRecord(
+            schema_version=1,
+            repository=REPOSITORY,
+            issue=ISSUE,
+            artifact_kind=ArtifactKind.CONTRACT,
+            artifact_digest=pending.envelope.artifact_digest,
+            parent_digest=None,
+            approver="legacy@example.test",
+            approved_at="2026-09-16T00:00:00Z",
+            rationale="This null-parent approval must not grant v2 authority.",
+        )
+    )
+
+    null_parent = issue_status(
+        repository=REPOSITORY,
+        issue=ISSUE,
+        repo_root=repo,
+        state_root=state,
+        policy_version=None,
+    )
+
+    assert null_parent.state is FactoryStatusState.APPROVAL_PENDING
+    assert null_parent.approval_current is False
+    assert null_parent.artifact_digests == {
+        "constraint": constraint_digest,
+        "contract": pending.envelope.artifact_digest,
+    }
+
+    ApprovalStore(state / "approvals").approve(
+        ApprovalRecord(
+            schema_version=1,
+            repository=REPOSITORY,
+            issue=ISSUE,
+            artifact_kind=ArtifactKind.CONTRACT,
+            artifact_digest=pending.envelope.artifact_digest,
+            parent_digest=constraint_digest,
+            approver="operator@example.test",
+            approved_at="2026-09-16T00:01:00Z",
+            rationale="Reviewed exact contract and constraints.",
+        )
+    )
+
+    current = issue_status(
+        repository=REPOSITORY,
+        issue=ISSUE,
+        repo_root=repo,
+        state_root=state,
+        policy_version=None,
+    )
+    assert current.state is FactoryStatusState.READY
+    assert current.approval_current is True
+
+
+def test_terminal_status_replay_receives_exact_contract_constraint_and_revision_lineage(
+    tmp_path, monkeypatch
+):
+    import software_factory.build.status as status_module
+
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    repo.mkdir()
+    values, gate = _ready_lifecycle(repo, state)
+    _git_repo(repo)
+    revision = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    tree = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    publication = hashlib.sha256(
+        b"software-factory-publication-v1\0" + tree.encode("ascii")
+    ).hexdigest()
+    stored = ContractEnvelopeStore(repo).inspect(
+        repository=REPOSITORY, issue=ISSUE, policy_version="intent-v1"
+    )
+    design = DesignEnvelopeStore(state / "designs").read_current(
+        repository=REPOSITORY, issue=ISSUE
+    )
+    assert stored is not None and design is not None
+    constraint_digest = "c" * 64
+    previous_digest = "d" * 64
+    request_digest = "e" * 64
+    constrained = replace(
+        stored,
+        envelope=replace(
+            stored.envelope,
+            schema_version=3,
+            policy_version="intent-v2",
+            constraint_document={"schema_version": "synthetic-test-authority"},
+            constraint_digest=constraint_digest,
+            previous_contract_digest=previous_digest,
+            revision_request_digest=request_digest,
+        ),
+    )
+    tail = DecisionEvent(
+        event_schema_version=EVENT_SCHEMA_VERSION,
+        repository=REPOSITORY,
+        issue=ISSUE,
+        run_id="run-v2",
+        stage="final-disposition",
+        timestamp="2026-09-16T00:00:00Z",
+        artifact_digest=publication,
+        parent_digest=gate.envelope.gate_result_digest,
+        source_version=revision,
+        schema_version="lifecycle-v1",
+        policy_version="intent-v2",
+        sensor_version="deterministic-controller-v1",
+        config_version="lifecycle-v1",
+        findings=(),
+        proof_obligations=(),
+        authority="deterministic-controller",
+        rationale="Synthetic terminal event.",
+        disposition="SHIPPED",
+        rule="build.final-disposition",
+        constraint_digest=constraint_digest,
+        previous_contract_digest=previous_digest,
+        revision_request_digest=request_digest,
+    )
+    captured = {}
+
+    def capture(_history, authority):
+        captured["authority"] = authority
+        return SimpleNamespace(valid=True)
+
+    monkeypatch.setattr(status_module, "verify_published_lifecycle", capture)
+    assert status_module._terminal_is_complete(
+        (tail,),
+        repo_root=repo,
+        contract=constrained,
+        design=design,
+        gate=gate,
+        review_protocol="findings_v2",
+        review_sensors=(("judge", "opus", "general"),),
+        review_overrides=(),
+        review_revise_count=0,
+        review_restart_count=0,
+        review_revise_cap=2,
+        expected_review_artifact_fingerprint="f" * 64,
+        expected_contract_intent_authority="operator@example.test",
+        expected_terminal_disposition="SHIPPED",
+    )
+    authority = captured["authority"]
+    assert authority.policy_version == "intent-v2"
+    assert authority.constraint_digest == constraint_digest
+    assert authority.previous_contract_digest == previous_digest
+    assert authority.revision_request_digest == request_digest
 
 
 def test_pending_contract_stale_approval_remains_approval_pending(tmp_path):
@@ -366,25 +720,34 @@ def test_project_status_uses_supplied_trusted_capability_values_only(tmp_path):
     _git_repo(repo)
     before = _snapshot(tmp_path)
 
+    declarations = (
+        RunnerCapabilityDeclaration(
+            "runner-capability-v1",
+            "runner",
+            frozenset({Capability.MERGE_FORBIDDEN, Capability.DEPLOYMENT_FORBIDDEN}),
+        ),
+    )
+    observations = (
+        CapabilityObservation(
+            "capability-observation-v1",
+            "runner",
+            frozenset({Capability.MERGE_FORBIDDEN, Capability.DEPLOYMENT_FORBIDDEN}),
+            frozenset(),
+        ),
+    )
+    assessment = assess_capabilities(
+        declarations=declarations,
+        observations=observations,
+        required=frozenset(
+            {Capability.MERGE_FORBIDDEN, Capability.DEPLOYMENT_FORBIDDEN}
+        ),
+    )
+
     result = project_status(
         repository=REPOSITORY,
         repo_root=repo,
         state_root=state,
-        capability_declarations=(
-            RunnerCapabilityDeclaration(
-                "runner-capability-v1",
-                "runner",
-                frozenset({Capability.MERGE_FORBIDDEN, Capability.DEPLOYMENT_FORBIDDEN}),
-            ),
-        ),
-        capability_observations=(
-            CapabilityObservation(
-                "capability-observation-v1",
-                "runner",
-                frozenset({Capability.MERGE_FORBIDDEN, Capability.DEPLOYMENT_FORBIDDEN}),
-                frozenset(),
-            ),
-        ),
+        capability_assessment=capability_document(assessment),
         current_artifact_fingerprint="a" * 64,
     )
 
@@ -395,6 +758,84 @@ def test_project_status_uses_supplied_trusted_capability_values_only(tmp_path):
         "merge_forbidden",
     )
     assert _snapshot(tmp_path) == before
+
+
+def test_project_status_reconstructs_authenticated_v1_capability_records(tmp_path):
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    repo.mkdir()
+    _git_repo(repo)
+    capabilities = frozenset(
+        {Capability.MERGE_FORBIDDEN, Capability.DEPLOYMENT_FORBIDDEN}
+    )
+
+    result = project_status(
+        repository=REPOSITORY,
+        repo_root=repo,
+        state_root=state,
+        capability_declarations=(
+            RunnerCapabilityDeclaration("runner-capability-v1", "runner", capabilities),
+        ),
+        capability_observations=(
+            CapabilityObservation(
+                "capability-observation-v1",
+                "runner",
+                capabilities,
+                frozenset(),
+            ),
+        ),
+        current_artifact_fingerprint="a" * 64,
+    )
+
+    assert result.state is FactoryStatusState.READY
+    assert result.effective_capabilities == (
+        "deployment_forbidden",
+        "merge_forbidden",
+    )
+
+
+def test_project_status_consumes_provider_authority_without_v1_projection(tmp_path):
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    repo.mkdir()
+    _git_repo(repo)
+    values, assessment = _provider_gate_inputs()
+
+    result = project_status(
+        repository=REPOSITORY,
+        repo_root=repo,
+        state_root=state,
+        capability_assessment=capability_authority_document(assessment),
+        design_protocol="design_ir_v1",
+        design_config=values["design_config_document"],
+        current_artifact_fingerprint="a" * 64,
+    )
+
+    assert result.state is FactoryStatusState.READY
+    assert result.effective_capabilities == tuple(
+        sorted(capability.value for capability in assessment.effective)
+    )
+
+
+def test_project_status_rejects_hybrid_provider_authority(tmp_path):
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    repo.mkdir()
+    _git_repo(repo)
+    _values, assessment = _provider_gate_inputs()
+    hybrid = capability_authority_document(assessment)
+    hybrid["declared"] = []
+
+    result = project_status(
+        repository=REPOSITORY,
+        repo_root=repo,
+        state_root=state,
+        capability_assessment=hybrid,
+        design_protocol="design_ir_v1",
+        current_artifact_fingerprint="a" * 64,
+    )
+
+    assert result.state is FactoryStatusState.UNAVAILABLE
 
 
 def test_unsafe_contract_state_is_blocked_without_disclosing_paths(tmp_path):
@@ -433,6 +874,42 @@ def test_current_approved_passing_gate_is_ready_without_running_analyzers(tmp_pa
     assert result.gate_fresh is True
     assert result.approval_current is True
     assert result.finding_counts["total"] == 0
+    assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("policy_version", ("intent-v1", "intent-v2"))
+def test_policy_neutral_status_uses_authenticated_contract_policy_downstream(
+    tmp_path, policy_version
+):
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    repo.mkdir()
+    values, _gate = _ready_lifecycle(
+        repo, state, policy_version=policy_version
+    )
+    before = _snapshot(tmp_path)
+
+    result = issue_status(
+        repository=REPOSITORY,
+        issue=ISSUE,
+        repo_root=repo,
+        state_root=state,
+        policy_version=None,
+        capability_assessment=values["capability_document"],
+        design_config=values["design_config_document"],
+        current_artifact_fingerprint=values["expected_artifact_fingerprint"],
+    )
+
+    assert result.state is FactoryStatusState.READY
+    assert result.phase == "implementation"
+    assert result.approval_current is True
+    assert result.gate_fresh is True
+    if policy_version == "intent-v2":
+        stored = ContractEnvelopeStore(repo).inspect(
+            repository=REPOSITORY, issue=ISSUE, policy_version=None
+        )
+        assert stored is not None
+        assert result.artifact_digests["constraint"] == stored.envelope.constraint_digest
     assert _snapshot(tmp_path) == before
 
 
@@ -566,8 +1043,8 @@ def test_authority_change_during_repository_observation_never_returns_ready(tmp_
 
     def mutate(_root):
         DecisionLog(state / "decisions").append(
-            DecisionEvent(
-                1,
+                        DecisionEvent(
+                            EVENT_SCHEMA_VERSION,
                 REPOSITORY,
                 ISSUE,
                 "racing-run",
@@ -662,7 +1139,7 @@ def test_decision_append_during_publication_resolution_never_returns_complete(
         result = original(root, revision)
         DecisionLog(state / "decisions").append(
             DecisionEvent(
-                1,
+                EVENT_SCHEMA_VERSION,
                 REPOSITORY,
                 ISSUE,
                 "later-run",
@@ -747,7 +1224,7 @@ def test_every_status_authority_reader_rejects_special_files_without_blocking():
             if authority == "decision":
                 DecisionLog(state / "decisions").append(
                     DecisionEvent(
-                        1,
+                        EVENT_SCHEMA_VERSION,
                         REPOSITORY,
                         ISSUE,
                         "run",
@@ -829,6 +1306,31 @@ def test_capability_mismatch_makes_stored_pass_unavailable(tmp_path):
     assert result.gate_fresh is False
 
 
+def test_provider_capability_authority_replays_natively_for_current_gate(tmp_path):
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    repo.mkdir()
+    values, assessment = _provider_gate_inputs()
+    values, _gate = _ready_lifecycle(repo, state, values=values)
+
+    result = issue_status(
+        repository=REPOSITORY,
+        issue=ISSUE,
+        repo_root=repo,
+        state_root=state,
+        policy_version=values["policy_version"],
+        capability_assessment=capability_authority_document(assessment),
+        design_config=values["design_config_document"],
+        current_artifact_fingerprint=values["expected_artifact_fingerprint"],
+    )
+
+    assert result.state is FactoryStatusState.READY
+    assert result.gate_fresh is True
+    assert result.effective_capabilities == tuple(
+        sorted(capability.value for capability in assessment.effective)
+    )
+
+
 def test_blocking_gate_is_blocked_and_exposes_counts_only(tmp_path):
     repo = tmp_path / "repo"
     state = tmp_path / "state"
@@ -892,7 +1394,7 @@ def test_corrupt_decision_chain_is_blocked_even_when_gate_is_current(tmp_path):
     log = DecisionLog(state / "decisions")
     log.append(
         DecisionEvent(
-            event_schema_version=1,
+            event_schema_version=EVENT_SCHEMA_VERSION,
             repository=REPOSITORY,
             issue=ISSUE,
             run_id="run-1",
@@ -948,6 +1450,7 @@ def _append_completion_history(
     recorded_review_sensors: tuple[tuple[str, str, str], ...] | None = None,
     review_fingerprint: str | None = None,
     contract_intent_authority: str = "deterministic-policy",
+    terminal_disposition: str = "SHIPPED",
 ):
     revision = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "HEAD"],
@@ -977,7 +1480,7 @@ def _append_completion_history(
         if stage == omit_stage:
             return
         fields = {
-            "event_schema_version": 1,
+            "event_schema_version": EVENT_SCHEMA_VERSION,
             "repository": REPOSITORY,
             "issue": ISSUE,
             "run_id": "complete-run",
@@ -1201,7 +1704,7 @@ def _append_completion_history(
     )
     append(
         "final-disposition",
-        "SHIPPED",
+        terminal_disposition,
         publication,
         contract_digest,
         source_version=revision,
@@ -1262,6 +1765,282 @@ def test_complete_requires_replayed_terminal_binding_to_current_authority(tmp_pa
 
     assert result.state is FactoryStatusState.COMPLETE
     assert result.artifact_digests["publication"]
+
+
+def test_validated_completion_is_completed_not_promoted(tmp_path):
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    repo.mkdir()
+    values, gate = _ready_lifecycle(repo, state)
+    _git_repo(repo)
+    _append_completion_history(
+        repo, state, values, gate, terminal_disposition="VALIDATED"
+    )
+
+    result = issue_status(
+        repository=REPOSITORY,
+        issue=ISSUE,
+        repo_root=repo,
+        state_root=state,
+        policy_version=values["policy_version"],
+        capability_assessment=values["capability_document"],
+        design_config=values["design_config_document"],
+        current_artifact_fingerprint="0" * 64,
+        review_protocol="verdict_v1",
+        review_sensors=(("judge", "legacy", "general"),),
+    )
+
+    assert result.state is FactoryStatusState.BLOCKED
+    assert "publication" not in result.artifact_digests
+
+
+def test_validated_completion_requires_matching_promoted_operational_evidence(tmp_path):
+    from software_factory.core.design.gate import (
+        capability_authority_from_document,
+        capability_authority_sha256,
+    )
+
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    repo.mkdir()
+    values, gate = _ready_lifecycle(repo, state)
+    _git_repo(repo)
+    base_revision = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (repo / "product.py").write_text("validated = True\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "product.py"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.test",
+            "commit",
+            "-qm",
+            "validated product",
+        ],
+        check=True,
+    )
+    _append_completion_history(
+        repo, state, values, gate, terminal_disposition="VALIDATED"
+    )
+    revision = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    evidence = OperationalEvidence(
+        schema_version=OPERATIONAL_EVIDENCE_SCHEMA_VERSION,
+        repository=REPOSITORY,
+        issue=ISSUE,
+        disposition=OperationalDisposition.COMPLETED_NOT_PROMOTED,
+        contract_digest=values["contract_digest"],
+        design_digest=values["design_digest"],
+        gate_digest=gate.envelope.gate_result_digest,
+        capability_digest=capability_authority_sha256(
+            capability_authority_from_document(values["capability_document"])
+        ),
+        base_revision=base_revision,
+        implementation_revision=revision,
+        verification_passed=True,
+        secret_scan_passed=True,
+        remote_mutations_permitted=False,
+        references=(),
+        metrics={},
+        artifact_policy_digest=local_artifact_policy_sha256(
+            controller_roots=(".factory", ".superpowers", "contracts", "reviews"),
+            implementation_paths=("product.py",),
+        ),
+    )
+    OperationalEvidenceStore(state / "operational-evidence").put(evidence)
+
+    result = issue_status(
+        repository=REPOSITORY,
+        issue=ISSUE,
+        repo_root=repo,
+        state_root=state,
+        policy_version=values["policy_version"],
+        capability_assessment=values["capability_document"],
+        design_config=values["design_config_document"],
+        current_artifact_fingerprint="0" * 64,
+        review_protocol="verdict_v1",
+        review_sensors=(("judge", "legacy", "general"),),
+    )
+
+    assert result.state is FactoryStatusState.COMPLETED_NOT_PROMOTED
+    assert result.phase == "completed-not-promoted"
+    assert result.artifact_digests["publication"]
+    assert result.artifact_digests["operational_evidence"]
+
+    OperationalEvidenceStore(state / "operational-evidence").put(
+        replace(
+            evidence,
+            artifact_policy_digest=local_artifact_policy_sha256(
+                controller_roots=("src",),
+                implementation_paths=("product.py",),
+            ),
+        )
+    )
+    policy_mismatched = issue_status(
+        repository=REPOSITORY,
+        issue=ISSUE,
+        repo_root=repo,
+        state_root=state,
+        policy_version=values["policy_version"],
+        capability_assessment=values["capability_document"],
+        design_config=values["design_config_document"],
+        current_artifact_fingerprint="0" * 64,
+        review_protocol="verdict_v1",
+        review_sensors=(("judge", "legacy", "general"),),
+    )
+
+    assert policy_mismatched.state is FactoryStatusState.BLOCKED
+    assert "publication" not in policy_mismatched.artifact_digests
+
+    OperationalEvidenceStore(state / "operational-evidence").put(
+        replace(evidence, base_revision="f" * 40)
+    )
+    mismatched = issue_status(
+        repository=REPOSITORY,
+        issue=ISSUE,
+        repo_root=repo,
+        state_root=state,
+        policy_version=values["policy_version"],
+        capability_assessment=values["capability_document"],
+        design_config=values["design_config_document"],
+        current_artifact_fingerprint="0" * 64,
+        review_protocol="verdict_v1",
+        review_sensors=(("judge", "legacy", "general"),),
+    )
+
+    assert mismatched.state is FactoryStatusState.BLOCKED
+    assert "publication" not in mismatched.artifact_digests
+
+
+def test_validated_status_rejects_cross_store_transition_during_snapshot(
+    tmp_path, monkeypatch
+):
+    """Lifecycle/evidence pairs must come from one stable four-token snapshot."""
+    from software_factory.core.design.gate import (
+        capability_authority_from_document,
+        capability_authority_sha256,
+    )
+
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    repo.mkdir()
+    values, gate = _ready_lifecycle(repo, state)
+    _git_repo(repo)
+    base_revision = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (repo / "product.py").write_text("validated = True\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "product.py"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.test",
+            "commit",
+            "-qm",
+            "validated product",
+        ],
+        check=True,
+    )
+    _append_completion_history(
+        repo, state, values, gate, terminal_disposition="VALIDATED"
+    )
+    revision = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    completed = OperationalEvidence(
+        schema_version=OPERATIONAL_EVIDENCE_SCHEMA_VERSION,
+        repository=REPOSITORY,
+        issue=ISSUE,
+        disposition=OperationalDisposition.COMPLETED_NOT_PROMOTED,
+        contract_digest=values["contract_digest"],
+        design_digest=values["design_digest"],
+        gate_digest=gate.envelope.gate_result_digest,
+        capability_digest=capability_authority_sha256(
+            capability_authority_from_document(values["capability_document"])
+        ),
+        base_revision=base_revision,
+        implementation_revision=revision,
+        verification_passed=True,
+        secret_scan_passed=True,
+        remote_mutations_permitted=False,
+        references=(),
+        metrics={},
+        artifact_policy_digest=local_artifact_policy_sha256(
+            controller_roots=(".factory", ".superpowers", "contracts", "reviews"),
+            implementation_paths=("product.py",),
+        ),
+    )
+    store = OperationalEvidenceStore(state / "operational-evidence")
+    store.put(
+        replace(
+            completed,
+            disposition=OperationalDisposition.VERIFICATION_FAILED,
+            verification_passed=False,
+            secret_scan_passed=False,
+            artifact_policy_digest=None,
+        )
+    )
+    real_read = OperationalEvidenceStore.read_current
+    transitioned = False
+
+    def transition_between_tokens(self, *, repository, issue):
+        nonlocal transitioned
+        if not transitioned:
+            transitioned = True
+            log = DecisionLog(state / "decisions")
+            tail = log.read_verified(repository=REPOSITORY, issue=ISSUE)[-1]
+            log.append(
+                replace(
+                    tail,
+                    disposition="BLOCKED",
+                    rationale="Concurrent terminal transition.",
+                    previous_event_digest=None,
+                    event_digest=None,
+                )
+            )
+            OperationalEvidenceStore(state / "operational-evidence").put(completed)
+        return real_read(self, repository=repository, issue=issue)
+
+    monkeypatch.setattr(OperationalEvidenceStore, "read_current", transition_between_tokens)
+
+    result = issue_status(
+        repository=REPOSITORY,
+        issue=ISSUE,
+        repo_root=repo,
+        state_root=state,
+        policy_version=values["policy_version"],
+        capability_assessment=values["capability_document"],
+        design_config=values["design_config_document"],
+        current_artifact_fingerprint="0" * 64,
+        review_protocol="verdict_v1",
+        review_sensors=(("judge", "legacy", "general"),),
+    )
+
+    assert result.state is not FactoryStatusState.COMPLETED_NOT_PROMOTED
 
 
 def test_complete_rejects_event_derived_contract_intent_authority(tmp_path):
@@ -1346,6 +2125,302 @@ def test_status_rejects_operator_to_contract_author_downgrade(
     )
 
     assert result.state is expected_state
+
+
+def test_terminal_legacy_status_uses_historical_approval_without_current_evaluation(
+    tmp_path, monkeypatch
+):
+    import software_factory.build.status as status_module
+
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    repo.mkdir()
+    values = _human_owned_gate_inputs()
+    values, gate = _ready_lifecycle(repo, state, values=values, policy_version="intent-v1")
+    ApprovalStore(state / "approvals").approve(
+        ApprovalRecord(
+            1,
+            REPOSITORY,
+            ISSUE,
+            ArtifactKind.CONTRACT,
+            values["contract_digest"],
+            None,
+            "operator@example.test",
+            "2026-08-10T00:00:00Z",
+            "Reviewed exact historical Contract.",
+        )
+    )
+    _git_repo(repo)
+    _append_completion_history(
+        repo,
+        state,
+        values,
+        gate,
+        contract_intent_authority="operator@example.test",
+    )
+    evaluator_called = False
+
+    def reject_current_evaluation(*_args, **_kwargs):
+        nonlocal evaluator_called
+        evaluator_called = True
+        raise AssertionError("current intent evaluator must not inspect legacy authority")
+
+    monkeypatch.setattr(status_module, "evaluate_intent", reject_current_evaluation)
+    result = issue_status(
+        repository=REPOSITORY,
+        issue=ISSUE,
+        repo_root=repo,
+        state_root=state,
+        policy_version=None,
+        capability_assessment=values["capability_document"],
+        design_config=values["design_config_document"],
+        current_artifact_fingerprint="0" * 64,
+        review_protocol="verdict_v1",
+        review_sensors=(("judge", "legacy", "general"),),
+    )
+
+    assert result.state is FactoryStatusState.COMPLETE
+    assert evaluator_called is False
+
+
+def test_terminal_legacy_status_rechecks_exact_contract_approval_after_read(
+    tmp_path, monkeypatch
+):
+    import software_factory.build.status as status_module
+
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    repo.mkdir()
+    values = _human_owned_gate_inputs()
+    values, gate = _ready_lifecycle(repo, state, values=values, policy_version="intent-v1")
+    approvals = ApprovalStore(state / "approvals")
+    approvals.approve(
+        ApprovalRecord(
+            1,
+            REPOSITORY,
+            ISSUE,
+            ArtifactKind.CONTRACT,
+            values["contract_digest"],
+            None,
+            "operator@example.test",
+            "2026-08-10T00:00:00Z",
+            "Reviewed exact historical Contract.",
+        )
+    )
+    _git_repo(repo)
+    _append_completion_history(
+        repo,
+        state,
+        values,
+        gate,
+        contract_intent_authority="operator@example.test",
+    )
+    real_require = ApprovalStore.require
+    contract_swapped = False
+
+    def swap_contract_after_exact_read(self, **kwargs):
+        nonlocal contract_swapped
+        record = real_require(self, **kwargs)
+        if (
+            not contract_swapped
+            and kwargs["artifact_kind"] is ArtifactKind.CONTRACT
+            and kwargs["artifact_digest"] == values["contract_digest"]
+        ):
+            contract_swapped = True
+            self.approve(
+                replace(
+                    record,
+                    artifact_digest="f" * 64,
+                    rationale="Concurrent stale Contract approval.",
+                )
+            )
+        return record
+
+    def reject_current_evaluation(*_args, **_kwargs):
+        raise AssertionError("current intent evaluator must not inspect legacy authority")
+
+    monkeypatch.setattr(ApprovalStore, "require", swap_contract_after_exact_read)
+    monkeypatch.setattr(status_module, "evaluate_intent", reject_current_evaluation)
+    result = issue_status(
+        repository=REPOSITORY,
+        issue=ISSUE,
+        repo_root=repo,
+        state_root=state,
+        policy_version=None,
+        capability_assessment=values["capability_document"],
+        design_config=values["design_config_document"],
+        current_artifact_fingerprint="0" * 64,
+        review_protocol="verdict_v1",
+        review_sensors=(("judge", "legacy", "general"),),
+    )
+
+    assert contract_swapped is True
+    assert result.state is FactoryStatusState.UNAVAILABLE
+    assert result.phase == "authority"
+    assert "publication" not in result.artifact_digests
+
+
+@pytest.mark.parametrize("policy_version", ("intent-v1", "intent-v2"))
+@pytest.mark.parametrize(
+    ("approval_failure", "expected_state"),
+    (
+        ("revoked", FactoryStatusState.APPROVAL_PENDING),
+        ("stale", FactoryStatusState.APPROVAL_PENDING),
+        ("unreadable", FactoryStatusState.UNAVAILABLE),
+        ("recursive", FactoryStatusState.BLOCKED),
+        ("large_integer", FactoryStatusState.BLOCKED),
+    ),
+)
+def test_nonterminal_human_owned_status_fails_closed_when_contract_approval_changes(
+    tmp_path, monkeypatch, policy_version, approval_failure, expected_state
+):
+    import software_factory.build.status as status_module
+
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    repo.mkdir()
+    values = _human_owned_gate_inputs()
+    values, _gate = _ready_lifecycle(
+        repo,
+        state,
+        values=values,
+        policy_version=policy_version,
+    )
+    stored = ContractEnvelopeStore(repo).inspect(
+        repository=REPOSITORY,
+        issue=ISSUE,
+        policy_version=None,
+    )
+    assert stored is not None
+    parent_digest = (
+        stored.envelope.constraint_digest if policy_version == "intent-v2" else None
+    )
+    approval = ApprovalRecord(
+        1,
+        REPOSITORY,
+        ISSUE,
+        ArtifactKind.CONTRACT,
+        values["contract_digest"],
+        parent_digest,
+        "operator@example.test",
+        "2026-08-10T00:00:00Z",
+        "Reviewed exact Contract authority.",
+    )
+    approvals = ApprovalStore(state / "approvals")
+    approvals.approve(approval)
+    if approval_failure == "revoked":
+        filename = approvals._filename_for(REPOSITORY, ISSUE, ArtifactKind.CONTRACT)
+        (approvals.root / filename).unlink()
+    elif approval_failure == "stale":
+        approvals.approve(replace(approval, artifact_digest="f" * 64))
+    elif approval_failure == "unreadable":
+        real_require = ApprovalStore.require
+
+        def unreadable_contract(self, **kwargs):
+            if kwargs["artifact_kind"] is ArtifactKind.CONTRACT:
+                raise ApprovalError(
+                    "SECRET unreadable approval path",
+                    kind=AuthorityFailureKind.UNREADABLE_RUNTIME,
+                )
+            return real_require(self, **kwargs)
+
+        monkeypatch.setattr(ApprovalStore, "require", unreadable_contract)
+    elif approval_failure == "recursive":
+        filename = approvals._filename_for(REPOSITORY, ISSUE, ArtifactKind.CONTRACT)
+        raw = (
+            b'{"SECRET-DEEP-APPROVAL":'
+            + (b"[" * 10_000)
+            + b"0"
+            + (b"]" * 10_000)
+            + b"}"
+        )
+        assert len(raw) < 1024 * 1024
+        (approvals.root / filename).write_bytes(raw)
+    else:
+        filename = approvals._filename_for(REPOSITORY, ISSUE, ArtifactKind.CONTRACT)
+        raw = b'{"SECRET-LARGE-INTEGER":' + (b"9" * 10_000) + b"}"
+        assert len(raw) < 1024 * 1024
+        (approvals.root / filename).write_bytes(raw)
+
+    if policy_version == "intent-v1":
+        monkeypatch.setattr(
+            status_module,
+            "evaluate_intent",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("current intent evaluator must not inspect legacy authority")
+            ),
+        )
+    result = issue_status(
+        repository=REPOSITORY,
+        issue=ISSUE,
+        repo_root=repo,
+        state_root=state,
+        policy_version=None,
+        capability_assessment=values["capability_document"],
+        design_config=values["design_config_document"],
+        current_artifact_fingerprint=values["expected_artifact_fingerprint"],
+    )
+
+    assert result.state is expected_state
+    assert result.phase == "approval"
+    assert result.approval_current is False
+    assert "publication" not in result.artifact_digests
+    assert "SECRET" not in json.dumps(status_document(result))
+
+
+@pytest.mark.parametrize("approval_variant", ("absent", "stale"))
+def test_terminal_human_owned_legacy_status_requires_exact_null_parent_approval(
+    tmp_path, monkeypatch, approval_variant
+):
+    import software_factory.build.status as status_module
+
+    repo = tmp_path / "repo"
+    state = tmp_path / "state"
+    repo.mkdir()
+    values = _human_owned_gate_inputs()
+    values, gate = _ready_lifecycle(repo, state, values=values, policy_version="intent-v1")
+    if approval_variant == "stale":
+        ApprovalStore(state / "approvals").approve(
+            ApprovalRecord(
+                1,
+                REPOSITORY,
+                ISSUE,
+                ArtifactKind.CONTRACT,
+                "f" * 64,
+                None,
+                "operator@example.test",
+                "2026-08-10T00:00:00Z",
+                "Approval for a different historical Contract.",
+            )
+        )
+    _git_repo(repo)
+    _append_completion_history(
+        repo,
+        state,
+        values,
+        gate,
+        contract_intent_authority="deterministic-policy",
+    )
+
+    def reject_current_evaluation(*_args, **_kwargs):
+        raise AssertionError("current intent evaluator must not inspect legacy authority")
+
+    monkeypatch.setattr(status_module, "evaluate_intent", reject_current_evaluation)
+    result = issue_status(
+        repository=REPOSITORY,
+        issue=ISSUE,
+        repo_root=repo,
+        state_root=state,
+        policy_version=None,
+        capability_assessment=values["capability_document"],
+        design_config=values["design_config_document"],
+        current_artifact_fingerprint="0" * 64,
+        review_protocol="verdict_v1",
+        review_sensors=(("judge", "legacy", "general"),),
+    )
+
+    assert result.state is FactoryStatusState.BLOCKED
+    assert "publication" not in result.artifact_digests
 
 
 @pytest.mark.parametrize(

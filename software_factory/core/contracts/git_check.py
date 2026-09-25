@@ -63,6 +63,22 @@ def contract_precedes_implementation(
     return (False, f"implementation (commit {ii}) precedes the contract (commit {ci})")
 
 
+def commits_from_log(output: str) -> list[dict]:
+    """Parse the argument-array Git log format used by workspace adapters."""
+    if type(output) is not str:
+        raise TypeError("Git log output must be text")
+    commits: list[dict] = []
+    for raw in output.split("\x00"):
+        block = raw.strip()
+        if not block:
+            continue
+        lines = block.splitlines()
+        commits.append(
+            {"sha": lines[0], "paths": [line for line in lines[1:] if line.strip()]}
+        )
+    return commits
+
+
 def commits_from_git(repo_dir: str, base_ref: str, head_ref: str = "HEAD") -> list[dict]:
     """Build the oldest->newest commit/path list for ``base_ref..head_ref``
     (live git I/O; the pure check above is what's unit-tested)."""
@@ -77,11 +93,4 @@ def commits_from_git(repo_dir: str, base_ref: str, head_ref: str = "HEAD") -> li
         text=True,
         check=True,
     ).stdout
-    commits: list[dict] = []
-    for raw in out.split("\x00"):
-        block = raw.strip()
-        if not block:
-            continue
-        lines = block.splitlines()
-        commits.append({"sha": lines[0], "paths": [ln for ln in lines[1:] if ln.strip()]})
-    return commits
+    return commits_from_log(out)

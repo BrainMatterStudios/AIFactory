@@ -391,7 +391,9 @@ def test_contract_lifecycle_dispatches_and_records_in_trust_boundary_order(tmp_p
                 target.parent.mkdir(parents=True, exist_ok=True)
                 import json
 
-                target.write_text(json.dumps(_valid_v2()) + "\n", encoding="utf-8")
+                document = _valid_v2()
+                document["repo"] = "example/repo"
+                target.write_text(json.dumps(document) + "\n", encoding="utf-8")
             elif system == "implementer":
                 events.append("implementer")
                 Path(cwd, "feature.py").write_text("implemented = True\n", encoding="utf-8")
@@ -413,7 +415,7 @@ def test_contract_lifecycle_dispatches_and_records_in_trust_boundary_order(tmp_p
         signals={"source": "bug"},
         require_contract=True,
         contracts_dir="contracts",
-        repository="example-repo",
+        repository="example/repo",
         repo_root=str(repo),
         approval_store=ApprovalStore(tmp_path / "controller-approvals"),
         decision_log=decisions,
@@ -433,7 +435,21 @@ def test_contract_lifecycle_dispatches_and_records_in_trust_boundary_order(tmp_p
         "commit",
         "push",
     ]
-    history = decisions.read_verified(repository="example-repo", issue="7")
+    history = decisions.read_verified(repository="example/repo", issue="7")
+    assert all(event.event_schema_version == 2 for event in history)
+    contract_events = [
+        event for event in history if event.stage in {"contract", "contract-outcome"}
+    ]
+    constraint_digests = {event.constraint_digest for event in contract_events}
+    assert len(constraint_digests) == 1
+    assert None not in constraint_digests
+    assert all(
+        event.constraint_digest is None
+        for event in history
+        if event.stage not in {"contract", "contract-outcome"}
+    )
+    assert all(event.previous_contract_digest is None for event in history)
+    assert all(event.revision_request_digest is None for event in history)
     stages = [event.stage for event in history]
     assert stages == [
         "contract",
@@ -493,7 +509,9 @@ def test_publication_rejects_operator_to_contract_author_downgrade(tmp_path):
             if prompt.startswith("ROLE=contract-author"):
                 target = Path(cwd, "contracts", "7.json")
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(json.dumps(_valid_v2(human_owned=True)) + "\n", encoding="utf-8")
+                document = _valid_v2(human_owned=True)
+                document["repo"] = "example/repo"
+                target.write_text(json.dumps(document) + "\n", encoding="utf-8")
             elif system == "implementer":
                 Path(cwd, "feature.py").write_text("implemented = True\n", encoding="utf-8")
             elif system == "judge":
@@ -512,7 +530,7 @@ def test_publication_rejects_operator_to_contract_author_downgrade(tmp_path):
         "signals": {"source": "bug"},
         "require_contract": True,
         "contracts_dir": "contracts",
-        "repository": "example-repo",
+        "repository": "example/repo",
         "repo_root": str(repo),
         "approval_store": approvals,
         "decision_log": decisions,
@@ -535,11 +553,11 @@ def test_publication_rejects_operator_to_contract_author_downgrade(tmp_path):
     approvals.approve(
         ApprovalRecord(
             schema_version=APPROVAL_SCHEMA_VERSION,
-            repository="example-repo",
+            repository="example/repo",
             issue="7",
             artifact_kind=ArtifactKind.CONTRACT,
             artifact_digest=first.artifact_digest,
-            parent_digest=None,
+            parent_digest=first.parent_digest,
             approver="operator@example.invalid",
             approved_at="2026-08-05T12:05:00Z",
             rationale="Approved the exact contract",
@@ -583,6 +601,7 @@ def test_exact_pending_contract_resumes_without_a_second_author_turn(tmp_path):
             if prompt.startswith("ROLE=contract-author"):
                 author_turns += 1
                 document = _valid_v2(human_owned=True)
+                document["repo"] = "example/repo"
                 document["generated_at"] = f"2026-08-05T10:00:0{author_turns}Z"
                 document["intent"]["summary"] += f" (author turn {author_turns})"
                 target = Path(cwd, "contracts", "7.json")
@@ -607,7 +626,7 @@ def test_exact_pending_contract_resumes_without_a_second_author_turn(tmp_path):
         "signals": {"source": "bug"},
         "require_contract": True,
         "contracts_dir": "contracts",
-        "repository": "example-repo",
+        "repository": "example/repo",
         "repo_root": str(repo),
         "approval_store": approvals,
         "decision_log": decisions,
@@ -642,11 +661,11 @@ def test_exact_pending_contract_resumes_without_a_second_author_turn(tmp_path):
     approvals.approve(
         ApprovalRecord(
             schema_version=APPROVAL_SCHEMA_VERSION,
-            repository="example-repo",
+            repository="example/repo",
             issue="7",
             artifact_kind=ArtifactKind.CONTRACT,
             artifact_digest=expected_digest,
-            parent_digest=None,
+            parent_digest=first.parent_digest,
             approver="operator@example.invalid",
             approved_at="2026-08-05T12:05:00Z",
             rationale="Approved the exact first-run contract",
@@ -692,7 +711,7 @@ def test_exact_pending_contract_resumes_without_a_second_author_turn(tmp_path):
     assert accepted["contract_text"].encode("utf-8") == first_contract_bytes
     assert accepted["artifact_digest"] == expected_digest
 
-    history = decisions.read_verified(repository="example-repo", issue="7")
+    history = decisions.read_verified(repository="example/repo", issue="7")
     resumed = [event for event in history if event.run_id == "run-contract-pending-2"]
     contract = next(event for event in resumed if event.stage == "contract")
     contract_outcome = next(event for event in resumed if event.stage == "contract-outcome")
@@ -725,6 +744,7 @@ def test_accepted_contract_survives_a_downstream_block_and_resumes_a_third_run(
             if prompt.startswith("ROLE=contract-author"):
                 author_turns += 1
                 document = _valid_v2(human_owned=True)
+                document["repo"] = "example/repo"
                 document["tier"] = "T2"
                 target = Path(cwd, "contracts", "7.json")
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -740,7 +760,7 @@ def test_accepted_contract_survives_a_downstream_block_and_resumes_a_third_run(
         "dev_branch": "develop",
         "signals": {"source": "feature", "files_changed": 12, "lines_changed": 800},
         "require_contract": True,
-        "repository": "example-repo",
+        "repository": "example/repo",
         "repo_root": str(repo),
         "approval_store": approvals,
         "decision_log": decisions,
@@ -763,7 +783,7 @@ def test_accepted_contract_survives_a_downstream_block_and_resumes_a_third_run(
         json.dumps(
             {
                 "schema_version": 1,
-                "repository": "example-repo",
+                "repository": "example/repo",
                 "issue": "7",
                 "plan": stale_plan,
                 "artifact_digest": hashlib.sha256(stale_plan.encode()).hexdigest(),
@@ -779,11 +799,11 @@ def test_accepted_contract_survives_a_downstream_block_and_resumes_a_third_run(
     approvals.approve(
         ApprovalRecord(
             schema_version=APPROVAL_SCHEMA_VERSION,
-            repository="example-repo",
+            repository="example/repo",
             issue="7",
             artifact_kind=ArtifactKind.CONTRACT,
             artifact_digest=first.artifact_digest,
-            parent_digest=None,
+            parent_digest=first.parent_digest,
             approver="operator@example.invalid",
             approved_at="2026-08-05T13:05:00Z",
             rationale="Approve only the exact contract",

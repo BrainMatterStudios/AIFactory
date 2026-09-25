@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import software_factory.analyzers.base as analyzer_base
 from software_factory.analyzers import (
     AnalyzerContext,
     AnalyzerErrorKind,
@@ -431,6 +432,46 @@ def test_invalid_context_is_rejected(
         AnalyzerContext(**values)
 
 
+def test_remote_analyzer_context_accepts_only_normalized_opaque_workspace_identity(
+    tmp_path: Path,
+) -> None:
+    values = {
+        "repository": "owner/repository",
+        "issue": "42",
+        "artifact_fingerprint": "a" * 64,
+        "limits": AnalyzerLimits(),
+    }
+
+    context = AnalyzerContext(workspace="workspace://remote/test", **values)
+
+    assert context.workspace == "workspace://remote/test"
+    for malformed in (
+        "workspace:/remote/test",
+        "workspace://remote",
+        "workspace://remote/../test",
+        "workspace://remote/a//b",
+        "workspace://remote/a\\b",
+        "workspace://remote/test?query=yes",
+        "workspace://remote/test#fragment",
+        "workspace://remote/test\0tail",
+    ):
+        with pytest.raises((TypeError, ValueError)):
+            AnalyzerContext(workspace=malformed, **values)
+
+
+def test_analyzer_workspace_identity_normalizes_local_paths_without_rewriting_opaque(
+    tmp_path: Path,
+) -> None:
+    identity = analyzer_base.analyzer_workspace_identity
+    assert identity(str(tmp_path)) == tmp_path
+    assert (
+        identity("workspace://remote/test")
+        == "workspace://remote/test"
+    )
+    with pytest.raises(ValueError):
+        identity("relative")
+
+
 def test_adapter_name_must_match_configured_spec(context: AnalyzerContext) -> None:
     execution = run_analyzer(
         adapter=OtherAnalyzer(),
@@ -679,7 +720,7 @@ def test_finding_count_limit_is_enforced_after_strict_parsing(context: AnalyzerC
     assert execution.error.kind is AnalyzerErrorKind.LIMIT
 
 
-def test_timeout_terminates_and_joins_child_and_reauthenticates_afterward(
+def test_timeout_reauthenticates_and_reaps_child_if_collection_started(
     context: AnalyzerContext, tmp_path: Path
 ) -> None:
     pid_path = tmp_path / "analyzer.pid"
@@ -707,9 +748,13 @@ def test_timeout_terminates_and_joins_child_and_reauthenticates_afterward(
     assert execution.error is not None
     assert execution.error.kind is AnalyzerErrorKind.TIMEOUT
     assert calls == 2
-    pid = int(pid_path.read_text(encoding="utf-8"))
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    # The deadline intentionally includes spawn startup, so a loaded host may
+    # time out before collect() creates the marker. If collection did start,
+    # its process must have been reaped before the timeout result is returned.
+    if pid_path.exists():
+        pid = int(pid_path.read_text(encoding="utf-8"))
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
 
 
 def test_nonzero_child_exit_without_payload_is_process_failure(

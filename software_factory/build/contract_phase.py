@@ -4,28 +4,49 @@ The model authors one data artifact. This controller owns every authoritative
 decision after that turn: Git boundary enforcement, strict parsing, policy,
 hash-bound approval, checkpointing, and durable evidence.
 """
+
 from __future__ import annotations
 
 import json
-import os
-import secrets
-import subprocess
 import warnings
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from enum import Enum
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 from typing import Any
 
 from software_factory.adapters.base import Issue, RunnerAdapter
-from software_factory.build.briefs import contract_author_brief
+from software_factory.build.briefs import contract_author_brief, contract_revision_brief
+from software_factory.build.contract_constraints import (
+    CONTRACT_POLICY_VERSION,
+    ContractConstraintError,
+    validate_contract_constraints,
+)
+from software_factory.build.contract_revision import (
+    ContractRevisionError,
+    validate_revision_request,
+)
 from software_factory.build.contract_store import (
     ContractEnvelope,
     ContractEnvelopeStore,
     ContractStoreError,
+    StoredContractRevision,
 )
-from software_factory.build.workspace import Workspace
-from software_factory.core.approvals import ApprovalError, ApprovalStore, ArtifactKind
+from software_factory.build.workspace import (
+    Workspace,
+    workspace_file_state,
+    workspace_read_file,
+    workspace_read_file_at,
+    workspace_remove_file,
+    workspace_write_file,
+)
+from software_factory.core.approvals import (
+    ApprovalError,
+    ApprovalRecord,
+    ApprovalStore,
+    ArtifactKind,
+)
+from software_factory.core.authority import AuthorityFailureKind
 from software_factory.core.contracts import (
     IntentDisposition,
     ProofObligation,
@@ -41,12 +62,14 @@ from software_factory.trace.decisions import (
     DecisionEvent,
     DecisionLog,
 )
-from software_factory.trace.redact import redact
 
 CONTRACT_AUTHOR_MODEL = "opus"
 CONTRACT_AUTHOR_TOOLS = ("Read", "Grep", "Glob", "LS", "Write")
-_NOFOLLOW = getattr(os, "O_NOFOLLOW", None)
-_DIRECTORY = getattr(os, "O_DIRECTORY", None)
+_MAX_CONTRACT_BYTES = 2 * 1024 * 1024
+_CONTRACT_ACCEPTED = "contract-accepted"
+_CONTRACT_APPROVAL_PENDING = "contract-approval-pending"
+_CONTRACT_EXTERNAL_FAILURE = "contract-external-failure"
+_CONTRACT_SPEC_PENDING = "contract-spec-pending"
 
 
 @dataclass(frozen=True)
@@ -60,10 +83,14 @@ class ContractPhaseResult:
     contract_digest: str | None
     checkpoint_sha: str | None
     policy_version: str
+    constraint_digest: str | None
+    previous_contract_digest: str | None
+    revision_request_digest: str | None
     findings: tuple[CheckResult, ...]
     proof_obligations: tuple[ProofObligation, ...]
     requires_approval: bool
     keep_workspace: bool
+    approval_record: ApprovalRecord | None = None
 
 
 def _result(
@@ -75,10 +102,14 @@ def _result(
     contract_digest: str | None = None,
     checkpoint_sha: str | None = None,
     policy_version: str = POLICY_VERSION,
+    constraint_digest: str | None = None,
+    previous_contract_digest: str | None = None,
+    revision_request_digest: str | None = None,
     findings: tuple[CheckResult, ...] = (),
     proof_obligations: tuple[ProofObligation, ...] = (),
     requires_approval: bool = False,
     keep_workspace: bool = False,
+    approval_record: ApprovalRecord | None = None,
 ) -> ContractPhaseResult:
     return ContractPhaseResult(
         disposition=disposition,
@@ -88,10 +119,14 @@ def _result(
         contract_digest=contract_digest,
         checkpoint_sha=checkpoint_sha,
         policy_version=policy_version,
+        constraint_digest=constraint_digest,
+        previous_contract_digest=previous_contract_digest,
+        revision_request_digest=revision_request_digest,
         findings=findings,
         proof_obligations=proof_obligations,
         requires_approval=requires_approval,
         keep_workspace=keep_workspace,
+        approval_record=approval_record,
     )
 
 
@@ -114,109 +149,35 @@ def _contract_path(contracts_dir: str, issue_id: str) -> str:
     return str(directory / f"{issue_id}.json")
 
 
-def _safe_paths(paths: list[str]) -> str:
-    """Render bounded, single-line, secret-scrubbed diagnostic path evidence."""
-    rendered = []
-    for path in paths:
-        safe = redact(path).encode("unicode_escape").decode("ascii")
-        rendered.append(safe[:200])
-    return ", ".join(rendered)
-
-
-def _git_status(worktree: Path, contract_path: str) -> bytes:
-    result = subprocess.run(
-        ["git", "status", "--porcelain=v1", "-z", "--", contract_path],
-        cwd=worktree,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError("contract draft status is unreadable")
-    return result.stdout
-
-
-def _clear_stale_contract_draft(worktree: Path, contract_path: str) -> None:
+def _clear_stale_contract_draft(workspace: Workspace, contract_path: str) -> None:
     """Discard only an uncommitted draft; leave any HEAD contract untouched."""
-    status = _git_status(worktree, contract_path)
-    if not status:
+    state = workspace_file_state(workspace, contract_path)
+    try:
+        committed = workspace_read_file_at(
+            workspace, "HEAD", contract_path, max_bytes=_MAX_CONTRACT_BYTES
+        )
+    except FileNotFoundError:
+        if state.kind == "absent":
+            return
+        if state.kind not in {"regular", "symlink"}:
+            raise RuntimeError("stale contract draft is not a safe file") from None
+        workspace_remove_file(workspace, contract_path)
         return
-    tracked = subprocess.run(
-        ["git", "ls-files", "--error-unmatch", "--", contract_path],
-        cwd=worktree,
-        capture_output=True,
-        check=False,
-    ).returncode == 0
-    path = worktree / contract_path
-    if not tracked:
-        if path.is_symlink() or path.is_file():
-            path.unlink()
-        elif path.exists():
-            raise RuntimeError("stale contract draft is not a regular file")
+    if state.kind == "absent":
+        workspace_write_file(workspace, contract_path, committed)
         return
-    restored = subprocess.run(
-        ["git", "restore", "--source=HEAD", "--staged", "--worktree", "--", contract_path],
-        cwd=worktree,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if restored.returncode != 0:
-        raise RuntimeError("stale contract draft could not be cleared")
+    if state.kind != "regular":
+        raise RuntimeError("stale contract draft is not a regular file")
+    current = workspace_read_file(workspace, contract_path, max_bytes=_MAX_CONTRACT_BYTES)
+    if current != committed:
+        workspace_write_file(workspace, contract_path, committed)
 
 
 def _materialize_pending_contract(
-    worktree: Path, contract_path: str, contract_text: str
+    workspace: Workspace, contract_path: str, contract_text: str
 ) -> None:
-    """Write stored bytes through pinned directories without following links."""
-    if not _NOFOLLOW or not _DIRECTORY or os.open not in os.supports_dir_fd:
-        raise RuntimeError("secure contract materialization is unavailable")
-    parts = PurePosixPath(contract_path).parts
-    parent: int | None = None
-    temporary: str | None = None
-    descriptor: int | None = None
-    try:
-        parent = os.open(worktree, os.O_RDONLY | _DIRECTORY | _NOFOLLOW)
-        for part in parts[:-1]:
-            try:
-                os.mkdir(part, 0o755, dir_fd=parent)
-            except FileExistsError:
-                pass
-            child = os.open(part, os.O_RDONLY | _DIRECTORY | _NOFOLLOW, dir_fd=parent)
-            os.close(parent)
-            parent = child
-        for _ in range(20):
-            temporary = f".{parts[-1]}.{secrets.token_hex(16)}.tmp"
-            try:
-                descriptor = os.open(
-                    temporary,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW,
-                    0o600,
-                    dir_fd=parent,
-                )
-            except FileExistsError:
-                continue
-            break
-        if descriptor is None or temporary is None:
-            raise RuntimeError("pending contract temporary file cannot be created")
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb") as destination:
-            descriptor = None
-            destination.write(contract_text.encode("utf-8"))
-            destination.flush()
-            os.fsync(destination.fileno())
-        os.replace(temporary, parts[-1], src_dir_fd=parent, dst_dir_fd=parent)
-        temporary = None
-        os.fsync(parent)
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        if temporary is not None and parent is not None:
-            try:
-                os.unlink(temporary, dir_fd=parent)
-            except (FileNotFoundError, NotImplementedError, OSError, TypeError):
-                pass
-        if parent is not None:
-            os.close(parent)
+    """Write exact stored bytes through the workspace transport."""
+    workspace_write_file(workspace, contract_path, contract_text.encode("utf-8"))
 
 
 def _strict_contract(raw: bytes) -> tuple[str, dict[str, Any]]:
@@ -240,40 +201,45 @@ def _strict_contract(raw: bytes) -> tuple[str, dict[str, Any]]:
             parse_constant=reject_non_json_constant,
             object_pairs_hook=unique_object,
         )
-    except (UnicodeError, ValueError) as exc:
+    except (UnicodeError, ValueError, RecursionError) as exc:
         raise ValueError("contract artifact is unreadable") from exc
     if type(document) is not dict:
         raise ValueError("contract artifact must be a JSON object")
     try:
         canonical_json_bytes(document)
-    except (TypeError, ValueError, UnicodeError) as exc:
+    except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
         raise ValueError("contract artifact is not finite canonical JSON") from exc
     return text, document
 
 
-def _read_contract(path: Path) -> tuple[bytes, str, dict[str, Any]]:
+def _read_contract(workspace: Workspace, contract_path: str) -> tuple[bytes, str, dict[str, Any]]:
     try:
-        raw = path.read_bytes()
-    except OSError as exc:
+        if workspace_file_state(workspace, contract_path).kind != "regular":
+            raise ValueError("contract artifact is not a regular file")
+        raw = workspace_read_file(workspace, contract_path, max_bytes=_MAX_CONTRACT_BYTES)
+    except (OSError, RuntimeError) as exc:
         raise ValueError("contract artifact is unreadable") from exc
     text, document = _strict_contract(raw)
     return raw, text, document
 
 
 def _git_contract_blob(
-    worktree: Path, revision: str, contract_path: str, *, absent_ok: bool = False
+    workspace: Workspace,
+    revision: str,
+    contract_path: str,
+    *,
+    absent_ok: bool = False,
 ) -> bytes | None:
-    result = subprocess.run(
-        ["git", "show", f"{revision}:{contract_path}"],
-        cwd=worktree,
-        capture_output=True,
-        check=False,
-    )
-    if result.returncode != 0:
+    try:
+        return workspace_read_file_at(
+            workspace, revision, contract_path, max_bytes=_MAX_CONTRACT_BYTES
+        )
+    except FileNotFoundError:
         if absent_ok:
             return None
-        raise ValueError("checkpoint contract blob is unreadable")
-    return result.stdout
+        raise ValueError("checkpoint contract blob is unreadable") from None
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
+        raise ValueError("checkpoint contract blob is unreadable") from error
 
 
 def _validate_without_deprecation_warning(document: dict[str, Any]):
@@ -320,6 +286,10 @@ def _append_decision(
     obligations: tuple[ProofObligation, ...],
     authority: str,
     rationale: str,
+    policy_version: str,
+    constraint_digest: str | None,
+    previous_contract_digest: str | None,
+    revision_request_digest: str | None,
 ) -> None:
     decision_log.append(
         DecisionEvent(
@@ -330,18 +300,33 @@ def _append_decision(
             stage="contract",
             timestamp=timestamp,
             artifact_digest=digest,
-            parent_digest=None,
+            parent_digest=(
+                constraint_digest if policy_version == CONTRACT_POLICY_VERSION else None
+            ),
             source_version=checkpoint,
             schema_version=str(schema_version),
-            policy_version=POLICY_VERSION,
+            policy_version=policy_version,
             sensor_version="contract-author-v1",
-            config_version="contract-phase-v1",
+            config_version=(
+                "contract-phase-v3"
+                if policy_version == CONTRACT_POLICY_VERSION
+                else "contract-phase-v1"
+            ),
             findings=tuple(_finding_data(finding) for finding in findings),
             proof_obligations=tuple(_obligation_data(item) for item in obligations),
             authority=authority,
             rationale=rationale,
             disposition=IntentDisposition.PASS.value,
             rule="contract.intent",
+            constraint_digest=(
+                constraint_digest if policy_version == CONTRACT_POLICY_VERSION else None
+            ),
+            previous_contract_digest=(
+                previous_contract_digest if policy_version == CONTRACT_POLICY_VERSION else None
+            ),
+            revision_request_digest=(
+                revision_request_digest if policy_version == CONTRACT_POLICY_VERSION else None
+            ),
         )
     )
 
@@ -350,6 +335,7 @@ def run_contract_phase(
     issue: Issue,
     *,
     repository: str,
+    tier: str,
     runner: RunnerAdapter,
     workspace: Workspace,
     contracts_dir: str,
@@ -357,52 +343,189 @@ def run_contract_phase(
     decision_log: DecisionLog,
     run_id: str,
     timestamp: str,
+    constraint_document: Mapping[str, Any],
+    constraint_digest: str,
     contract_author_role: str = "contract-author",
     pending_contract: ContractEnvelope | None = None,
+    revision_request: (StoredContractRevision | tuple[StoredContractRevision, ...] | None) = None,
 ) -> ContractPhaseResult:
     """Author, admit, checkpoint, and record one contract before implementation."""
-    if not isinstance(contract_author_role, str) or not contract_author_role.strip():
-        return _result(IntentDisposition.BLOCKED, "Contract-author role is invalid")
     try:
-        contract_path = _contract_path(contracts_dir, issue.id)
-    except (TypeError, ValueError):
-        return _result(IntentDisposition.BLOCKED, "Contract artifact identity is invalid")
+        normalized_constraints = validate_contract_constraints(
+            constraint_document,
+            repository=repository,
+            issue=issue.id,
+        )
+        if (
+            type(constraint_digest) is not str
+            or artifact_sha256(normalized_constraints) != constraint_digest
+        ):
+            raise ContractConstraintError()
+    except (ContractConstraintError, TypeError, ValueError, UnicodeError):
+        return _result(IntentDisposition.BLOCKED, "contract-constraints-invalid")
+
+    if isinstance(revision_request, tuple):
+        if len(revision_request) != 1:
+            return _result(
+                IntentDisposition.BLOCKED,
+                "contract-revision-conflict",
+                constraint_digest=constraint_digest,
+                keep_workspace=True,
+            )
+        revision_request = revision_request[0]
+    if revision_request is not None:
+        if not isinstance(revision_request, StoredContractRevision):
+            return _result(
+                IntentDisposition.BLOCKED,
+                "contract-revision-store-unavailable",
+                constraint_digest=constraint_digest,
+                keep_workspace=True,
+            )
+        try:
+            validated_revision = validate_revision_request(
+                revision_request.request,
+                repository=repository,
+                issue=issue.id,
+            )
+        except ContractRevisionError:
+            return _result(
+                IntentDisposition.BLOCKED,
+                "contract-revision-store-unavailable",
+                constraint_digest=constraint_digest,
+                keep_workspace=True,
+            )
+        if validated_revision != revision_request.request:
+            return _result(
+                IntentDisposition.BLOCKED,
+                "contract-revision-store-unavailable",
+                constraint_digest=constraint_digest,
+                keep_workspace=True,
+            )
+        revision_request = StoredContractRevision(
+            request=validated_revision,
+            device=revision_request.device,
+            inode=revision_request.inode,
+        )
+
+    if revision_request is not None and pending_contract is None:
+        return _result(
+            IntentDisposition.BLOCKED,
+            "contract-revision-absent",
+            constraint_digest=constraint_digest,
+            keep_workspace=True,
+        )
 
     if pending_contract is not None:
+        if (
+            pending_contract.schema_version != 3
+            or pending_contract.policy_version != CONTRACT_POLICY_VERSION
+        ):
+            return _result(
+                IntentDisposition.BLOCKED,
+                (
+                    "contract-revision-stale"
+                    if revision_request is not None
+                    else "contract-constraints-stale"
+                ),
+                constraint_digest=constraint_digest,
+                keep_workspace=True,
+            )
         try:
             ContractEnvelopeStore.validate(
                 pending_contract,
                 repository=repository,
                 issue=issue.id,
-                policy_version=POLICY_VERSION,
+                policy_version=CONTRACT_POLICY_VERSION,
             )
         except ContractStoreError:
             return _result(
                 IntentDisposition.BLOCKED,
-                "Stored pending contract is invalid or mismatched",
+                "contract-constraints-stale",
+                constraint_digest=constraint_digest,
+                keep_workspace=True,
+            )
+        if (
+            pending_contract.constraint_document != normalized_constraints
+            or pending_contract.constraint_digest != constraint_digest
+        ):
+            return _result(
+                IntentDisposition.BLOCKED,
+                "contract-constraints-stale",
+                constraint_digest=constraint_digest,
                 keep_workspace=True,
             )
 
-    worktree = Path(workspace.path)
+    if revision_request is not None:
+        assert pending_contract is not None
+        if (
+            revision_request.request.rejected_contract_digest != pending_contract.artifact_digest
+            or revision_request.request.constraint_digest != constraint_digest
+        ):
+            return _result(
+                IntentDisposition.BLOCKED,
+                "contract-revision-stale",
+                constraint_digest=constraint_digest,
+                keep_workspace=True,
+            )
+
+    revising = revision_request is not None
+    resuming = pending_contract is not None and not revising
+    previous_contract_digest = (
+        pending_contract.artifact_digest
+        if revising and pending_contract is not None
+        else (pending_contract.previous_contract_digest if pending_contract is not None else None)
+    )
+    revision_request_digest = (
+        revision_request.request.request_digest
+        if revision_request is not None
+        else (pending_contract.revision_request_digest if pending_contract is not None else None)
+    )
+
+    def phase_result(
+        disposition: IntentDisposition, reason: str, **kwargs: Any
+    ) -> ContractPhaseResult:
+        """Return a phase result without dropping authenticated authority lineage."""
+        kwargs.setdefault("constraint_digest", constraint_digest)
+        kwargs.setdefault("previous_contract_digest", previous_contract_digest)
+        kwargs.setdefault("revision_request_digest", revision_request_digest)
+        return _result(disposition, reason, **kwargs)
+
+    if not isinstance(contract_author_role, str) or not contract_author_role.strip():
+        return phase_result(
+            IntentDisposition.BLOCKED,
+            _CONTRACT_EXTERNAL_FAILURE,
+        )
+    try:
+        contract_path = _contract_path(contracts_dir, issue.id)
+    except (TypeError, ValueError):
+        return phase_result(IntentDisposition.BLOCKED, _CONTRACT_EXTERNAL_FAILURE)
+
     allowed = {contract_path}
     try:
         before = set(workspace.changed_files())
     except Exception:
-        return _result(
+        return phase_result(
             IntentDisposition.BLOCKED,
-            "Workspace change surface is unreadable",
+            _CONTRACT_EXTERNAL_FAILURE,
             keep_workspace=True,
         )
     preexisting_extra = sorted(before - allowed)
     if preexisting_extra:
-        return _result(
+        return phase_result(
             IntentDisposition.BLOCKED,
-            "Workspace already contains non-contract changes: " + _safe_paths(preexisting_extra),
+            _CONTRACT_EXTERNAL_FAILURE,
             keep_workspace=True,
         )
 
     preexisting_v1_blob: bytes | None = None
-    committed_blob = _git_contract_blob(worktree, "HEAD", contract_path, absent_ok=True)
+    try:
+        committed_blob = _git_contract_blob(workspace, "HEAD", contract_path, absent_ok=True)
+    except Exception:
+        return phase_result(
+            IntentDisposition.BLOCKED,
+            _CONTRACT_EXTERNAL_FAILURE,
+            keep_workspace=True,
+        )
     if committed_blob is not None:
         try:
             _committed_text, committed_document = _strict_contract(committed_blob)
@@ -414,41 +537,61 @@ def run_contract_phase(
                 preexisting_v1_blob = committed_blob
 
     try:
-        _clear_stale_contract_draft(worktree, contract_path)
+        _clear_stale_contract_draft(workspace, contract_path)
     except Exception:
-        return _result(
+        return phase_result(
             IntentDisposition.BLOCKED,
-            "Stale contract draft could not be cleared safely",
+            _CONTRACT_EXTERNAL_FAILURE,
             keep_workspace=True,
         )
 
     turn = None
     turn_raised = False
-    resuming = pending_contract is not None
-    if resuming:
+    if pending_contract is not None:
         assert pending_contract is not None
         try:
-            _materialize_pending_contract(
-                worktree, contract_path, pending_contract.contract_text
-            )
+            _materialize_pending_contract(workspace, contract_path, pending_contract.contract_text)
         except Exception:
-            return _result(
+            return phase_result(
                 IntentDisposition.BLOCKED,
-                "Stored pending contract could not be materialized safely",
+                _CONTRACT_EXTERNAL_FAILURE,
                 contract_text=pending_contract.contract_text,
                 contract_document=pending_contract.contract_document,
                 contract_digest=pending_contract.artifact_digest,
                 requires_approval=True,
                 keep_workspace=True,
             )
-    else:
+    if not resuming:
         try:
+            prompt = (
+                contract_revision_brief(
+                    issue,
+                    contract_path,
+                    repository=repository,
+                    tier=tier,
+                    generated_at=timestamp,
+                    rejected_contract=pending_contract.contract_document,
+                    constraint_document=normalized_constraints,
+                    constraint_digest=constraint_digest,
+                    feedback_document=revision_request.request.feedback_document,
+                )
+                if revising
+                else contract_author_brief(
+                    issue,
+                    contract_path,
+                    repository=repository,
+                    tier=tier,
+                    generated_at=timestamp,
+                    constraint_document=normalized_constraints,
+                    constraint_digest=constraint_digest,
+                )
+            )
             turn = runner.run_agent(
-                contract_author_brief(issue, contract_path),
+                prompt,
                 model=CONTRACT_AUTHOR_MODEL,
                 system=contract_author_role,
                 tools=CONTRACT_AUTHOR_TOOLS,
-                cwd=str(worktree),
+                cwd=workspace.path,
             )
         except Exception:
             turn_raised = True
@@ -456,57 +599,56 @@ def run_contract_phase(
     try:
         after = set(workspace.changed_files())
     except Exception:
-        return _result(
+        return phase_result(
             IntentDisposition.BLOCKED,
-            "Workspace change surface is unreadable after the contract-author turn",
+            _CONTRACT_EXTERNAL_FAILURE,
             keep_workspace=True,
         )
     extra_paths = sorted(after - allowed)
     if extra_paths:
-        return _result(
+        return phase_result(
             IntentDisposition.BLOCKED,
-            "Contract-author changed forbidden paths: " + _safe_paths(extra_paths),
+            _CONTRACT_EXTERNAL_FAILURE,
             keep_workspace=True,
         )
     if not resuming and turn_raised:
-        return _result(
+        return phase_result(
             IntentDisposition.BLOCKED,
-            "Contract-author turn could not be completed",
+            _CONTRACT_EXTERNAL_FAILURE,
             keep_workspace=True,
         )
     if not resuming and (turn is None or not turn.ok):
-        return _result(
+        return phase_result(
             IntentDisposition.BLOCKED,
-            "Contract-author turn failed without an admissible artifact",
+            _CONTRACT_EXTERNAL_FAILURE,
             keep_workspace=True,
         )
 
-    artifact_path = worktree / contract_path
-    if not artifact_path.is_file() or artifact_path.is_symlink():
-        return _result(
+    try:
+        artifact_state = workspace_file_state(workspace, contract_path)
+    except Exception:
+        artifact_state = None
+    if artifact_state is None or artifact_state.kind != "regular":
+        return phase_result(
             IntentDisposition.BLOCKED,
-            "Contract author did not write " + _safe_paths([contract_path]),
+            _CONTRACT_EXTERNAL_FAILURE,
         )
     if contract_path not in after:
-        tracked = subprocess.run(
-            ["git", "ls-files", "--error-unmatch", "--", contract_path],
-            cwd=worktree,
-            capture_output=True,
-            check=False,
-        )
-        if tracked.returncode != 0:
-            return _result(
+        try:
+            workspace_read_file_at(workspace, "HEAD", contract_path, max_bytes=_MAX_CONTRACT_BYTES)
+        except Exception:
+            return phase_result(
                 IntentDisposition.BLOCKED,
-                "Contract artifact is outside the tracked Git change surface",
+                _CONTRACT_EXTERNAL_FAILURE,
                 keep_workspace=True,
             )
 
     try:
-        contract_blob, contract_text, document = _read_contract(artifact_path)
+        contract_blob, contract_text, document = _read_contract(workspace, contract_path)
     except ValueError:
-        return _result(
+        return phase_result(
             IntentDisposition.BLOCKED,
-            "Contract artifact is not readable strict JSON",
+            _CONTRACT_EXTERNAL_FAILURE,
             keep_workspace=True,
         )
 
@@ -514,21 +656,35 @@ def run_contract_phase(
         validation = validate_contract_report(document)
         digest = artifact_sha256(document)
     except (TypeError, ValueError, UnicodeError):
-        return _result(
+        return phase_result(
             IntentDisposition.BLOCKED,
-            "Contract artifact cannot be represented as canonical JSON",
+            _CONTRACT_EXTERNAL_FAILURE,
             contract_text=contract_text,
             keep_workspace=True,
         )
-    if pending_contract is not None and (
-        contract_blob != pending_contract.contract_text.encode("utf-8")
-        or contract_text != pending_contract.contract_text
-        or document != pending_contract.contract_document
-        or digest != pending_contract.artifact_digest
+    if (
+        resuming
+        and pending_contract is not None
+        and (
+            contract_blob != pending_contract.contract_text.encode("utf-8")
+            or contract_text != pending_contract.contract_text
+            or document != pending_contract.contract_document
+            or digest != pending_contract.artifact_digest
+        )
     ):
-        return _result(
+        return phase_result(
             IntentDisposition.BLOCKED,
-            "Materialized contract does not match the stored pending artifact",
+            _CONTRACT_EXTERNAL_FAILURE,
+            contract_text=contract_text,
+            contract_document=document,
+            contract_digest=digest,
+            requires_approval=True,
+            keep_workspace=True,
+        )
+    if revising and pending_contract is not None and digest == pending_contract.artifact_digest:
+        return phase_result(
+            IntentDisposition.BLOCKED,
+            "contract-revision-no-change",
             contract_text=contract_text,
             contract_document=document,
             contract_digest=digest,
@@ -556,9 +712,9 @@ def run_contract_phase(
             ("author the contract for the current controller work item",),
             ("matching contract identity",),
         )
-        return _result(
+        return phase_result(
             IntentDisposition.BLOCKED,
-            "Contract identity does not match the controller work item",
+            _CONTRACT_EXTERNAL_FAILURE,
             contract_text=contract_text,
             contract_document=document,
             contract_digest=digest,
@@ -566,12 +722,12 @@ def run_contract_phase(
             proof_obligations=(identity_obligation,),
             keep_workspace=True,
         )
+    approval_record: ApprovalRecord | None = None
     if validation.schema_version == 1 and not validation.errors:
         if preexisting_v1_blob is None or contract_blob != preexisting_v1_blob:
-            return _result(
+            return phase_result(
                 IntentDisposition.BLOCKED,
-                "Contract v1 compatibility applies only to an unchanged pre-existing artifact; "
-                "new or modified contracts must use Contract v2",
+                _CONTRACT_EXTERNAL_FAILURE,
                 contract_text=contract_text,
                 contract_document=document,
                 contract_digest=digest,
@@ -589,19 +745,47 @@ def run_contract_phase(
         requires_approval = False
         authority = "compatibility-policy"
         rationale = warning
+        result_policy_version = "intent-v1"
     else:
-        policy = evaluate_intent(document)
+        try:
+            policy = evaluate_intent(document)
+        except Exception:
+            return phase_result(
+                IntentDisposition.BLOCKED,
+                _CONTRACT_EXTERNAL_FAILURE,
+                contract_text=contract_text,
+                contract_document=document,
+                contract_digest=digest,
+                keep_workspace=True,
+            )
+        result_policy_version = policy.policy_version
         findings = policy.findings
         obligations = policy.proof_obligations
         requires_approval = policy.requires_contract_approval
-        if pending_contract is not None and (
-            policy.policy_version != pending_contract.policy_version
-            or policy.disposition is not IntentDisposition.APPROVAL_PENDING
-            or not requires_approval
+        forced_revision_resume = (
+            resuming
+            and pending_contract is not None
+            and pending_contract.previous_contract_digest is not None
+            and pending_contract.revision_request_digest is not None
+            and policy.disposition is IntentDisposition.PASS
+        )
+        if forced_revision_resume:
+            requires_approval = True
+        if (
+            resuming
+            and pending_contract is not None
+            and (
+                policy.policy_version != pending_contract.policy_version
+                or (
+                    policy.disposition is not IntentDisposition.APPROVAL_PENDING
+                    and not forced_revision_resume
+                )
+                or not requires_approval
+            )
         ):
-            return _result(
+            return phase_result(
                 IntentDisposition.BLOCKED,
-                "Stored contract is not approval-pending under the pinned policy",
+                _CONTRACT_EXTERNAL_FAILURE,
                 contract_text=contract_text,
                 contract_document=document,
                 contract_digest=digest,
@@ -611,9 +795,9 @@ def run_contract_phase(
                 keep_workspace=True,
             )
         if policy.disposition is IntentDisposition.SPEC_PENDING:
-            return _result(
+            return phase_result(
                 policy.disposition,
-                "Contract has unresolved blocking specification questions",
+                _CONTRACT_SPEC_PENDING,
                 contract_text=contract_text,
                 contract_document=document,
                 contract_digest=digest,
@@ -623,15 +807,41 @@ def run_contract_phase(
                 keep_workspace=True,
             )
         if policy.disposition is IntentDisposition.BLOCKED:
-            return _result(
+            return phase_result(
                 policy.disposition,
-                "Contract input is malformed or inadmissible under the pinned policy",
+                _CONTRACT_EXTERNAL_FAILURE,
                 contract_text=contract_text,
                 contract_document=document,
                 contract_digest=digest,
                 findings=findings,
                 proof_obligations=obligations,
                 requires_approval=requires_approval,
+                keep_workspace=True,
+            )
+        if revising:
+            return phase_result(
+                IntentDisposition.APPROVAL_PENDING,
+                _CONTRACT_APPROVAL_PENDING,
+                contract_text=contract_text,
+                contract_document=document,
+                contract_digest=digest,
+                policy_version=result_policy_version,
+                findings=findings,
+                proof_obligations=obligations,
+                requires_approval=True,
+                keep_workspace=True,
+            )
+        if requires_approval and not resuming:
+            return phase_result(
+                IntentDisposition.APPROVAL_PENDING,
+                _CONTRACT_APPROVAL_PENDING,
+                contract_text=contract_text,
+                contract_document=document,
+                contract_digest=digest,
+                policy_version=result_policy_version,
+                findings=findings,
+                proof_obligations=obligations,
+                requires_approval=True,
                 keep_workspace=True,
             )
         authority = "deterministic-policy"
@@ -643,51 +853,116 @@ def run_contract_phase(
                     issue=issue.id,
                     artifact_kind=ArtifactKind.CONTRACT,
                     artifact_digest=digest,
-                    parent_digest=None,
+                    parent_digest=constraint_digest,
                 )
             except ApprovalError as exc:
-                if str(exc) == "approval authority is absent":
-                    return _result(
+                if exc.kind is AuthorityFailureKind.ABSENT:
+                    return phase_result(
                         IntentDisposition.APPROVAL_PENDING,
-                        "Contract requires an exact hash-bound operator approval",
+                        _CONTRACT_APPROVAL_PENDING,
                         contract_text=contract_text,
                         contract_document=document,
                         contract_digest=digest,
+                        policy_version=result_policy_version,
                         findings=findings,
                         proof_obligations=obligations,
                         requires_approval=True,
                         keep_workspace=True,
                     )
-                return _result(
+                if exc.kind is not AuthorityFailureKind.POLICY_STALE:
+                    return phase_result(
+                        IntentDisposition.BLOCKED,
+                        _CONTRACT_EXTERNAL_FAILURE,
+                        contract_text=contract_text,
+                        contract_document=document,
+                        contract_digest=digest,
+                        policy_version=result_policy_version,
+                        findings=findings,
+                        proof_obligations=obligations,
+                        requires_approval=True,
+                        keep_workspace=True,
+                    )
+                try:
+                    approval_store.require(
+                        repository=repository,
+                        issue=issue.id,
+                        artifact_kind=ArtifactKind.CONTRACT,
+                        artifact_digest=digest,
+                        parent_digest=None,
+                    )
+                except ApprovalError as legacy_error:
+                    if legacy_error.kind not in {
+                        AuthorityFailureKind.ABSENT,
+                        AuthorityFailureKind.POLICY_STALE,
+                    }:
+                        return phase_result(
+                            IntentDisposition.BLOCKED,
+                            _CONTRACT_EXTERNAL_FAILURE,
+                            contract_text=contract_text,
+                            contract_document=document,
+                            contract_digest=digest,
+                            policy_version=result_policy_version,
+                            findings=findings,
+                            proof_obligations=obligations,
+                            requires_approval=True,
+                            keep_workspace=True,
+                        )
+                else:
+                    return phase_result(
+                        IntentDisposition.APPROVAL_PENDING,
+                        _CONTRACT_APPROVAL_PENDING,
+                        contract_text=contract_text,
+                        contract_document=document,
+                        contract_digest=digest,
+                        policy_version=result_policy_version,
+                        findings=findings,
+                        proof_obligations=obligations,
+                        requires_approval=True,
+                        keep_workspace=True,
+                    )
+                return phase_result(
                     IntentDisposition.BLOCKED,
-                    "Contract approval does not exactly match the current artifact",
+                    "contract-approval-parent-mismatch",
                     contract_text=contract_text,
                     contract_document=document,
                     contract_digest=digest,
+                    policy_version=result_policy_version,
                     findings=findings,
                     proof_obligations=obligations,
                     requires_approval=True,
                     keep_workspace=True,
                 )
             except Exception:
-                return _result(
+                return phase_result(
                     IntentDisposition.BLOCKED,
-                    "Contract approval authority is invalid or unreadable",
+                    _CONTRACT_EXTERNAL_FAILURE,
                     contract_text=contract_text,
                     contract_document=document,
                     contract_digest=digest,
+                    policy_version=result_policy_version,
                     findings=findings,
                     proof_obligations=obligations,
                     requires_approval=True,
                     keep_workspace=True,
                 )
-            approved_policy = evaluate_intent(document, approval_supplied=True)
+            try:
+                approved_policy = evaluate_intent(document, approval_supplied=True)
+            except Exception:
+                return phase_result(
+                    IntentDisposition.BLOCKED,
+                    _CONTRACT_EXTERNAL_FAILURE,
+                    contract_text=contract_text,
+                    contract_document=document,
+                    contract_digest=digest,
+                    requires_approval=True,
+                    keep_workspace=True,
+                )
             findings = approved_policy.findings
             obligations = approved_policy.proof_obligations
             if approved_policy.disposition is not IntentDisposition.PASS:
-                return _result(
+                return phase_result(
                     IntentDisposition.BLOCKED,
-                    "Approved contract did not pass the pinned policy",
+                    _CONTRACT_EXTERNAL_FAILURE,
                     contract_text=contract_text,
                     contract_document=document,
                     contract_digest=digest,
@@ -698,6 +973,35 @@ def run_contract_phase(
                 )
             authority = approval.approver
             rationale = approval.rationale
+            approval_record = approval
+
+    def approval_is_current() -> bool:
+        if approval_record is None:
+            return True
+        try:
+            current = approval_store.require(
+                repository=repository,
+                issue=issue.id,
+                artifact_kind=ArtifactKind.CONTRACT,
+                artifact_digest=digest,
+                parent_digest=constraint_digest,
+            )
+        except Exception:
+            return False
+        return current == approval_record
+
+    if not approval_is_current():
+        return phase_result(
+            IntentDisposition.BLOCKED,
+            _CONTRACT_EXTERNAL_FAILURE,
+            contract_text=contract_text,
+            contract_document=document,
+            contract_digest=digest,
+            findings=findings,
+            proof_obligations=obligations,
+            requires_approval=requires_approval,
+            keep_workspace=True,
+        )
 
     try:
         checkpoint = (
@@ -706,9 +1010,9 @@ def run_contract_phase(
             else workspace.head_revision()
         )
     except Exception:
-        return _result(
+        return phase_result(
             IntentDisposition.BLOCKED,
-            "Contract checkpoint could not be created",
+            _CONTRACT_EXTERNAL_FAILURE,
             contract_text=contract_text,
             contract_document=document,
             contract_digest=digest,
@@ -721,9 +1025,9 @@ def run_contract_phase(
     try:
         post_checkpoint = set(workspace.changed_files())
     except Exception:
-        return _result(
+        return phase_result(
             IntentDisposition.BLOCKED,
-            "Workspace change surface is unreadable after the contract checkpoint",
+            _CONTRACT_EXTERNAL_FAILURE,
             contract_text=contract_text,
             contract_document=document,
             contract_digest=digest,
@@ -735,10 +1039,9 @@ def run_contract_phase(
         )
     post_checkpoint_extra = sorted(post_checkpoint - allowed)
     if post_checkpoint_extra:
-        return _result(
+        return phase_result(
             IntentDisposition.BLOCKED,
-            "Contract checkpoint changed forbidden paths: "
-            + _safe_paths(post_checkpoint_extra),
+            _CONTRACT_EXTERNAL_FAILURE,
             contract_text=contract_text,
             contract_document=document,
             contract_digest=digest,
@@ -749,15 +1052,15 @@ def run_contract_phase(
             keep_workspace=True,
         )
     try:
-        checkpoint_blob = _git_contract_blob(worktree, checkpoint, contract_path)
+        checkpoint_blob = _git_contract_blob(workspace, checkpoint, contract_path)
         assert checkpoint_blob is not None
         checkpoint_text, checkpoint_document = _strict_contract(checkpoint_blob)
         checkpoint_validation = _validate_without_deprecation_warning(checkpoint_document)
         checkpoint_digest = artifact_sha256(checkpoint_document)
     except (TypeError, ValueError, UnicodeError):
-        return _result(
+        return phase_result(
             IntentDisposition.BLOCKED,
-            "Contract became unreadable while creating its checkpoint",
+            _CONTRACT_EXTERNAL_FAILURE,
             contract_digest=digest,
             checkpoint_sha=checkpoint,
             findings=findings,
@@ -783,9 +1086,9 @@ def run_contract_phase(
             and checkpoint_blob == preexisting_v1_blob
         )
     if not checkpoint_matches:
-        return _result(
+        return phase_result(
             IntentDisposition.BLOCKED,
-            "Exact checkpoint contract does not match the approved contract",
+            _CONTRACT_EXTERNAL_FAILURE,
             contract_text=checkpoint_text,
             contract_document=checkpoint_document,
             contract_digest=checkpoint_digest,
@@ -797,13 +1100,32 @@ def run_contract_phase(
         )
 
     try:
-        checkpoint_status = _git_status(worktree, contract_path)
+        current_state = workspace_file_state(workspace, contract_path)
+        checkpoint_status = (
+            current_state.kind != "regular"
+            or workspace_read_file(workspace, contract_path, max_bytes=_MAX_CONTRACT_BYTES)
+            != checkpoint_blob
+        )
     except Exception:
-        checkpoint_status = b"unreadable"
+        checkpoint_status = True
     if checkpoint_status:
-        return _result(
+        return phase_result(
             IntentDisposition.BLOCKED,
-            "Contract worktree bytes differ from the exact checkpoint blob",
+            _CONTRACT_EXTERNAL_FAILURE,
+            contract_text=checkpoint_text,
+            contract_document=checkpoint_document,
+            contract_digest=checkpoint_digest,
+            checkpoint_sha=checkpoint,
+            findings=findings,
+            proof_obligations=obligations,
+            requires_approval=requires_approval,
+            keep_workspace=True,
+        )
+
+    if not approval_is_current():
+        return phase_result(
+            IntentDisposition.BLOCKED,
+            _CONTRACT_EXTERNAL_FAILURE,
             contract_text=checkpoint_text,
             contract_document=checkpoint_document,
             contract_digest=checkpoint_digest,
@@ -828,11 +1150,15 @@ def run_contract_phase(
             obligations=obligations,
             authority=authority,
             rationale=rationale,
+            policy_version=result_policy_version,
+            constraint_digest=constraint_digest,
+            previous_contract_digest=previous_contract_digest,
+            revision_request_digest=revision_request_digest,
         )
     except Exception:
-        return _result(
+        return phase_result(
             IntentDisposition.BLOCKED,
-            "Contract decision evidence could not be appended",
+            _CONTRACT_EXTERNAL_FAILURE,
             contract_text=checkpoint_text,
             contract_document=checkpoint_document,
             contract_digest=checkpoint_digest,
@@ -843,19 +1169,16 @@ def run_contract_phase(
             keep_workspace=True,
         )
 
-    reason = (
-        validation.warnings[0]
-        if validation.warnings
-        else "Contract intent accepted, checkpointed, and recorded"
-    )
-    return _result(
+    return phase_result(
         IntentDisposition.PASS,
-        reason,
+        _CONTRACT_ACCEPTED,
         contract_text=checkpoint_text,
         contract_document=checkpoint_document,
         contract_digest=checkpoint_digest,
         checkpoint_sha=checkpoint,
+        policy_version=result_policy_version,
         findings=findings,
         proof_obligations=obligations,
         requires_approval=requires_approval,
+        approval_record=approval_record,
     )

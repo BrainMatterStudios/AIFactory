@@ -16,10 +16,18 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
+    from software_factory.build.workspace import Workspace, WorkspaceRequest
     from software_factory.core.design.capabilities import (
         CapabilityObservation,
         RunnerCapabilityDeclaration,
     )
+    from software_factory.core.design.provider_capabilities import (
+        CapabilityContext,
+        ProviderCapabilityDeclaration,
+        ProviderCapabilityObservation,
+        ProviderRole,
+    )
+    from software_factory.execution.bridge import ExecutionScope
 
 
 # --------------------------------------------------------------------------- #
@@ -189,6 +197,22 @@ class RunnerAdapter(Protocol):
 
 
 @runtime_checkable
+class ScopedRunnerAdapter(RunnerAdapter, Protocol):
+    """Runner transport that accepts bridge-authenticated turn authority."""
+
+    def run_scoped_agent(
+        self,
+        prompt: str,
+        *,
+        model: str,
+        scope: ExecutionScope,
+        system: str | None = None,
+        tools: Sequence[str] | None = None,
+        cwd: str | None = None,
+    ) -> RunResult: ...
+
+
+@runtime_checkable
 class CapabilityAwareRunner(Protocol):
     """Optional trusted declaration and runtime observation surface."""
 
@@ -197,6 +221,27 @@ class CapabilityAwareRunner(Protocol):
     def observe_capabilities(
         self, *, workspace_path: str, repo_root: str
     ) -> CapabilityObservation: ...
+
+
+@runtime_checkable
+class CapabilityProvider(Protocol):
+    """Trusted external source of role-bound capability evidence."""
+
+    source: str
+    provider_role: ProviderRole
+
+    def capability_declaration(self) -> ProviderCapabilityDeclaration: ...
+
+    def observe_capabilities(
+        self, *, context: CapabilityContext
+    ) -> ProviderCapabilityObservation: ...
+
+
+@runtime_checkable
+class WorkspaceFactory(Protocol):
+    """Construct an isolated workspace from one explicit source boundary."""
+
+    def create(self, request: WorkspaceRequest) -> Workspace: ...
 
 
 # --------------------------------------------------------------------------- #

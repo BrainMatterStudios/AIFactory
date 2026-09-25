@@ -45,9 +45,14 @@ from software_factory.core.approvals import (
     ApprovalStore,
     ArtifactKind,
 )
-from software_factory.core.config import BuildConfig, FactoryConfig
+from software_factory.core.config import AdapterSpec, BuildConfig, FactoryConfig, PublicationMode
 from software_factory.core.contracts import artifact_sha256
-from software_factory.core.design.configuration import AnalyzerSpec
+from software_factory.core.design.configuration import (
+    AnalyzerSpec,
+    CapabilityProviderSpec,
+    ExecutionPolicySpec,
+    VerificationCommandSpec,
+)
 from software_factory.core.governance import BudgetGuard, crosses_prod_boundary
 from software_factory.core.orchestrate import Tier, Verdict, decide_restart
 from software_factory.trace.decisions import DecisionLog
@@ -69,6 +74,7 @@ from .test_build import (
     _contract_controller_kwargs,
     _issue,
     _persist_accepted_contract,
+    _seed_legacy_contract_history,
     _stub_contract_phase,
     write_verdict_fixture,
 )
@@ -199,14 +205,42 @@ def test_every_build_config_field_is_parsed_from_the_manifest():
         "design_protocol": "design_ir_v1",
         "design_analyzers": [{"name": "harness", "required": True}],
         "design_author_role": "systems-architect",
+        "capability_providers": [{"name": "cell-executor", "options": {}}],
+        "execution_policy": {
+            "implementation_writable_paths": ["src"],
+            "verification_commands": [
+                {
+                    "name": "unit",
+                    "argv": ["pytest", "-q"],
+                    "expected_exit": "zero",
+                    "environment_profile": "default",
+                }
+            ],
+            "network_profile": "model-api-only",
+        },
+        "publication_mode": "local_bundle",
+        "local_artifact_root": "/controller/validation-artifacts",
     }
-    assert set(values) == set(BuildConfig().__dataclass_fields__), (
+    derived_fields = {"execution_policy_explicit", "workspace_adapter"}
+    assert set(values) | derived_fields == set(BuildConfig().__dataclass_fields__), (
         "a BuildConfig field is not covered by this test — is it parsed?"
     )
-    cfg = FactoryConfig.from_dict({"factory": {"name": "x", "build": values}})
+    cfg = FactoryConfig.from_dict(
+        {"factory": {"name": "x", "workspace": "git-worktree", "build": values}}
+    )
     expected = {
         **values,
         "design_analyzers": (AnalyzerSpec("harness", True),),
+        "capability_providers": (CapabilityProviderSpec("cell-executor", {}),),
+        "execution_policy": ExecutionPolicySpec(
+            ("src",),
+            (VerificationCommandSpec("unit", ("pytest", "-q"), "zero", "default"),),
+            "model-api-only",
+        ),
+        "execution_policy_explicit": True,
+        "workspace_adapter": AdapterSpec("git-worktree", {}),
+        "publication_mode": PublicationMode.LOCAL_BUNDLE,
+        "local_artifact_root": "/controller/validation-artifacts",
     }
     for field, want in expected.items():
         assert getattr(cfg.build_cfg, field) == want, field
@@ -468,7 +502,7 @@ def test_the_judge_is_shown_the_contract_it_is_grading_against(monkeypatch):
         ws,
         require_contract=True,
         contracts_dir="contracts",
-        repository="example-repo",
+        repository="example/repo",
         **_contract_controller_kwargs(ws),
     )
     assert "end contract" in seen["prompt"]
@@ -598,7 +632,7 @@ def _contract_lifecycle_kwargs(tmp_path, monkeypatch, workspace):
     _stub_contract_phase(monkeypatch, workspace)
     return {
         "require_contract": True,
-        "repository": "example-repo",
+        "repository": "example/repo",
         "repo_root": str(tmp_path),
         "approval_store": ApprovalStore(tmp_path / "controller-approvals"),
         "decision_log": DecisionLog(tmp_path / "controller-decisions"),
@@ -610,7 +644,7 @@ def _contract_lifecycle_kwargs(tmp_path, monkeypatch, workspace):
 def _plan_approval(*, digest, parent_digest):
     return ApprovalRecord(
         schema_version=APPROVAL_SCHEMA_VERSION,
-        repository="example-repo",
+        repository="example/repo",
         issue="7",
         artifact_kind=ArtifactKind.PLAN,
         artifact_digest=digest,
@@ -668,12 +702,12 @@ def test_contract_enabled_t2_persists_a_digest_bound_plan_envelope(tmp_path, mon
     assert outcome.parent_digest == artifact_sha256(_ACCEPTED_CONTRACT)
     assert envelope == {
         "schema_version": 1,
-        "repository": "example-repo",
+        "repository": "example/repo",
         "issue": "7",
         "plan": "THE BOUND PLAN",
         "artifact_digest": expected_digest,
         "parent_digest": artifact_sha256(_ACCEPTED_CONTRACT),
-        "policy_version": "intent-v1",
+        "policy_version": "intent-v2",
         "config_version": "plan-phase-v1",
     }
     planner_prompt = next(
@@ -923,7 +957,7 @@ def test_cap_crossing_implementer_contract_mutation_blocks_and_keeps_before_noti
     assert outcome.status is BuildStatus.BLOCKED
     assert "contract integrity" in outcome.reason.lower()
     assert outcome.keep_workspace and not workspace.cleaned and not workspace.pushed
-    history = kwargs["decision_log"].read_verified(repository="example-repo", issue="7")
+    history = kwargs["decision_log"].read_verified(repository="example/repo", issue="7")
     integrity = next(event for event in history if event.stage.startswith("contract-integrity-"))
     assert integrity.schema_version == "contract-integrity-v1"
     assert integrity.sensor_version == "contract-boundary-v1"
@@ -966,7 +1000,7 @@ def test_failed_contract_mode_judge_records_terminal_blocked_disposition(tmp_pat
     assert outcome.status is BuildStatus.BLOCKED
     assert outcome.keep_workspace
     assert not workspace.cleaned and not workspace.pushed
-    history = kwargs["decision_log"].read_verified(repository="example-repo", issue="7")
+    history = kwargs["decision_log"].read_verified(repository="example/repo", issue="7")
     assert history[-1].stage == "terminal-disposition"
     assert history[-1].disposition == "BLOCKED"
 
@@ -1040,7 +1074,7 @@ def test_open_pr_failure_after_push_records_manual_recovery_without_retry(
     assert pathlib.Path(workspace.path).is_dir()
     assert outcome.keep_workspace and not workspace.cleaned
     assert "blocked" in src.get_issue(issue.id).labels
-    history = kwargs["decision_log"].read_verified(repository="example-repo", issue="7")
+    history = kwargs["decision_log"].read_verified(repository="example/repo", issue="7")
     assert [event.stage for event in history[-2:]] == [
         "final-disposition",
         "terminal-disposition",
@@ -1137,7 +1171,7 @@ def test_reviewer_code_surface_drift_blocks_before_routing_or_publication(tmp_pa
     assert outcome.status is BuildStatus.BLOCKED
     assert "review" in outcome.reason.lower() and "surface" in outcome.reason.lower()
     assert outcome.keep_workspace and not workspace.cleaned and not workspace.pushed
-    history = kwargs["decision_log"].read_verified(repository="example-repo", issue="7")
+    history = kwargs["decision_log"].read_verified(repository="example/repo", issue="7")
     assert not any(event.stage == "review-routing" for event in history)
     assert history[-1].stage == "terminal-disposition"
 
@@ -1169,7 +1203,7 @@ def test_publication_validator_rejects_an_arbitrary_surface_digest(tmp_path):
         ).stdout.strip(),
         contracts_dir="contracts",
         issue_id="7",
-        repository="example-repo",
+        repository="example/repo",
         expected_text=expected_contract,
         expected_digest=artifact_sha256(_ACCEPTED_CONTRACT),
         expected_surface_digest="0" * 64,
@@ -1218,7 +1252,7 @@ def test_publication_refuses_a_commit_sha_outside_the_accepted_checkpoint_histor
     assert outcome.status is BuildStatus.BLOCKED
     assert "publication revision" in outcome.reason.lower()
     assert outcome.keep_workspace and not workspace.pushed
-    tail = kwargs["decision_log"].read_verified(repository="example-repo", issue="7")[-1]
+    tail = kwargs["decision_log"].read_verified(repository="example/repo", issue="7")[-1]
     assert tail.stage == "terminal-disposition"
     assert tail.disposition == "BLOCKED"
 
@@ -1233,12 +1267,12 @@ def test_a_plan_label_has_no_authority_in_contract_mode(tmp_path, monkeypatch):
         json.dumps(
             {
                 "schema_version": 1,
-                "repository": "example-repo",
+                "repository": "example/repo",
                 "issue": "7",
                 "plan": plan,
                 "artifact_digest": hashlib.sha256(plan.encode()).hexdigest(),
                 "parent_digest": artifact_sha256(_ACCEPTED_CONTRACT),
-                "policy_version": "intent-v1",
+                "policy_version": "intent-v2",
                 "config_version": "plan-phase-v1",
             }
         ),
@@ -1275,12 +1309,12 @@ def test_malformed_plan_envelope_cannot_become_approval_input(tmp_path, monkeypa
         json.dumps(
             {
                 "schema_version": True,
-                "repository": "example-repo",
+                "repository": "example/repo",
                 "issue": "7",
                 "plan": plan,
                 "artifact_digest": hashlib.sha256(plan.encode()).hexdigest(),
                 "parent_digest": artifact_sha256(_ACCEPTED_CONTRACT),
-                "policy_version": "intent-v1",
+                "policy_version": "intent-v2",
                 "config_version": "plan-phase-v1",
             }
         ),
@@ -1316,12 +1350,12 @@ def test_stale_or_wrong_parent_plan_approval_blocks(tmp_path, monkeypatch, wrong
         json.dumps(
             {
                 "schema_version": 1,
-                "repository": "example-repo",
+                "repository": "example/repo",
                 "issue": "7",
                 "plan": plan,
                 "artifact_digest": digest,
                 "parent_digest": artifact_sha256(_ACCEPTED_CONTRACT),
-                "policy_version": "intent-v1",
+                "policy_version": "intent-v2",
                 "config_version": "plan-phase-v1",
             }
         ),
@@ -1362,12 +1396,12 @@ def test_exact_plan_and_parent_approval_reaches_the_implementer(tmp_path, monkey
         json.dumps(
             {
                 "schema_version": 1,
-                "repository": "example-repo",
+                "repository": "example/repo",
                 "issue": "7",
                 "plan": plan,
                 "artifact_digest": digest,
                 "parent_digest": artifact_sha256(_ACCEPTED_CONTRACT),
-                "policy_version": "intent-v1",
+                "policy_version": "intent-v2",
                 "config_version": "plan-phase-v1",
             }
         ),
@@ -1404,7 +1438,7 @@ def test_exact_plan_and_parent_approval_reaches_the_implementer(tmp_path, monkey
     assert shared_replays[0].expected_workflow_protocol == "legacy_plan"
     assert plan in implementer_prompt
     assert "product-manager" not in runner.calls
-    history = kwargs["decision_log"].read_verified(repository="example-repo", issue="7")
+    history = kwargs["decision_log"].read_verified(repository="example/repo", issue="7")
     assessed_stages = {
         "implementation-objective",
         "review-result",
@@ -1427,6 +1461,20 @@ def test_exact_plan_and_parent_approval_reaches_the_implementer(tmp_path, monkey
     assert assessed
     assert {event.artifact_digest for event in assessed} == {expected_surface}
     assert {event.parent_digest for event in assessed} == {artifact_sha256(_ACCEPTED_CONTRACT)}
+    contract_lineage = {
+        event.constraint_digest
+        for event in history
+        if event.stage in {"contract", "contract-outcome"}
+    }
+    assert len(contract_lineage) == 1
+    assert None not in contract_lineage
+    assert {
+        event.constraint_digest
+        for event in history
+        if event.stage not in {"contract", "contract-outcome"}
+    } == {None}
+    assert {event.previous_contract_digest for event in history} == {None}
+    assert {event.revision_request_digest for event in history} == {None}
 
 
 @pytest.mark.parametrize(
@@ -1493,7 +1541,7 @@ def test_v1_pre_push_shared_replay_requires_exact_trusted_panel(monkeypatch, mut
             FakeRunner(judge_replies=["verdict: PASS", "verdict: PASS"]),
             workspace,
             require_contract=True,
-            repository="example-repo",
+            repository="example/repo",
             review_protocol="verdict_v1",
             **controller,
         )
@@ -1515,12 +1563,12 @@ def test_t2_pre_push_replay_requires_plan_authority_stages(tmp_path, monkeypatch
         json.dumps(
             {
                 "schema_version": 1,
-                "repository": "example-repo",
+                "repository": "example/repo",
                 "issue": "7",
                 "plan": plan,
                 "artifact_digest": digest,
                 "parent_digest": artifact_sha256(_ACCEPTED_CONTRACT),
-                "policy_version": "intent-v1",
+                "policy_version": "intent-v2",
                 "config_version": "plan-phase-v1",
             }
         ),
@@ -2169,7 +2217,7 @@ def _findings_build(monkeypatch, runner, *, max_revise=2, labels=None):
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         review_protocol="findings_v2",
         max_revise=max_revise,
         **controller,
@@ -2186,7 +2234,7 @@ def test_findings_v2_ignores_model_prose_and_routes_empty_report_to_pass(monkeyp
     assert not pathlib.Path(workspace.path, FINDINGS_PATH).exists()
     reviews = [
         event
-        for event in controller["decision_log"].read_verified(repository="example-repo", issue="7")
+        for event in controller["decision_log"].read_verified(repository="example/repo", issue="7")
         if event.stage == "review-result"
     ]
     assert len(reviews) == 1
@@ -2197,7 +2245,7 @@ def test_findings_v2_ignores_model_prose_and_routes_empty_report_to_pass(monkeyp
     assert len(reviews[0].source_version) == 64
     routing = next(
         event
-        for event in controller["decision_log"].read_verified(repository="example-repo", issue="7")
+        for event in controller["decision_log"].read_verified(repository="example/repo", issue="7")
         if event.stage == "review-routing"
     )
     assert routing.artifact_digest == reviews[0].artifact_digest
@@ -2379,7 +2427,7 @@ def test_v2_reauthenticates_artifact_after_controller_evidence_io(monkeypatch, s
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         review_protocol="findings_v2",
         **controller,
     )
@@ -2389,7 +2437,7 @@ def test_v2_reauthenticates_artifact_after_controller_evidence_io(monkeypatch, s
     assert outcome.keep_workspace
     assert not pathlib.Path(workspace.path, FINDINGS_PATH).exists()
     assert not workspace.pushed
-    stages = [event.stage for event in delegate.read_verified(repository="example-repo", issue="7")]
+    stages = [event.stage for event in delegate.read_verified(repository="example/repo", issue="7")]
     if stage == "review-result":
         assert "review-routing" not in stages
     else:
@@ -2402,19 +2450,11 @@ def test_v2_reauthenticates_accepted_contract_after_review_evidence_io(monkeypat
     workspace = ContractWorkspace()
     controller = _contract_controller_kwargs(workspace)
     delegate = controller["decision_log"]
-    store, _accepted = _persist_accepted_contract(controller)
-    contract_path = pathlib.Path(workspace.path, "contracts", "7.json")
-    contract_path.write_text(_accepted.envelope.contract_text, encoding="utf-8")
-    subprocess.run(["git", "add", "contracts/7.json"], cwd=workspace.path, check=True)
-    subprocess.run(
-        ["git", "commit", "-qm", "contract: exact accepted authority"],
-        cwd=workspace.path,
-        check=True,
-    )
+    store, _accepted = _persist_accepted_contract(controller, workspace)
     controller["approval_store"].approve(
         ApprovalRecord(
             schema_version=APPROVAL_SCHEMA_VERSION,
-            repository="example-repo",
+            repository="example/repo",
             issue="7",
             artifact_kind=ArtifactKind.CONTRACT,
             artifact_digest=_accepted.envelope.artifact_digest,
@@ -2423,6 +2463,9 @@ def test_v2_reauthenticates_accepted_contract_after_review_evidence_io(monkeypat
             approved_at="2026-08-05T11:00:00Z",
             rationale="approve exact synthetic contract",
         )
+    )
+    _seed_legacy_contract_history(
+        controller, workspace, _accepted.envelope, authority="operator"
     )
     replaced = False
 
@@ -2449,7 +2492,7 @@ def test_v2_reauthenticates_accepted_contract_after_review_evidence_io(monkeypat
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         review_protocol="findings_v2",
         **controller,
     )
@@ -2457,7 +2500,7 @@ def test_v2_reauthenticates_accepted_contract_after_review_evidence_io(monkeypat
     assert replaced
     assert outcome.status is BuildStatus.BLOCKED
     assert outcome.keep_workspace
-    stages = [event.stage for event in delegate.read_verified(repository="example-repo", issue="7")]
+    stages = [event.stage for event in delegate.read_verified(repository="example/repo", issue="7")]
     assert "review-routing" not in stages
 
 
@@ -2465,19 +2508,11 @@ def test_v2_clears_findings_before_returning_store_generation_block(monkeypatch)
     src, issue = _issue()
     workspace = ContractWorkspace()
     controller = _contract_controller_kwargs(workspace)
-    store, accepted = _persist_accepted_contract(controller)
-    contract_path = pathlib.Path(workspace.path, "contracts", "7.json")
-    contract_path.write_text(accepted.envelope.contract_text, encoding="utf-8")
-    subprocess.run(["git", "add", "contracts/7.json"], cwd=workspace.path, check=True)
-    subprocess.run(
-        ["git", "commit", "-qm", "contract: exact accepted authority"],
-        cwd=workspace.path,
-        check=True,
-    )
+    store, accepted = _persist_accepted_contract(controller, workspace)
     controller["approval_store"].approve(
         ApprovalRecord(
             schema_version=APPROVAL_SCHEMA_VERSION,
-            repository="example-repo",
+            repository="example/repo",
             issue="7",
             artifact_kind=ArtifactKind.CONTRACT,
             artifact_digest=accepted.envelope.artifact_digest,
@@ -2486,6 +2521,9 @@ def test_v2_clears_findings_before_returning_store_generation_block(monkeypatch)
             approved_at="2026-08-05T11:00:00Z",
             rationale="approve exact synthetic contract",
         )
+    )
+    _seed_legacy_contract_history(
+        controller, workspace, accepted.envelope, authority="operator"
     )
 
     class StoreMutatingSensor(_FindingsRunner):
@@ -2508,7 +2546,7 @@ def test_v2_clears_findings_before_returning_store_generation_block(monkeypatch)
         StoreMutatingSensor([]),
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         review_protocol="findings_v2",
         **controller,
     )
@@ -2518,7 +2556,7 @@ def test_v2_clears_findings_before_returning_store_generation_block(monkeypatch)
     assert not pathlib.Path(workspace.path, FINDINGS_PATH).exists()
     stages = [
         event.stage
-        for event in controller["decision_log"].read_verified(repository="example-repo", issue="7")
+        for event in controller["decision_log"].read_verified(repository="example/repo", issue="7")
     ]
     assert "review-routing" not in stages
     assert "reverify" not in stages
@@ -2544,7 +2582,7 @@ def test_non_contract_v2_still_records_controller_routing_decision(tmp_path):
         issue,
         _FindingsRunner([_findings_document("judge")]),
         workspace,
-        repository="example-repo",
+        repository="example/repo",
         decision_log=decisions,
         review_protocol="findings_v2",
     )
@@ -2552,7 +2590,7 @@ def test_non_contract_v2_still_records_controller_routing_decision(tmp_path):
     assert outcome.status is BuildStatus.SHIPPED
     routing = next(
         event
-        for event in decisions.read_verified(repository="example-repo", issue="7")
+        for event in decisions.read_verified(repository="example/repo", issue="7")
         if event.stage == "review-routing"
     )
     assert (routing.disposition, routing.schema_version) == (
@@ -2579,7 +2617,7 @@ def test_exact_authorized_finding_override_is_counted_and_applied(monkeypatch):
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         review_protocol="findings_v2",
         finding_overrides=(
             FindingOverride(
@@ -2595,7 +2633,7 @@ def test_exact_authorized_finding_override_is_counted_and_applied(monkeypatch):
     assert outcome.status is BuildStatus.SHIPPED
     overrides = [
         event
-        for event in controller["decision_log"].read_verified(repository="example-repo", issue="7")
+        for event in controller["decision_log"].read_verified(repository="example/repo", issue="7")
         if event.stage == "finding-override"
     ]
     assert len(overrides) == 1
@@ -2642,7 +2680,7 @@ def test_v2_pre_push_replay_rejects_semantically_forged_review_evidence(monkeypa
                 if first_review is None:
                     first_review = event
                 if mutation == "missing-review" and review_count == 2:
-                    return delegate.read_verified(repository="example-repo", issue="7")[-1]
+                    return delegate.read_verified(repository="example/repo", issue="7")[-1]
                 if review_count == 1 and mutation in {
                     "wrong-sensor",
                     "wrong-revision",
@@ -2678,7 +2716,7 @@ def test_v2_pre_push_replay_rejects_semantically_forged_review_evidence(monkeypa
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         review_protocol="findings_v2",
         **controller,
     )
@@ -2745,7 +2783,7 @@ def test_v2_replay_cannot_authorize_shipped_from_coherent_non_pass_evidence(
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         review_protocol="findings_v2",
         **controller,
     )
@@ -2818,7 +2856,7 @@ def test_v2_replay_rejects_a_digest_valid_full_legacy_protocol_downgrade(monkeyp
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         review_protocol="findings_v2",
         **controller,
     )
@@ -2853,7 +2891,7 @@ def test_v1_replay_rejects_v2_routing_evidence(monkeypatch):
             FakeRunner(judge_replies=["verdict: PASS"]),
             workspace,
             require_contract=True,
-            repository="example-repo",
+            repository="example/repo",
             review_protocol="verdict_v1",
             **controller,
         )
@@ -2889,7 +2927,7 @@ def test_v2_replay_binds_evidence_to_the_live_review_fingerprint(monkeypatch):
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         review_protocol="findings_v2",
         **controller,
     )
@@ -2920,7 +2958,7 @@ def test_v2_pre_push_replay_rejects_semantically_forged_override_evidence(monkey
         def append(self, event):
             if event.stage == "finding-override":
                 if mutation == "omitted-applied":
-                    return delegate.read_verified(repository="example-repo", issue="7")[-1]
+                    return delegate.read_verified(repository="example/repo", issue="7")[-1]
                 finding = dict(event.findings[0])
                 finding["applied"] = True
                 event = replace(event, disposition="APPLIED", findings=(finding,))
@@ -2936,7 +2974,7 @@ def test_v2_pre_push_replay_rejects_semantically_forged_override_evidence(monkey
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         review_protocol="findings_v2",
         finding_overrides=(
             FindingOverride(
@@ -2962,7 +3000,7 @@ def test_invalid_and_immutable_overrides_are_counted_but_cannot_suppress(monkeyp
     assert outcome.status is BuildStatus.BLOCKED
     assert not [
         event
-        for event in controller["decision_log"].read_verified(repository="example-repo", issue="7")
+        for event in controller["decision_log"].read_verified(repository="example/repo", issue="7")
         if event.stage == "finding-override"
     ]
 
@@ -2983,7 +3021,7 @@ def test_invalid_and_immutable_overrides_are_counted_but_cannot_suppress(monkeyp
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         review_protocol="findings_v2",
         finding_overrides=(FindingOverride("correctness-1", "a" * 64, "", ""),),
         **controller,
@@ -2992,7 +3030,7 @@ def test_invalid_and_immutable_overrides_are_counted_but_cannot_suppress(monkeyp
     assert outcome.status is BuildStatus.BLOCKED
     override = next(
         event
-        for event in controller["decision_log"].read_verified(repository="example-repo", issue="7")
+        for event in controller["decision_log"].read_verified(repository="example/repo", issue="7")
         if event.stage == "finding-override"
     )
     assert override.disposition == "REJECTED"

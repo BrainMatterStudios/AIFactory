@@ -11,7 +11,7 @@ from typing import Any
 from software_factory.core.contracts.schema import validate_contract_report
 from software_factory.loop.collectors import CheckResult, CheckVerdict
 
-POLICY_VERSION = "intent-v1"
+POLICY_VERSION = "intent-v2"
 
 
 class IntentDisposition(str, Enum):

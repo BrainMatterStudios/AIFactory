@@ -33,6 +33,7 @@ from tests.fixtures.synthetic_sensitive_values import (
     PRIVATE_HOST_IP,
     PRIVATE_HOSTNAME,
     PRIVATE_HOSTNAME_BOUNDARY_CASES,
+    PRIVATE_IPV4_PUNCTUATION_CASES,
     PRIVATE_KEY_HEADER,
     PRIVATE_URL_172,
     PRIVATE_URL_192,
@@ -105,6 +106,32 @@ def _write_policy(tmp_path: Path, document: dict[str, object]) -> Path:
     return path
 
 
+def _security_control_approval(
+    relative_path: str, rule_ids: list[str]
+) -> dict[str, object]:
+    return {
+        "path": relative_path,
+        "git_mode": "100644",
+        "object_type": "blob",
+        "sha256": sha256((REPO_ROOT / relative_path).read_bytes()).hexdigest(),
+        "license": "Apache-2.0",
+        "source": "project-original:validation-cell-security-controls-v1",
+        "rule_ids": rule_ids,
+    }
+
+
+def _retain_only_synthetic_fixture_approval(document: dict[str, object]) -> list[object]:
+    approvals = document["content_allowlist"]
+    assert isinstance(approvals, list)
+    approvals[:] = [
+        approval
+        for approval in approvals
+        if isinstance(approval, dict)
+        and approval.get("path") == "tests/fixtures/synthetic_sensitive_values.py"
+    ]
+    return approvals
+
+
 def test_default_policy_is_versioned_and_loads() -> None:
     policy = load_publication_policy(DEFAULT_POLICY)
 
@@ -164,6 +191,22 @@ def test_private_report_filename_rule_cannot_regress_to_directories_only(
 
     with pytest.raises(PublicationPolicyError):
         load_publication_policy(_write_policy(tmp_path, document))
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "software_factory/build/operational_evidence.py",
+        "tests/test_operational_evidence.py",
+    ],
+)
+def test_private_report_rule_allows_python_module_names(
+    tmp_path: Path, relative_path: str
+) -> None:
+    repo = _repo(tmp_path)
+    _track(repo, relative_path)
+
+    assert scan_public_tree(repo, DEFAULT_POLICY) == ()
 
 
 @pytest.mark.parametrize(
@@ -525,6 +568,40 @@ def test_high_signal_near_misses_remain_public(tmp_path: Path) -> None:
     )
 
     assert scan_public_tree(repo, DEFAULT_POLICY) == ()
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "pnpm@10.18.0",
+        "127.0.0",
+        "172.16.0",
+        "192.168.1",
+        "169.254.1",
+        "https://10.18.0/package",
+        "10.0.0.1.2",
+        "http://10.0.0.1.2/path",
+        "10.0.0.256",
+        "http://192.168.1.999/path",
+    ],
+)
+def test_private_ipv4_rules_require_one_complete_valid_address(
+    tmp_path: Path, content: str
+) -> None:
+    repo = _repo(tmp_path)
+    _track(repo, "docs/example.txt", content + "\n")
+
+    assert scan_public_tree(repo, DEFAULT_POLICY) == ()
+
+
+@pytest.mark.parametrize("content", PRIVATE_IPV4_PUNCTUATION_CASES)
+def test_private_ipv4_rules_detect_addresses_next_to_punctuation(
+    tmp_path: Path, content: str
+) -> None:
+    repo = _repo(tmp_path)
+    _track(repo, "docs/example.txt", content + "\n")
+
+    assert "private.hostname" in _rules(repo)
 
 
 def test_escaping_symlink_is_a_finding(tmp_path: Path) -> None:
@@ -894,6 +971,85 @@ def test_synthetic_fixture_approval_provenance_is_canonical(tmp_path: Path) -> N
 
     with pytest.raises(PublicationPolicyError):
         load_publication_policy(_write_policy(tmp_path, document))
+
+
+def test_reviewed_security_control_content_approval_is_accepted(tmp_path: Path) -> None:
+    document = _policy_document()
+    approvals = _retain_only_synthetic_fixture_approval(document)
+    approvals.append(
+        _security_control_approval(
+            "software_factory/execution/bridge.py",
+            ["private.absolute-path", "private.hostname"],
+        )
+    )
+    approvals.sort(key=lambda item: str(item["path"]))
+
+    policy = load_publication_policy(_write_policy(tmp_path, document))
+
+    assert {approval.path for approval in policy.content_allowlist} == {
+        "software_factory/execution/bridge.py",
+        "tests/fixtures/synthetic_sensitive_values.py",
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("path", "docs/private-example.md"),
+        ("git_mode", "100755"),
+        ("license", "MIT"),
+        ("source", "project-original"),
+        ("rule_ids", ["private.hostname"]),
+        ("rule_ids", ["private.account-id", "private.hostname"]),
+    ],
+)
+def test_security_control_content_approval_cannot_broaden_authority(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    document = _policy_document()
+    approvals = _retain_only_synthetic_fixture_approval(document)
+    approval = _security_control_approval(
+        "software_factory/execution/bridge.py",
+        ["private.absolute-path", "private.hostname"],
+    )
+    approval[field] = value
+    approvals.append(approval)
+    approvals.sort(key=lambda item: str(item["path"]))
+
+    with pytest.raises(PublicationPolicyError):
+        load_publication_policy(_write_policy(tmp_path, document))
+
+
+def test_content_approvals_must_be_in_canonical_path_order(tmp_path: Path) -> None:
+    document = _policy_document()
+    approvals = _retain_only_synthetic_fixture_approval(document)
+    approvals.append(
+        _security_control_approval(
+            "software_factory/execution/bridge.py",
+            ["private.absolute-path", "private.hostname"],
+        )
+    )
+
+    with pytest.raises(PublicationPolicyError):
+        load_publication_policy(_write_policy(tmp_path, document))
+
+
+def test_security_control_approval_requires_exact_blob_and_mode(tmp_path: Path) -> None:
+    relative_path = "software_factory/execution/bridge.py"
+    fixture = REPO_ROOT / relative_path
+    repo = _repo(tmp_path)
+    path = _track(repo, relative_path, fixture.read_bytes())
+
+    assert scan_public_tree(repo, DEFAULT_POLICY) == ()
+
+    path.write_bytes(fixture.read_bytes() + b"\n")
+    _git(repo, "add", "--", relative_path)
+    assert {"private.absolute-path", "private.hostname"} <= _rules(repo)
+
+    path.write_bytes(fixture.read_bytes())
+    path.chmod(0o755)
+    _git(repo, "add", "--chmod=+x", relative_path)
+    assert {"private.absolute-path", "private.hostname"} <= _rules(repo)
 
 
 def test_cli_exits_nonzero_and_prints_secret_safe_findings(tmp_path: Path) -> None:

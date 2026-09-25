@@ -12,6 +12,22 @@ from importlib import import_module as _import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from software_factory.build.local_artifacts import (
+        LocalArtifactError,
+        LocalArtifactExporter,
+        LocalArtifactManifest,
+        LocalArtifactResult,
+        verify_local_artifact_payloads,
+    )
+    from software_factory.build.operational_evidence import (
+        EvidenceObservation,
+        EvidenceReference,
+        OperationalDisposition,
+        OperationalEvidence,
+        OperationalEvidenceError,
+        OperationalEvidenceStore,
+        StoredOperationalEvidence,
+    )
     from software_factory.build.orchestrator import BuildOutcome, BuildStatus, run_build
     from software_factory.build.review_findings import (
         EvidenceLocation,
@@ -33,12 +49,28 @@ if TYPE_CHECKING:
         WorkflowProtocolStore,
         WorkflowProtocolStoreError,
     )
-    from software_factory.build.workspace import GitWorktree, NothingToCommit, Workspace
+    from software_factory.build.workspace import (
+        GitWorktree,
+        LocalArtifactSource,
+        LocalGitArtifactInventory,
+        LocalGitArtifactPayload,
+        LocalValidationWorkspacePolicy,
+        NothingToCommit,
+        Workspace,
+    )
 
 _EXPORTS = {
     "BuildOutcome": ("software_factory.build.orchestrator", "BuildOutcome"),
     "BuildStatus": ("software_factory.build.orchestrator", "BuildStatus"),
     "EvidenceLocation": ("software_factory.build.review_findings", "EvidenceLocation"),
+    "EvidenceObservation": (
+        "software_factory.build.operational_evidence",
+        "EvidenceObservation",
+    ),
+    "EvidenceReference": (
+        "software_factory.build.operational_evidence",
+        "EvidenceReference",
+    ),
     "FactoryStatus": ("software_factory.build.status", "FactoryStatus"),
     "FactoryStatusState": ("software_factory.build.status", "FactoryStatusState"),
     "Finding": ("software_factory.build.review_findings", "Finding"),
@@ -46,9 +78,62 @@ _EXPORTS = {
     "FindingsReport": ("software_factory.build.review_findings", "FindingsReport"),
     "FindingsUnreadable": ("software_factory.build.review_findings", "FindingsUnreadable"),
     "GitWorktree": ("software_factory.build.workspace", "GitWorktree"),
+    "LocalArtifactError": ("software_factory.build.local_artifacts", "LocalArtifactError"),
+    "LocalArtifactExporter": (
+        "software_factory.build.local_artifacts",
+        "LocalArtifactExporter",
+    ),
+    "LocalArtifactManifest": (
+        "software_factory.build.local_artifacts",
+        "LocalArtifactManifest",
+    ),
+    "LocalArtifactResult": (
+        "software_factory.build.local_artifacts",
+        "LocalArtifactResult",
+    ),
+    "LocalArtifactSource": (
+        "software_factory.build.workspace",
+        "LocalArtifactSource",
+    ),
+    "LocalGitArtifactInventory": (
+        "software_factory.build.workspace",
+        "LocalGitArtifactInventory",
+    ),
+    "LocalGitArtifactPayload": (
+        "software_factory.build.workspace",
+        "LocalGitArtifactPayload",
+    ),
+    "LocalValidationWorkspacePolicy": (
+        "software_factory.build.workspace",
+        "LocalValidationWorkspacePolicy",
+    ),
+    "verify_local_artifact_payloads": (
+        "software_factory.build.local_artifacts",
+        "verify_local_artifact_payloads",
+    ),
     "NothingToCommit": ("software_factory.build.workspace", "NothingToCommit"),
+    "OperationalDisposition": (
+        "software_factory.build.operational_evidence",
+        "OperationalDisposition",
+    ),
+    "OperationalEvidence": (
+        "software_factory.build.operational_evidence",
+        "OperationalEvidence",
+    ),
+    "OperationalEvidenceError": (
+        "software_factory.build.operational_evidence",
+        "OperationalEvidenceError",
+    ),
+    "OperationalEvidenceStore": (
+        "software_factory.build.operational_evidence",
+        "OperationalEvidenceStore",
+    ),
     "ReviewDecision": ("software_factory.build.review_policy", "ReviewDecision"),
     "SensorIdentity": ("software_factory.build.review_findings", "SensorIdentity"),
+    "StoredOperationalEvidence": (
+        "software_factory.build.operational_evidence",
+        "StoredOperationalEvidence",
+    ),
     "WorkflowProtocolSelection": (
         "software_factory.build.workflow_protocol_store",
         "WorkflowProtocolSelection",
@@ -72,6 +157,8 @@ __all__ = [
     "BuildOutcome",
     "BuildStatus",
     "EvidenceLocation",
+    "EvidenceObservation",
+    "EvidenceReference",
     "FactoryStatus",
     "FactoryStatusState",
     "Finding",
@@ -79,9 +166,22 @@ __all__ = [
     "FindingsReport",
     "FindingsUnreadable",
     "GitWorktree",
+    "LocalArtifactError",
+    "LocalArtifactExporter",
+    "LocalArtifactManifest",
+    "LocalArtifactResult",
+    "LocalArtifactSource",
+    "LocalGitArtifactInventory",
+    "LocalGitArtifactPayload",
+    "LocalValidationWorkspacePolicy",
     "NothingToCommit",
+    "OperationalDisposition",
+    "OperationalEvidence",
+    "OperationalEvidenceError",
+    "OperationalEvidenceStore",
     "ReviewDecision",
     "SensorIdentity",
+    "StoredOperationalEvidence",
     "WorkflowProtocolSelection",
     "WorkflowProtocolStore",
     "WorkflowProtocolStoreError",
@@ -90,6 +190,7 @@ __all__ = [
     "project_status",
     "run_build",
     "status_document",
+    "verify_local_artifact_payloads",
 ]
 
 

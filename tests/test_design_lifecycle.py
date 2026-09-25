@@ -7,19 +7,24 @@ import stat
 import subprocess
 from copy import deepcopy
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
 from software_factory.adapters.base import CapabilityAwareRunner
 from software_factory.build import BuildStatus
 from software_factory.build.briefs import implementer_brief
+from software_factory.build.capability_runtime import execution_policy_sha256
 from software_factory.build.contract_phase import ContractPhaseResult
+from software_factory.build.contract_store import ContractEnvelopeStore
 from software_factory.build.design_gate_store import DesignGateStore
 from software_factory.build.design_phase import DesignPhaseDisposition, DesignPhaseResult
 from software_factory.build.design_store import DesignEnvelopeStore
+from software_factory.build.operational_evidence import operational_evidence_sha256
 from software_factory.build.review_findings import FINDINGS_PATH
 from software_factory.build.workflow_protocol_store import WorkflowProtocolStore
 from software_factory.core.approvals import ApprovalRecord, ArtifactKind
+from software_factory.core.config import PublicationMode
 from software_factory.core.contracts import (
     IntentDisposition,
     artifact_sha256,
@@ -30,18 +35,193 @@ from software_factory.core.design.capabilities import (
     RunnerCapabilityDeclaration,
 )
 from software_factory.core.design.capability_names import Capability
-from software_factory.core.design.configuration import AnalyzerSpec
+from software_factory.core.design.configuration import (
+    AnalyzerSpec,
+    CapabilityProviderSpec,
+    ExecutionPolicySpec,
+    VerificationCommandSpec,
+    execution_policy_document,
+)
+from software_factory.core.design.gate import capability_authority_from_document
+from software_factory.core.design.provider_capabilities import (
+    PROVIDER_CAPABILITY_DECLARATION_VERSION,
+    PROVIDER_CAPABILITY_OBSERVATION_VERSION,
+    ProviderCapabilityDeclaration,
+    ProviderCapabilityObservation,
+    ProviderRole,
+    capability_context_sha256,
+    provider_capability_sha256,
+)
+from software_factory.core.governance import BudgetGuard
+from software_factory.execution.bridge import ExecutionScope
 from software_factory.trace.decisions import EVENT_SCHEMA_VERSION, DecisionEvent
 
 from .test_build import (
-    ContractWorkspace,
+    ContractWorkspace as _LegacyContractWorkspace,
+)
+from .test_build import (
     FakeRunner,
-    _build,
     _contract_controller_kwargs,
     _issue,
     _stub_contract_phase,
 )
+from .test_build import (
+    _build as _legacy_build,
+)
 from .test_design_gate import traced_design, valid_contract
+
+_PRIMARY_VERIFY = VerificationCommandSpec(
+    "unit", ("python", "-m", "pytest", "-q"), "zero", "default"
+)
+_EXECUTION_POLICY = ExecutionPolicySpec(
+    implementation_writable_paths=("src",),
+    verification_commands=(_PRIMARY_VERIFY,),
+)
+
+
+class ContractWorkspace(_LegacyContractWorkspace):
+    source = "test-workspace"
+    provider_role = ProviderRole.WORKSPACE
+    verification_command = _PRIMARY_VERIFY
+
+    def __init__(self, tests_pass=True):
+        super().__init__(tests_pass=tests_pass)
+        self.base = self.head_revision()
+
+    def capability_declaration(self):
+        return ProviderCapabilityDeclaration(
+            PROVIDER_CAPABILITY_DECLARATION_VERSION,
+            self.source,
+            self.provider_role,
+            frozenset({Capability.ISOLATED_WORKTREE}),
+        )
+
+    def observe_capabilities(self, *, context):
+        current = self.review_fingerprint()
+        exact = context.base_revision == self.base and context.workspace_fingerprint == current
+        return ProviderCapabilityObservation(
+            PROVIDER_CAPABILITY_OBSERVATION_VERSION,
+            self.source,
+            self.provider_role,
+            capability_context_sha256(context),
+            frozenset({Capability.ISOLATED_WORKTREE}) if exact else frozenset(),
+            frozenset() if exact else frozenset({Capability.ISOLATED_WORKTREE}),
+            (current,) if exact else (),
+        )
+
+    def capability_base_revision(self):
+        return self.base
+
+    def execution_scope(
+        self, turn_kind, *, expected_input_fingerprint=None
+    ) -> ExecutionScope:
+        fingerprint = self.review_fingerprint()
+        if (
+            expected_input_fingerprint is not None
+            and expected_input_fingerprint != fingerprint
+        ):
+            raise RuntimeError("workspace changed after containment observation")
+        writable = {
+            "contract-author": ("contracts/7.json",),
+            "design-author": (".factory/design-author.json",),
+            "reviewer": (".factory/judge-verdict.json", ".factory/review-findings.json"),
+            "implementation": ("src/**",),
+        }[turn_kind]
+        return ExecutionScope(
+            artifact_sha256(
+                {"workspace": str(self.path), "base_revision": self.base}
+            ),
+            turn_kind,
+            self.base,
+            self.head_revision(),
+            writable,
+            60,
+            "model-only-v1",
+            fingerprint,
+        )
+
+
+class _ExecutorProvider:
+    source = "test-executor"
+    provider_role = ProviderRole.EXECUTOR
+
+    def __init__(self, *, reduce_on_observation=None, execution_policy=_EXECUTION_POLICY):
+        self.observations = 0
+        self.reduce_on_observation = reduce_on_observation
+        self.execution_policy = execution_policy
+
+    def capability_declaration(self):
+        return ProviderCapabilityDeclaration(
+            PROVIDER_CAPABILITY_DECLARATION_VERSION,
+            self.source,
+            self.provider_role,
+            frozenset(
+                {
+                    Capability.BOUNDED_WRITABLE_PATHS,
+                    Capability.MERGE_FORBIDDEN,
+                    Capability.DEPLOYMENT_FORBIDDEN,
+                }
+            ),
+        )
+
+    def observe_capabilities(self, *, context):
+        self.observations += 1
+        values = self.capability_declaration().capabilities
+        failed = (
+            frozenset({Capability.BOUNDED_WRITABLE_PATHS})
+            if self.observations == self.reduce_on_observation
+            else frozenset()
+        )
+        return ProviderCapabilityObservation(
+            PROVIDER_CAPABILITY_OBSERVATION_VERSION,
+            self.source,
+            self.provider_role,
+            capability_context_sha256(context),
+            values - failed,
+            failed,
+            (execution_policy_sha256(self.execution_policy),),
+        )
+
+
+def _design_configuration(analyzers=(), *, publication_mode="pull_request"):
+    return {
+        "schema_version": "design-config-v2",
+        "design_protocol": "design_ir_v1",
+        "design_author_role": "design-author",
+        "design_analyzers": [
+            {
+                "name": spec.name,
+                "required": spec.required,
+                "options": dict(spec.options),
+            }
+            for spec in analyzers
+        ],
+        "capability_providers": [{"name": "test-executor", "options": {}}],
+        "execution_policy": execution_policy_document(_EXECUTION_POLICY),
+        "workspace_adapter": {"provider": "test-workspace", "options": {}},
+        "publication_mode": publication_mode,
+        "local_artifact_root": (
+            "controller_state" if publication_mode == "local_bundle" else None
+        ),
+    }
+
+
+def _build(source, issue, runner, workspace, **kwargs):
+    analyzers = kwargs.get("design_analyzers", ())
+    kwargs.setdefault("execution_policy", _EXECUTION_POLICY)
+    kwargs.setdefault("capability_providers", (_ExecutorProvider(),))
+    kwargs.setdefault(
+        "capability_provider_specs", (CapabilityProviderSpec("test-executor", {}),)
+    )
+    kwargs.setdefault(
+        "workspace_adapter_spec", CapabilityProviderSpec("test-workspace", {})
+    )
+    kwargs.setdefault("design_configuration", _design_configuration(analyzers))
+    if "run_id" in kwargs:
+        invocation = getattr(workspace, "_test_lifecycle_invocation", 0) + 1
+        workspace._test_lifecycle_invocation = invocation
+        kwargs["run_id"] = f"{kwargs['run_id']}-{invocation}"
+    return _legacy_build(source, issue, runner, workspace, **kwargs)
 
 
 def test_implementer_receives_exactly_one_approved_authority_artifact():
@@ -125,6 +305,25 @@ class DesignRunner(FakeRunner):
             "design-runner",
             frozenset(Capability),
             frozenset(),
+        )
+
+    def run_scoped_agent(
+        self,
+        prompt,
+        *,
+        model,
+        scope,
+        system=None,
+        tools=None,
+        cwd=None,
+    ):
+        assert type(scope) is ExecutionScope
+        return self.run_agent(
+            prompt,
+            model=model,
+            system=system,
+            tools=tools,
+            cwd=cwd,
         )
 
 
@@ -227,7 +426,7 @@ class FindingsLifecycleDesignRunner(ShippingLifecycleDesignRunner):
 
 def _stub_t2_contract(monkeypatch, workspace):
     document = valid_contract()
-    document["repo"] = "example-repo"
+    document["repo"] = "example/repo"
     document["issue"] = 7
     text = json.dumps(document)
     contract_path = pathlib.Path(workspace.path, "contracts", "7.json")
@@ -253,7 +452,10 @@ def _stub_t2_contract(monkeypatch, workspace):
             contract_document=document,
             contract_digest=artifact_sha256(document),
             checkpoint_sha=workspace.head_revision(),
-            policy_version="intent-v1",
+            policy_version="intent-v2",
+            constraint_digest=kwargs["constraint_digest"],
+            previous_contract_digest=None,
+            revision_request_digest=None,
             findings=(),
             proof_obligations=(),
             requires_approval=False,
@@ -269,18 +471,21 @@ def _stub_t2_contract(monkeypatch, workspace):
                     stage="contract",
                     timestamp=kwargs["timestamp"],
                     artifact_digest=result.contract_digest,
-                    parent_digest=None,
+                    parent_digest=result.constraint_digest,
                     source_version=workspace.head_revision(),
                     schema_version="2",
-                    policy_version="intent-v1",
+                    policy_version=result.policy_version,
                     sensor_version="contract-author-v1",
-                    config_version="contract-phase-v1",
+                    config_version="contract-phase-v3",
                     findings=(),
                     proof_obligations=(),
                     authority="deterministic-policy",
                     rationale="synthetic accepted contract",
                     disposition=IntentDisposition.PASS.value,
                     rule="contract.intent",
+                    constraint_digest=result.constraint_digest,
+                    previous_contract_digest=None,
+                    revision_request_digest=None,
                 )
             )
         except RuntimeError:
@@ -303,6 +508,79 @@ def _design_controller(controller):
     }
 
 
+def test_local_bundle_contract_constraints_preserve_configured_execution_order(tmp_path):
+    source, issue = _issue(labels=("type:feature",), title="new feature")
+
+    class LocalWorkspace(ContractWorkspace):
+        def configure_publication_policy(self, *, remote_mutations_permitted):
+            self.remote_mutations_permitted = remote_mutations_permitted
+
+        def attest_local_validation_git_policy(self):
+            return self.remote_mutations_permitted is False
+
+    class LocalContractRunner(DesignRunner):
+        def run_agent(self, prompt, *, model, system=None, tools=None, cwd=None):
+            if system == "contract-author":
+                from .test_contract_phase import _valid_v2
+
+                document = _valid_v2(human_owned=True)
+                document.update(repo="example/repo", tier="T2")
+                target = pathlib.Path(cwd, "contracts", "7.json")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(json.dumps(document) + "\n", encoding="utf-8")
+            return super().run_agent(
+                prompt, model=model, system=system, tools=tools, cwd=cwd
+            )
+
+    class EvidenceStore:
+        def stage(self, evidence):
+            return self.put(evidence)
+
+        def put(self, evidence):
+            return SimpleNamespace(digest=operational_evidence_sha256(evidence))
+
+    class Exporter:
+        def export(self, **_kwargs):
+            raise AssertionError("approval-pending must not export local artifacts")
+
+    workspace = LocalWorkspace()
+    controller = _design_controller(_contract_controller_kwargs(workspace))
+    controller["run_id"] = "local-contract"
+
+    outcome = _build(
+        source,
+        issue,
+        LocalContractRunner(),
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        design_protocol="design_ir_v1",
+        design_configuration=_design_configuration(publication_mode="local_bundle"),
+        publication_mode=PublicationMode.LOCAL_BUNDLE,
+        evidence_store=EvidenceStore(),
+        local_artifact_exporter=Exporter(),
+        **controller,
+    )
+
+    assert outcome.status is BuildStatus.APPROVAL_PENDING
+    record = ContractEnvelopeStore(controller["repo_root"]).inspect(
+        repository="example/repo", issue="7", policy_version=None
+    )
+    assert record is not None
+    constraints = record.envelope.constraint_document
+    assert constraints is not None
+    assert constraints["publication_mode"] == "local_bundle"
+    assert constraints["implementation_writable_paths"] == ["src"]
+    assert constraints["verification_commands"] == [
+        {
+            "name": "unit",
+            "argv": ["python", "-m", "pytest", "-q"],
+            "expected_exit": "zero",
+            "environment_profile": "default",
+        }
+    ]
+
+
 def test_design_protocol_fails_closed_without_all_controller_stores(monkeypatch):
     source, issue = _issue(labels=("type:feature",), title="new feature")
     workspace = ContractWorkspace()
@@ -322,7 +600,7 @@ def test_design_protocol_fails_closed_without_all_controller_stores(monkeypatch)
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         **controller,
     )
@@ -331,6 +609,36 @@ def test_design_protocol_fails_closed_without_all_controller_stores(monkeypatch)
     assert outcome.design_protocol == "design_ir_v1"
     assert dispatched == []
     assert runner.calls == ["contract-author"]
+
+
+def test_t2_design_ir_executor_obligation_blocks_before_dispatch_without_provider(
+    monkeypatch,
+) -> None:
+    """Provider availability must not erase an authenticated bounded-write obligation."""
+    source, issue = _issue(labels=("type:feature",), title="new feature")
+    workspace = ContractWorkspace()
+    runner = DesignRunner()
+    _stub_t2_contract(monkeypatch, workspace)
+    controller = _design_controller(_contract_controller_kwargs(workspace))
+    configuration = _design_configuration()
+    configuration["capability_providers"] = []
+
+    outcome = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        design_protocol="design_ir_v1",
+        design_configuration=configuration,
+        capability_providers=(),
+        capability_provider_specs=(),
+        **controller,
+    )
+
+    assert outcome.status is BuildStatus.BLOCKED
+    assert runner.calls == []
 
 
 def test_design_protocol_uses_design_phase_not_legacy_planner(monkeypatch):
@@ -356,7 +664,7 @@ def test_design_protocol_uses_design_phase_not_legacy_planner(monkeypatch):
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         **controller,
     )
@@ -371,7 +679,7 @@ def test_design_protocol_uses_design_phase_not_legacy_planner(monkeypatch):
     assert (
         controller["workflow_protocol_store"]
         .read(
-            repository="example-repo",
+            repository="example/repo",
             issue="7",
             parent_digest=phase_inputs[0]["contract_digest"],
         )
@@ -397,7 +705,7 @@ def test_sticky_legacy_selection_ignores_later_design_configuration(monkeypatch)
         .contract_digest
     )
     controller["workflow_protocol_store"].select(
-        repository="example-repo",
+        repository="example/repo",
         issue="7",
         parent_digest=contract_digest,
         requested="legacy_plan",
@@ -409,7 +717,7 @@ def test_sticky_legacy_selection_ignores_later_design_configuration(monkeypatch)
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         **controller,
     )
@@ -496,7 +804,7 @@ def test_design_configuration_does_not_change_t1_contract_path(monkeypatch):
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         **controller,
     )
@@ -507,7 +815,7 @@ def test_design_configuration_does_not_change_t1_contract_path(monkeypatch):
     assert outcome.design_protocol is None
 
 
-def test_runner_must_be_capability_aware_before_design_dispatch(monkeypatch):
+def test_non_capability_aware_runner_does_not_supply_provider_obligations(monkeypatch):
     source, issue = _issue(labels=("type:feature",), title="new feature")
     workspace = ContractWorkspace()
     runner = FakeRunner()
@@ -517,7 +825,13 @@ def test_runner_must_be_capability_aware_before_design_dispatch(monkeypatch):
     phase_calls = []
     monkeypatch.setattr(
         "software_factory.build.orchestrator.run_design_phase",
-        lambda **kwargs: phase_calls.append(kwargs),
+        lambda **kwargs: (
+            phase_calls.append(kwargs)
+            or DesignPhaseResult(
+                DesignPhaseDisposition.UNAVAILABLE,
+                "Required design evidence is unavailable",
+            )
+        ),
     )
 
     outcome = _build(
@@ -526,20 +840,27 @@ def test_runner_must_be_capability_aware_before_design_dispatch(monkeypatch):
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         **controller,
     )
 
     assert outcome.status is BuildStatus.BLOCKED
     assert phase_calls == []
-    assert runner.calls == ["contract-author"]
+    assert runner.calls == []
 
 
 def test_controller_state_inside_runner_workspace_cannot_claim_separation(monkeypatch):
     source, issue = _issue(labels=("type:feature",), title="new feature")
     workspace = ContractWorkspace()
-    runner = DesignRunner()
+    class UnmeteredDesignRunner(DesignRunner):
+        def run_agent(self, *args, **kwargs):
+            return replace(
+                super().run_agent(*args, **kwargs),
+                meta={"cost_known": False},
+            )
+
+    runner = UnmeteredDesignRunner(cost=1.25)
     _stub_contract_phase(monkeypatch, workspace)
     controller = _contract_controller_kwargs(workspace)
     unsafe = pathlib.Path(workspace.path, "controller-state")
@@ -560,12 +881,14 @@ def test_controller_state_inside_runner_workspace_cannot_claim_separation(monkey
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         **controller,
     )
 
     assert outcome.status is BuildStatus.BLOCKED
+    assert outcome.cost_usd == 1.25
+    assert outcome.unmetered_runs == 1
     assert phase_calls == []
 
 
@@ -574,7 +897,7 @@ def test_workflow_root_swap_blocks_before_design_or_planner_spend(monkeypatch):
     workspace = ContractWorkspace()
     contract = _stub_t2_contract(monkeypatch, workspace)
     design = traced_design(contract)
-    design.update(repo="example-repo", issue="7")
+    design.update(repo="example/repo", issue="7")
     runner = LifecycleDesignRunner(design)
     controller = _design_controller(_contract_controller_kwargs(workspace))
     controller_root = controller["approval_store"].root.parent
@@ -602,7 +925,7 @@ def test_workflow_root_swap_blocks_before_design_or_planner_spend(monkeypatch):
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         **controller,
     )
@@ -622,7 +945,7 @@ def test_passing_design_hands_exact_canonical_json_to_implementer_and_charges_au
     workspace = ContractWorkspace()
     contract = _stub_t2_contract(monkeypatch, workspace)
     design = traced_design(contract)
-    design.update(repo="example-repo", issue="7")
+    design.update(repo="example/repo", issue="7")
     runner = LifecycleDesignRunner(design)
     controller = _design_controller(_contract_controller_kwargs(workspace))
 
@@ -632,7 +955,7 @@ def test_passing_design_hands_exact_canonical_json_to_implementer_and_charges_au
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         **controller,
     )
@@ -647,7 +970,7 @@ def test_passing_design_hands_exact_canonical_json_to_implementer_and_charges_au
     controller["approval_store"].approve(
         ApprovalRecord(
             1,
-            "example-repo",
+            "example/repo",
             "7",
             ArtifactKind.DESIGN,
             pending.artifact_digest,
@@ -664,7 +987,7 @@ def test_passing_design_hands_exact_canonical_json_to_implementer_and_charges_au
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         **controller,
     )
@@ -681,6 +1004,176 @@ def test_passing_design_hands_exact_canonical_json_to_implementer_and_charges_au
     assert runner.calls.count("design-author") == 1
 
 
+def test_schema_correction_turn_is_charged_and_reaches_design_approval(monkeypatch):
+    source, issue = _issue(labels=("type:feature",), title="new feature")
+    workspace = ContractWorkspace()
+    contract = _stub_t2_contract(monkeypatch, workspace)
+    design = traced_design(contract)
+    design.update(repo="example/repo", issue="7")
+    invalid = deepcopy(design)
+    invalid["data_flows"][0]["unexpected"] = "not-authority"
+
+    class CorrectingRunner(LifecycleDesignRunner):
+        def __init__(self):
+            super().__init__(design)
+            self.design_author_turns = 0
+
+        def run_agent(self, prompt, *, model, system=None, tools=None, cwd=None):
+            if system == "design-author":
+                self.design_author_turns += 1
+                self.design = invalid if self.design_author_turns == 1 else design
+            return super().run_agent(
+                prompt, model=model, system=system, tools=tools, cwd=cwd
+            )
+
+    runner = CorrectingRunner()
+    controller = _design_controller(_contract_controller_kwargs(workspace))
+
+    pending = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        design_protocol="design_ir_v1",
+        **controller,
+    )
+
+    assert pending.status is BuildStatus.APPROVAL_PENDING, pending.reason
+    assert pending.cost_usd == 3.0
+    assert runner.design_author_turns == 2
+    correction = [
+        prompt
+        for prompt in runner.prompts
+        if "Correction turn:" in prompt
+    ]
+    assert len(correction) == 1
+    assert "data_flows[0]:unknown-field" in correction[0]
+    assert "not-authority" not in correction[0]
+
+
+def test_exhausted_budget_prevents_schema_correction_turn(monkeypatch):
+    source, issue = _issue(labels=("type:feature",), title="new feature")
+    workspace = ContractWorkspace()
+    contract = _stub_t2_contract(monkeypatch, workspace)
+    design = traced_design(contract)
+    design.update(repo="example/repo", issue="7")
+    design["data_flows"][0]["unexpected"] = "not-authority"
+    runner = LifecycleDesignRunner(design)
+    controller = _design_controller(_contract_controller_kwargs(workspace))
+
+    halted = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        design_protocol="design_ir_v1",
+        budget=BudgetGuard(per_task_usd=2.0),
+        **controller,
+    )
+
+    assert halted.status is BuildStatus.HALTED
+    assert halted.reason == "budget: per-task cap $2.00 is exhausted"
+    assert halted.cost_usd == 2.0
+    assert runner.calls.count("design-author") == 1
+
+
+def test_budget_crossing_schema_correction_is_charged_but_not_stored(monkeypatch):
+    source, issue = _issue(labels=("type:feature",), title="new feature")
+    workspace = ContractWorkspace()
+    contract = _stub_t2_contract(monkeypatch, workspace)
+    design = traced_design(contract)
+    design.update(repo="example/repo", issue="7")
+    invalid = deepcopy(design)
+    invalid["data_flows"][0]["unexpected"] = "not-authority"
+
+    class CorrectingRunner(LifecycleDesignRunner):
+        def __init__(self):
+            super().__init__(design)
+            self.design_author_turns = 0
+
+        def run_agent(self, prompt, *, model, system=None, tools=None, cwd=None):
+            if system == "design-author":
+                self.design_author_turns += 1
+                self.design = invalid if self.design_author_turns == 1 else design
+            return super().run_agent(
+                prompt, model=model, system=system, tools=tools, cwd=cwd
+            )
+
+    runner = CorrectingRunner()
+    controller = _design_controller(_contract_controller_kwargs(workspace))
+
+    halted = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        design_protocol="design_ir_v1",
+        budget=BudgetGuard(per_task_usd=2.5),
+        **controller,
+    )
+
+    assert halted.status is BuildStatus.HALTED
+    assert halted.reason == "budget: per-task cap $2.50 would be exceeded"
+    assert halted.cost_usd == 3.0
+    assert runner.design_author_turns == 2
+    assert controller["design_store"].read_current(
+        repository="example/repo", issue="7"
+    ) is None
+
+
+def test_recorded_design_config_v1_lifecycle_continues_with_v1_runner_authority(
+    monkeypatch,
+):
+    source, issue = _issue(labels=("type:feature",), title="new feature")
+    workspace = ContractWorkspace()
+    contract = _stub_t2_contract(monkeypatch, workspace)
+    design = traced_design(contract)
+    design.update(repo="example/repo", issue="7")
+    runner = LifecycleDesignRunner(design)
+    controller = _design_controller(_contract_controller_kwargs(workspace))
+
+    pending = _legacy_build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        design_protocol="design_ir_v1",
+        **controller,
+    )
+
+    assert pending.status is BuildStatus.APPROVAL_PENDING, pending.reason
+    stored = controller["design_gate_store"].read_current(
+        repository="example/repo", issue="7"
+    )
+    assert stored is not None
+    assert stored.envelope.design_config_document["schema_version"] == "design-config-v1"
+    assert stored.envelope.capability_document["schema_version"] == "capability-assessment-v1"
+    _approve_pending_design(controller, pending)
+
+    resumed = _legacy_build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        design_protocol="design_ir_v1",
+        **controller,
+    )
+
+    assert resumed.status is BuildStatus.BLOCKED
+    assert runner.worker_calls == 1
+    assert "fresh gate" not in resumed.reason.lower()
+
+
 def test_runtime_capability_reduction_after_approval_requires_fresh_gate(
     monkeypatch,
 ):
@@ -688,8 +1181,9 @@ def test_runtime_capability_reduction_after_approval_requires_fresh_gate(
     workspace = ContractWorkspace()
     contract = _stub_t2_contract(monkeypatch, workspace)
     design = traced_design(contract)
-    design.update(repo="example-repo", issue="7")
-    runner = LifecycleDesignRunner(design, reduce_on_observation=3)
+    design.update(repo="example/repo", issue="7")
+    runner = LifecycleDesignRunner(design)
+    executor = _ExecutorProvider(reduce_on_observation=5)
     controller = _design_controller(_contract_controller_kwargs(workspace))
     pending = _build(
         source,
@@ -697,14 +1191,15 @@ def test_runtime_capability_reduction_after_approval_requires_fresh_gate(
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
+        capability_providers=(executor,),
         **controller,
     )
     controller["approval_store"].approve(
         ApprovalRecord(
             1,
-            "example-repo",
+            "example/repo",
             "7",
             ArtifactKind.DESIGN,
             pending.artifact_digest,
@@ -721,8 +1216,9 @@ def test_runtime_capability_reduction_after_approval_requires_fresh_gate(
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
+        capability_providers=(executor,),
         **controller,
     )
 
@@ -736,15 +1232,63 @@ def test_runtime_capability_reduction_after_approval_requires_fresh_gate(
     assert not any(prompt.startswith("ROLE=implementer") for prompt in runner.prompts)
 
 
-@pytest.mark.parametrize("stale_authority", ["approval", "gate"])
-def test_stale_design_gate_or_approval_blocks_every_implementation_call(
-    monkeypatch, stale_authority
+def test_preflight_and_post_approval_use_the_same_context_and_authority_digest(
+    monkeypatch,
 ):
     source, issue = _issue(labels=("type:feature",), title="new feature")
     workspace = ContractWorkspace()
     contract = _stub_t2_contract(monkeypatch, workspace)
     design = traced_design(contract)
-    design.update(repo="example-repo", issue="7")
+    design.update(repo="example/repo", issue="7")
+    runner = LifecycleDesignRunner(design)
+    controller = _design_controller(_contract_controller_kwargs(workspace))
+    records = []
+    from software_factory.build import orchestrator as orchestrator_module
+
+    real_collect = orchestrator_module.collect_provider_capabilities
+
+    def recording_collect(**kwargs):
+        assessment = real_collect(**kwargs)
+        records.append((kwargs["context"], provider_capability_sha256(assessment)))
+        return assessment
+
+    monkeypatch.setattr(orchestrator_module, "collect_provider_capabilities", recording_collect)
+    pending = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        design_protocol="design_ir_v1",
+        **controller,
+    )
+    _approve_pending_design(controller, pending)
+
+    _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        design_protocol="design_ir_v1",
+        **controller,
+    )
+
+    assert len(records) >= 4
+    second_preflight, post_approval = records[-2:]
+    assert second_preflight[0] == post_approval[0]
+    assert second_preflight[1] == post_approval[1]
+
+
+@pytest.mark.parametrize("drift", ("base", "config", "workspace"))
+def test_post_approval_capability_context_drift_fails_freshness(monkeypatch, drift):
+    source, issue = _issue(labels=("type:feature",), title="new feature")
+    workspace = ContractWorkspace()
+    contract = _stub_t2_contract(monkeypatch, workspace)
+    design = traced_design(contract)
+    design.update(repo="example/repo", issue="7")
     runner = LifecycleDesignRunner(design)
     controller = _design_controller(_contract_controller_kwargs(workspace))
     pending = _build(
@@ -753,14 +1297,246 @@ def test_stale_design_gate_or_approval_blocks_every_implementation_call(
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
+        design_protocol="design_ir_v1",
+        **controller,
+    )
+    _approve_pending_design(controller, pending)
+    resume = {}
+    if drift == "base":
+        workspace.base = "a" * 40
+    elif drift == "config":
+        changed = _design_configuration(())
+        changed["execution_policy"]["network_profile"] = "isolated"
+        changed_policy = ExecutionPolicySpec(
+            implementation_writable_paths=("src",),
+            verification_commands=(_PRIMARY_VERIFY,),
+            network_profile="isolated",
+        )
+        resume.update(
+            design_configuration=changed,
+            execution_policy=changed_policy,
+            capability_providers=(
+                _ExecutorProvider(execution_policy=changed_policy),
+            ),
+        )
+    else:
+        pathlib.Path(workspace.path, "context-drift.txt").write_text(
+            "changed\n", encoding="utf-8"
+        )
+
+    outcome = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        design_protocol="design_ir_v1",
+        **resume,
+        **controller,
+    )
+
+    assert outcome.status is BuildStatus.BLOCKED
+    assert outcome.gate_state == DesignPhaseDisposition.UNAVAILABLE.value
+    assert runner.worker_calls == 0
+
+
+def test_v2_runtime_rejects_execution_policy_mismatch_before_collection(monkeypatch):
+    source, issue = _issue(labels=("type:feature",), title="new feature")
+    workspace = ContractWorkspace()
+    _stub_t2_contract(monkeypatch, workspace)
+    changed_policy = ExecutionPolicySpec(
+        implementation_writable_paths=("src",),
+        verification_commands=(_PRIMARY_VERIFY,),
+        network_profile="isolated",
+    )
+
+    with pytest.raises(ValueError, match="execution policy"):
+        _build(
+            source,
+            issue,
+            DesignRunner(),
+            workspace,
+            require_contract=True,
+            repository="example/repo",
+            design_protocol="design_ir_v1",
+            execution_policy=changed_policy,
+            design_configuration=_design_configuration(()),
+        )
+
+    assert workspace.created is False
+
+
+def test_v2_runtime_rejects_provider_source_and_options_mismatch(monkeypatch):
+    source, issue = _issue(labels=("type:feature",), title="new feature")
+    workspace = ContractWorkspace()
+    _stub_t2_contract(monkeypatch, workspace)
+    provider = _ExecutorProvider()
+    provider.source = "other-executor"
+
+    with pytest.raises(ValueError, match="capability provider"):
+        _build(
+            source,
+            issue,
+            DesignRunner(),
+            workspace,
+            require_contract=True,
+            repository="example/repo",
+            design_protocol="design_ir_v1",
+            capability_providers=(provider,),
+            capability_provider_specs=(
+                CapabilityProviderSpec("test-executor", {"mode": "wrong"}),
+            ),
+            design_configuration=_design_configuration(()),
+        )
+
+    assert workspace.created is False
+
+
+def test_v2_runtime_rejects_workspace_factory_mismatch_before_collection(monkeypatch):
+    source, issue = _issue(labels=("type:feature",), title="new feature")
+    workspace = ContractWorkspace()
+    _stub_t2_contract(monkeypatch, workspace)
+
+    with pytest.raises(ValueError, match="workspace"):
+        _build(
+            source,
+            issue,
+            DesignRunner(),
+            workspace,
+            require_contract=True,
+            repository="example/repo",
+            design_protocol="design_ir_v1",
+            workspace_adapter_spec=CapabilityProviderSpec("other-workspace", {}),
+            design_configuration=_design_configuration(()),
+        )
+
+    assert workspace.created is False
+
+
+def test_v2_runtime_rejects_workspace_native_source_mismatch_before_collection(
+    monkeypatch,
+):
+    source, issue = _issue(labels=("type:feature",), title="new feature")
+    workspace = ContractWorkspace()
+    workspace.source = "other-workspace"
+    _stub_t2_contract(monkeypatch, workspace)
+
+    with pytest.raises(ValueError, match=r"workspace.*source"):
+        _build(
+            source,
+            issue,
+            DesignRunner(),
+            workspace,
+            require_contract=True,
+            repository="example/repo",
+            design_protocol="design_ir_v1",
+            design_configuration=_design_configuration(()),
+        )
+
+    assert workspace.created is False
+
+
+def test_workspace_source_change_during_create_fails_before_capability_collection(
+    monkeypatch,
+):
+    from software_factory.build import orchestrator as orchestrator_module
+
+    class SourceChangingWorkspace(ContractWorkspace):
+        def create(self):
+            super().create()
+            self.source = "other-workspace"
+
+    source, issue = _issue(labels=("type:feature",), title="new feature")
+    workspace = SourceChangingWorkspace()
+    _stub_t2_contract(monkeypatch, workspace)
+    runner = DesignRunner()
+    controller = _design_controller(_contract_controller_kwargs(workspace))
+    collection_calls = 0
+    real_collect = orchestrator_module.collect_provider_capabilities
+
+    def collect(*args, **kwargs):
+        nonlocal collection_calls
+        collection_calls += 1
+        return real_collect(*args, **kwargs)
+
+    monkeypatch.setattr(orchestrator_module, "collect_provider_capabilities", collect)
+
+    outcome = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        design_protocol="design_ir_v1",
+        design_configuration=_design_configuration(()),
+        **controller,
+    )
+
+    assert outcome.status is BuildStatus.BLOCKED
+    assert (
+        outcome.reason
+        == "workspace native source identity does not match configuration"
+    )
+    assert collection_calls == 0
+    assert runner.calls == []
+    assert runner.worker_calls == 0
+
+
+def test_legacy_workspace_source_change_during_create_fails_before_implementation():
+    class SourceChangingWorkspace(ContractWorkspace):
+        def create(self):
+            super().create()
+            self.source = "other-workspace"
+
+        def push(self, revision=None, *, expected_remote_tip=None):
+            self.pushed = True
+            return self.branch
+
+    source, issue = _issue()
+    workspace = SourceChangingWorkspace()
+    runner = FakeRunner()
+
+    outcome = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=False,
+        design_protocol="legacy_plan",
+    )
+
+    assert outcome.status is BuildStatus.BLOCKED
+    assert runner.worker_calls == 0
+
+
+@pytest.mark.parametrize("stale_authority", ["approval", "gate"])
+def test_stale_design_gate_or_approval_blocks_every_implementation_call(
+    monkeypatch, stale_authority
+):
+    source, issue = _issue(labels=("type:feature",), title="new feature")
+    workspace = ContractWorkspace()
+    contract = _stub_t2_contract(monkeypatch, workspace)
+    design = traced_design(contract)
+    design.update(repo="example/repo", issue="7")
+    runner = LifecycleDesignRunner(design)
+    controller = _design_controller(_contract_controller_kwargs(workspace))
+    pending = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
         design_protocol="design_ir_v1",
         **controller,
     )
     controller["approval_store"].approve(
         ApprovalRecord(
             1,
-            "example-repo",
+            "example/repo",
             "7",
             ArtifactKind.DESIGN,
             pending.artifact_digest,
@@ -781,7 +1557,7 @@ def test_stale_design_gate_or_approval_blocks_every_implementation_call(
                 controller["approval_store"].approve(
                     ApprovalRecord(
                         1,
-                        "example-repo",
+                        "example/repo",
                         "7",
                         ArtifactKind.DESIGN,
                         "f" * 64,
@@ -793,7 +1569,7 @@ def test_stale_design_gate_or_approval_blocks_every_implementation_call(
                 )
             else:
                 pointer = controller["design_gate_store"].current_path_for(
-                    repository="example-repo", issue="7"
+                    repository="example/repo", issue="7"
                 )
                 pointer.write_bytes(b"{corrupt\n")
                 pointer.chmod(0o600)
@@ -807,7 +1583,7 @@ def test_stale_design_gate_or_approval_blocks_every_implementation_call(
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         **controller,
     )
@@ -825,7 +1601,7 @@ def test_reformatted_contract_text_blocks_before_design_dispatch(monkeypatch):
     workspace = ContractWorkspace()
     contract = _stub_t2_contract(monkeypatch, workspace)
     design = traced_design(contract)
-    design.update(repo="example-repo", issue="7")
+    design.update(repo="example/repo", issue="7")
     runner = LifecycleDesignRunner(design)
     controller = _design_controller(_contract_controller_kwargs(workspace))
     from software_factory.build import orchestrator
@@ -846,7 +1622,7 @@ def test_reformatted_contract_text_blocks_before_design_dispatch(monkeypatch):
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         **controller,
     )
@@ -861,7 +1637,7 @@ def _approve_pending_design(controller, pending):
     controller["approval_store"].approve(
         ApprovalRecord(
             1,
-            "example-repo",
+            "example/repo",
             "7",
             ArtifactKind.DESIGN,
             pending.artifact_digest,
@@ -880,12 +1656,12 @@ def test_revision_reauthenticates_without_spending_or_reinvoking_design_author(
     workspace = ContractWorkspace()
     contract = _stub_t2_contract(monkeypatch, workspace)
     design = traced_design(contract)
-    design.update(repo="example-repo", issue="7")
+    design.update(repo="example/repo", issue="7")
     runner = ShippingLifecycleDesignRunner(
         design,
         judge_replies=["verdict: REVISE", "verdict: PASS"],
-        reduce_on_observation=4,
     )
+    executor = _ExecutorProvider(reduce_on_observation=6)
     controller = _design_controller(_contract_controller_kwargs(workspace))
     pending = _build(
         source,
@@ -893,8 +1669,9 @@ def test_revision_reauthenticates_without_spending_or_reinvoking_design_author(
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
+        capability_providers=(executor,),
         **controller,
     )
     _approve_pending_design(controller, pending)
@@ -905,8 +1682,9 @@ def test_revision_reauthenticates_without_spending_or_reinvoking_design_author(
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
+        capability_providers=(executor,),
         **controller,
     )
 
@@ -923,7 +1701,7 @@ def test_each_revision_worker_has_a_gate_for_the_exact_current_workspace(monkeyp
     workspace = ContractWorkspace()
     contract = _stub_t2_contract(monkeypatch, workspace)
     design = traced_design(contract)
-    design.update(repo="example-repo", issue="7")
+    design.update(repo="example/repo", issue="7")
     runner = ShippingLifecycleDesignRunner(
         design,
         judge_replies=["verdict: REVISE", "verdict: PASS"],
@@ -935,7 +1713,7 @@ def test_each_revision_worker_has_a_gate_for_the_exact_current_workspace(monkeyp
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         **controller,
     )
@@ -943,7 +1721,7 @@ def test_each_revision_worker_has_a_gate_for_the_exact_current_workspace(monkeyp
     worker_gate_digests = []
 
     def assert_current_gate():
-        current = controller["design_gate_store"].read_current(repository="example-repo", issue="7")
+        current = controller["design_gate_store"].read_current(repository="example/repo", issue="7")
         assert current is not None
         assert current.envelope.expected_artifact_fingerprint == (workspace.review_fingerprint())
         worker_gate_digests.append(current.envelope.gate_result_digest)
@@ -956,7 +1734,7 @@ def test_each_revision_worker_has_a_gate_for_the_exact_current_workspace(monkeyp
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         **controller,
     )
@@ -968,12 +1746,127 @@ def test_each_revision_worker_has_a_gate_for_the_exact_current_workspace(monkeyp
     assert resumed.cost_usd == 7.0
 
 
+def test_base_drift_during_first_judge_blocks_before_second_worker(monkeypatch):
+    source, issue = _issue(labels=("type:feature",), title="new feature")
+    workspace = ContractWorkspace()
+    contract = _stub_t2_contract(monkeypatch, workspace)
+    design = traced_design(contract)
+    design.update(repo="example/repo", issue="7")
+
+    class BaseDriftingRunner(ShippingLifecycleDesignRunner):
+        def run_agent(self, prompt, *, model, system=None, tools=None, cwd=None):
+            result = super().run_agent(
+                prompt, model=model, system=system, tools=tools, cwd=cwd
+            )
+            if system == "judge" and self.judge_calls == 1:
+                workspace.base = "a" * 40
+            return result
+
+    runner = BaseDriftingRunner(
+        design,
+        judge_replies=["verdict: REVISE", "verdict: PASS"],
+    )
+    controller = _design_controller(_contract_controller_kwargs(workspace))
+    pending = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        design_protocol="design_ir_v1",
+        **controller,
+    )
+    _approve_pending_design(controller, pending)
+
+    resumed = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        design_protocol="design_ir_v1",
+        **controller,
+    )
+
+    assert resumed.status is BuildStatus.BLOCKED
+    assert runner.worker_calls == 1
+    assert resumed.gate_state == DesignPhaseDisposition.UNAVAILABLE.value
+    assert not workspace.pushed
+
+
+def test_revision_and_publication_consume_exact_fingerprint_transitions_once(
+    monkeypatch,
+):
+    source, issue = _issue(labels=("type:feature",), title="new feature")
+    workspace = ContractWorkspace()
+    contract = _stub_t2_contract(monkeypatch, workspace)
+    design = traced_design(contract)
+    design.update(repo="example/repo", issue="7")
+    runner = ShippingLifecycleDesignRunner(
+        design,
+        judge_replies=["verdict: REVISE", "verdict: PASS"],
+    )
+    controller = _design_controller(_contract_controller_kwargs(workspace))
+    pending = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        design_protocol="design_ir_v1",
+        **controller,
+    )
+    _approve_pending_design(controller, pending)
+    from software_factory.build import orchestrator as orchestrator_module
+
+    real_phase = orchestrator_module.run_design_phase
+    transitions = []
+
+    def recording_phase(**kwargs):
+        transition = kwargs.get("authorized_capability_context_transition")
+        if transition is not None:
+            current = kwargs["gate_store"].read_current(
+                repository="example/repo", issue="7"
+            )
+            assert current is not None
+            stored = capability_authority_from_document(
+                current.envelope.capability_document
+            )
+            assert transition == (
+                stored.context.workspace_fingerprint,
+                kwargs["capabilities"].context.workspace_fingerprint,
+            )
+            transitions.append(transition)
+        return real_phase(**kwargs)
+
+    monkeypatch.setattr(orchestrator_module, "run_design_phase", recording_phase)
+
+    resumed = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        design_protocol="design_ir_v1",
+        **controller,
+    )
+
+    assert resumed.status is BuildStatus.SHIPPED, resumed.reason
+    assert len(transitions) >= 2
+    assert len(set(transitions)) == len(transitions)
+    assert all(before != after for before, after in transitions)
+
+
 def test_publication_refresh_advances_gate_to_exact_implemented_surface(monkeypatch):
     source, issue = _issue(labels=("type:feature",), title="new feature")
     workspace = ContractWorkspace()
     contract = _stub_t2_contract(monkeypatch, workspace)
     design = traced_design(contract)
-    design.update(repo="example-repo", issue="7")
+    design.update(repo="example/repo", issue="7")
     runner = ShippingLifecycleDesignRunner(design, judge_replies=["verdict: PASS"])
     controller = _design_controller(_contract_controller_kwargs(workspace))
     pending = _build(
@@ -982,12 +1875,12 @@ def test_publication_refresh_advances_gate_to_exact_implemented_surface(monkeypa
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         **controller,
     )
     initial_gate = controller["design_gate_store"].read_current(
-        repository="example-repo", issue="7"
+        repository="example/repo", issue="7"
     )
     assert initial_gate is not None
     _approve_pending_design(controller, pending)
@@ -998,13 +1891,13 @@ def test_publication_refresh_advances_gate_to_exact_implemented_surface(monkeypa
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         **controller,
     )
 
     publication_gate = controller["design_gate_store"].read_current(
-        repository="example-repo", issue="7"
+        repository="example/repo", issue="7"
     )
     assert resumed.status is BuildStatus.SHIPPED, resumed.reason
     assert publication_gate is not None
@@ -1023,7 +1916,7 @@ def test_design_ir_findings_v2_replays_and_ships_end_to_end(monkeypatch):
     workspace = ContractWorkspace()
     contract = _stub_t2_contract(monkeypatch, workspace)
     design = traced_design(contract)
-    design.update(repo="example-repo", issue="7")
+    design.update(repo="example/repo", issue="7")
     runner = FindingsLifecycleDesignRunner(design)
     controller = _design_controller(_contract_controller_kwargs(workspace))
     pending = _build(
@@ -1032,7 +1925,7 @@ def test_design_ir_findings_v2_replays_and_ships_end_to_end(monkeypatch):
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         review_protocol="findings_v2",
         **controller,
@@ -1045,7 +1938,7 @@ def test_design_ir_findings_v2_replays_and_ships_end_to_end(monkeypatch):
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         review_protocol="findings_v2",
         **controller,
@@ -1089,8 +1982,9 @@ def test_design_lifecycle_blocks_then_reapproves_exact_revision(monkeypatch):
         check=True,
     )
     contract = _valid_v2(human_owned=True)
+    contract["repo"] = "example/repo"
     first_design = traced_design(contract)
-    first_design.update(repo="example-repo", issue="7")
+    first_design.update(repo="example/repo", issue="7")
     corrected_design = deepcopy(first_design)
     corrected_design["summary"] = "Corrected design after the harness posture was secured."
 
@@ -1136,7 +2030,7 @@ def test_design_lifecycle_blocks_then_reapproves_exact_revision(monkeypatch):
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         design_analyzers=analyzer_specs,
         review_protocol="findings_v2",
@@ -1149,11 +2043,11 @@ def test_design_lifecycle_blocks_then_reapproves_exact_revision(monkeypatch):
     controller["approval_store"].approve(
         ApprovalRecord(
             1,
-            "example-repo",
+            "example/repo",
             "7",
             ArtifactKind.CONTRACT,
             contract_pending.artifact_digest,
-            None,
+            contract_pending.parent_digest,
             "operator",
             "2026-08-10T00:00:00Z",
             "Approved exact Contract.",
@@ -1166,7 +2060,7 @@ def test_design_lifecycle_blocks_then_reapproves_exact_revision(monkeypatch):
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         design_analyzers=analyzer_specs,
         review_protocol="findings_v2",
@@ -1176,8 +2070,8 @@ def test_design_lifecycle_blocks_then_reapproves_exact_revision(monkeypatch):
     assert blocked.gate_state == "block", blocked.reason
     assert runner.design_author_turns == 1
     assert runner.worker_calls == 0
-    first = controller["design_store"].read_current(repository="example-repo", issue="7")
-    first_gate = controller["design_gate_store"].read_current(repository="example-repo", issue="7")
+    first = controller["design_store"].read_current(repository="example/repo", issue="7")
+    first_gate = controller["design_gate_store"].read_current(repository="example/repo", issue="7")
     assert first is not None and first_gate is not None
     analyzer_document = first_gate.envelope.analyzer_documents[0]
     assert analyzer_document["name"] == "harness"
@@ -1194,7 +2088,7 @@ def test_design_lifecycle_blocks_then_reapproves_exact_revision(monkeypatch):
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         design_analyzers=analyzer_specs,
         review_protocol="findings_v2",
@@ -1204,9 +2098,9 @@ def test_design_lifecycle_blocks_then_reapproves_exact_revision(monkeypatch):
     assert reauthored_blocked.gate_state == "block"
     assert runner.design_author_turns == 2
     assert runner.worker_calls == 0
-    corrected = controller["design_store"].read_current(repository="example-repo", issue="7")
+    corrected = controller["design_store"].read_current(repository="example/repo", issue="7")
     corrected_block_gate = controller["design_gate_store"].read_current(
-        repository="example-repo", issue="7"
+        repository="example/repo", issue="7"
     )
     assert corrected is not None and corrected_block_gate is not None
     assert corrected.envelope.artifact_digest != first.envelope.artifact_digest
@@ -1232,7 +2126,7 @@ def test_design_lifecycle_blocks_then_reapproves_exact_revision(monkeypatch):
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         design_analyzers=analyzer_specs,
         review_protocol="findings_v2",
@@ -1241,7 +2135,7 @@ def test_design_lifecycle_blocks_then_reapproves_exact_revision(monkeypatch):
     assert runner.design_author_turns == 2, pending.reason
     assert pending.status is BuildStatus.APPROVAL_PENDING, pending.reason
     corrected_gate = controller["design_gate_store"].read_current(
-        repository="example-repo", issue="7"
+        repository="example/repo", issue="7"
     )
     assert corrected_gate is not None
     assert pending.artifact_digest == corrected.envelope.artifact_digest
@@ -1257,7 +2151,7 @@ def test_design_lifecycle_blocks_then_reapproves_exact_revision(monkeypatch):
     controller["approval_store"].approve(
         ApprovalRecord(
             1,
-            "example-repo",
+            "example/repo",
             "7",
             ArtifactKind.DESIGN,
             pending.artifact_digest,
@@ -1273,7 +2167,7 @@ def test_design_lifecycle_blocks_then_reapproves_exact_revision(monkeypatch):
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         design_analyzers=analyzer_specs,
         review_protocol="findings_v2",
@@ -1298,7 +2192,7 @@ def test_design_lifecycle_blocks_then_reapproves_exact_revision(monkeypatch):
     runner_root = pathlib.Path(workspace.path).resolve()
     assert controller_root not in (runner_root, *runner_root.parents)
     assert runner_root not in (controller_root, *controller_root.parents)
-    history = controller["decision_log"].read_verified(repository="example-repo", issue="7")
+    history = controller["decision_log"].read_verified(repository="example/repo", issue="7")
     assert history[-1].stage == "final-disposition"
     assert history[-1].disposition == "SHIPPED"
 
@@ -1308,7 +2202,7 @@ def test_approval_replacement_after_judging_blocks_before_publication(monkeypatc
     workspace = ContractWorkspace()
     contract = _stub_t2_contract(monkeypatch, workspace)
     design = traced_design(contract)
-    design.update(repo="example-repo", issue="7")
+    design.update(repo="example/repo", issue="7")
     runner = ShippingLifecycleDesignRunner(design, judge_replies=["verdict: PASS"])
     controller = _design_controller(_contract_controller_kwargs(workspace))
     pending = _build(
@@ -1317,7 +2211,7 @@ def test_approval_replacement_after_judging_blocks_before_publication(monkeypatc
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         **controller,
     )
@@ -1333,7 +2227,7 @@ def test_approval_replacement_after_judging_blocks_before_publication(monkeypatc
             controller["approval_store"].approve(
                 ApprovalRecord(
                     1,
-                    "example-repo",
+                    "example/repo",
                     "7",
                     ArtifactKind.DESIGN,
                     "f" * 64,
@@ -1353,7 +2247,7 @@ def test_approval_replacement_after_judging_blocks_before_publication(monkeypatc
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         design_protocol="design_ir_v1",
         **controller,
     )
@@ -1362,5 +2256,5 @@ def test_approval_replacement_after_judging_blocks_before_publication(monkeypatc
     assert runner.worker_calls == 1
     assert runner.judge_calls == 2
     assert runner.calls.count("design-author") == 1
-    assert workspace.committed is not None
+    assert workspace.committed is None
     assert not workspace.pushed

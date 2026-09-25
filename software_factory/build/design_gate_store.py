@@ -22,12 +22,13 @@ from software_factory.core.design.gate import (
     DesignGateResult,
     DesignGateState,
     analyzer_execution_from_document,
-    capability_assessment_from_document,
+    capability_authority_from_document,
     design_gate_document,
     design_gate_sha256,
     evaluate_design_gate,
     finding_override_from_document,
     parse_design_config_document,
+    validate_capability_authority_protocol,
 )
 
 SCHEMA_VERSION = 1
@@ -478,7 +479,8 @@ class DesignGateStore(DesignEnvelopeStore):
             raise DesignGateStoreError("design config document is invalid") from exc
         capability = _normalize_mapping(capability_input, "capability document")
         try:
-            capability_assessment_from_document(capability)
+            authority = capability_authority_from_document(capability)
+            validate_capability_authority_protocol(config, authority)
         except (TypeError, ValueError) as exc:
             raise DesignGateStoreError("capability document is invalid") from exc
         if isinstance(analyzer_inputs, (Mapping, str, bytes)) or isinstance(
@@ -590,7 +592,10 @@ class DesignGateStore(DesignEnvelopeStore):
     def _replay_envelope(cls, envelope: DesignGateEnvelope) -> DesignGateResult:
         """Reconstruct every typed input and require the stored controller result."""
         try:
-            capability = capability_assessment_from_document(envelope.capability_document)
+            capability = capability_authority_from_document(envelope.capability_document)
+            validate_capability_authority_protocol(
+                envelope.design_config_document, capability
+            )
             analyzers = tuple(
                 analyzer_execution_from_document(item) for item in envelope.analyzer_documents
             )

@@ -25,6 +25,9 @@ class PublishedLifecycleAuthority:
     policy_version: str
     code_surface_digest: str
     publication_revision: str
+    constraint_digest: str | None = None
+    previous_contract_digest: str | None = None
+    revision_request_digest: str | None = None
     expected_contract_intent_authority: str = "deterministic-policy"
     expected_workflow_protocol: str = "design_ir_v1"
     expected_plan_digest: str | None = None
@@ -36,6 +39,7 @@ class PublishedLifecycleAuthority:
     restart_count: int = 0
     revise_cap: int = 2
     expected_tail_digest: str | None = None
+    expected_terminal_disposition: str = "SHIPPED"
 
 
 @dataclass(frozen=True)
@@ -64,10 +68,44 @@ def verify_published_lifecycle(
             return [thaw(child) for child in value]
         return value
 
+    def valid_digest(value: object) -> bool:
+        return bool(
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    if authority.policy_version not in {"intent-v1", "intent-v2"}:
+        return fail("unsupported-contract-policy")
+    if any(
+        digest is not None and not valid_digest(digest)
+        for digest in (
+            authority.constraint_digest,
+            authority.previous_contract_digest,
+            authority.revision_request_digest,
+        )
+    ) or (authority.previous_contract_digest is None) != (
+        authority.revision_request_digest is None
+    ):
+        return fail("trusted-contract-authority-invalid")
+    if authority.policy_version == "intent-v1":
+        if any(
+            digest is not None
+            for digest in (
+                authority.constraint_digest,
+                authority.previous_contract_digest,
+                authority.revision_request_digest,
+            )
+        ):
+            return fail("trusted-contract-authority-invalid")
+    elif authority.constraint_digest is None:
+        return fail("trusted-contract-authority-invalid")
+
     if authority.expected_review_protocol is None:
         return fail("trusted-review-expectations-absent")
     if (
         authority.expected_review_protocol not in {"verdict_v1", "findings_v2"}
+        or authority.expected_terminal_disposition not in {"SHIPPED", "VALIDATED"}
         or any(
             type(sensor) is not tuple
             or len(sensor) != 3
@@ -81,9 +119,24 @@ def verify_published_lifecycle(
     ):
         return fail("trusted-review-expectations-invalid")
 
-    current = tuple(event for event in history if event.run_id == authority.run_id)
-    if not current or current[-1] is not history[-1]:
+    current_positions = tuple(
+        index for index, event in enumerate(history) if event.run_id == authority.run_id
+    )
+    if not current_positions or current_positions[-1] != len(history) - 1:
         return fail("terminal-not-current")
+    if current_positions != tuple(range(current_positions[0], len(history))):
+        return fail("run-boundary")
+    current = tuple(history[index] for index in current_positions)
+    if authority.policy_version == "intent-v1" and any(
+        digest is not None
+        for event in current
+        for digest in (
+            event.constraint_digest,
+            event.previous_contract_digest,
+            event.revision_request_digest,
+        )
+    ):
+        return fail("contract-authority")
     tail = current[-1]
     if (
         authority.expected_tail_digest is not None
@@ -94,6 +147,11 @@ def verify_published_lifecycle(
     positions: dict[str, list[int]] = {}
     for index, event in enumerate(current):
         positions.setdefault(event.stage, []).append(index)
+
+    if len(positions.get("contract", ())) != 1 or len(
+        positions.get("contract-outcome", ())
+    ) != 1:
+        return fail("contract-cardinality")
 
     def last(stage: str, before: int) -> int | None:
         return next(
@@ -173,40 +231,96 @@ def verify_published_lifecycle(
         "contract-phase-v2",
         "contract.acceptance",
     )
-    if (
+    constraint_contract_metadata = (
+        "2",
+        "contract-author-v1",
+        "contract-phase-v3",
+        "contract.intent",
+    )
+    constraint_acceptance_metadata = (
+        "contract-v2",
+        "contract-phase-v3",
+        "contract-phase-v3",
+        "contract.acceptance",
+    )
+    common_contract_invalid = (
         contract.artifact_digest != authority.contract_digest
-        or contract.parent_digest is not None
         or contract.policy_version != authority.policy_version
         or contract.disposition != "PASS"
-        or contract_metadata
-        not in {
-            contract_v1_metadata,
-            contract_v2_metadata,
-            stored_acceptance_metadata,
-        }
-        or (
-            contract_metadata == stored_acceptance_metadata
-            and contract.authority != "contract-phase"
-        )
-        or (
-            contract_metadata == contract_v1_metadata
-            and contract.authority != "compatibility-policy"
-        )
-        or (
-            contract_metadata == contract_v2_metadata
-            and contract.authority != authority.expected_contract_intent_authority
-        )
         or outcome.artifact_digest != authority.contract_digest
-        or outcome.parent_digest is not None
         or outcome.source_version != checkpoint
         or outcome.schema_version != "contract-v2"
         or outcome.policy_version != authority.policy_version
-        or outcome.sensor_version != "contract-phase-v2"
-        or outcome.config_version != "contract-phase-v2"
         or outcome.authority != "deterministic-controller"
         or outcome.disposition != "PASS"
         or outcome.rule != "build.contract-outcome"
-    ):
+    )
+    if authority.policy_version == "intent-v1":
+        contract_authority_invalid = (
+            contract.parent_digest is not None
+            or outcome.parent_digest is not None
+            or any(
+                digest is not None
+                for event in (contract, outcome)
+                for digest in (
+                    event.constraint_digest,
+                    event.previous_contract_digest,
+                    event.revision_request_digest,
+                )
+            )
+            or contract_metadata
+            not in {
+                contract_v1_metadata,
+                contract_v2_metadata,
+                stored_acceptance_metadata,
+            }
+            or (
+                contract_metadata == stored_acceptance_metadata
+                and contract.authority != "contract-phase"
+            )
+            or (
+                contract_metadata == contract_v1_metadata
+                and contract.authority != "compatibility-policy"
+            )
+            or (
+                contract_metadata == contract_v2_metadata
+                and contract.authority != authority.expected_contract_intent_authority
+            )
+            or outcome.sensor_version != "contract-phase-v2"
+            or outcome.config_version != "contract-phase-v2"
+        )
+    else:
+        expected_lineage = (
+            authority.constraint_digest,
+            authority.previous_contract_digest,
+            authority.revision_request_digest,
+        )
+        contract_authority_invalid = (
+            contract.parent_digest != authority.constraint_digest
+            or outcome.parent_digest != authority.constraint_digest
+            or any(
+                (
+                    event.constraint_digest,
+                    event.previous_contract_digest,
+                    event.revision_request_digest,
+                )
+                != expected_lineage
+                for event in (contract, outcome)
+            )
+            or contract_metadata
+            not in {constraint_contract_metadata, constraint_acceptance_metadata}
+            or (
+                contract_metadata == constraint_contract_metadata
+                and contract.authority != authority.expected_contract_intent_authority
+            )
+            or (
+                contract_metadata == constraint_acceptance_metadata
+                and contract.authority != "contract-phase"
+            )
+            or outcome.sensor_version != "contract-phase-v3"
+            or outcome.config_version != "contract-phase-v3"
+        )
+    if common_contract_invalid or contract_authority_invalid:
         return fail("contract-authority")
 
     if authority.expected_workflow_protocol == "design_ir_v1":
@@ -595,7 +709,7 @@ def verify_published_lifecycle(
         or tail.sensor_version != "publication-controller-v1"
         or tail.config_version != "publication-v1"
         or tail.authority != "deterministic-controller"
-        or tail.disposition != "SHIPPED"
+        or tail.disposition != authority.expected_terminal_disposition
         or tail.rule != "build.final-disposition"
     ):
         return fail("terminal-authority")

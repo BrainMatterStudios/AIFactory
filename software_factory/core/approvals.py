@@ -182,7 +182,12 @@ class ApprovalStore:
                 "approval authority is unreadable",
                 kind=AuthorityFailureKind.UNREADABLE_RUNTIME,
             ) from exc
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        except (
+            json.JSONDecodeError,
+            RecursionError,
+            UnicodeDecodeError,
+            ValueError,
+        ) as exc:
             raise ApprovalError("approval authority is corrupt") from exc
         finally:
             if descriptor is not None:
@@ -346,7 +351,7 @@ class ApprovalStore:
     def _validate_parent(artifact_kind: ArtifactKind, parent_digest: str | None) -> None:
         if artifact_kind is ArtifactKind.CONTRACT:
             if parent_digest is not None:
-                raise ApprovalError("contract approvals cannot carry a parent digest")
+                ApprovalStore._validate_digest(parent_digest)
             return
         if parent_digest is None:
             raise ApprovalError(f"{artifact_kind.value} approvals require a parent contract digest")

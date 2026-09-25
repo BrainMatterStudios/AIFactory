@@ -11,11 +11,16 @@ import os
 import pathlib
 import subprocess
 import tempfile
+from dataclasses import replace
+
+import pytest
 
 from software_factory.adapters.base import Issue, RunResult
 from software_factory.adapters.reference.memory import MemorySource
-from software_factory.build import BuildStatus, run_build
+from software_factory.build import BuildOutcome, BuildStatus, run_build
+from software_factory.build.contract_constraints import build_contract_constraints
 from software_factory.build.contract_phase import ContractPhaseResult
+from software_factory.build.contract_revision import build_revision_request
 from software_factory.build.contract_store import (
     ContractEnvelopeStore,
     ContractStoreError,
@@ -28,12 +33,26 @@ from software_factory.core.approvals import (
     ApprovalStore,
     ArtifactKind,
 )
+from software_factory.core.config import PublicationMode
 from software_factory.core.contracts import IntentDisposition, artifact_sha256
+from software_factory.core.design.configuration import (
+    ExecutionPolicySpec,
+    VerificationCommandSpec,
+)
 from software_factory.core.governance import BudgetGuard
 from software_factory.core.orchestrate import Tier
 from software_factory.trace.decisions import EVENT_SCHEMA_VERSION, DecisionEvent, DecisionLog
 
 DEV = "develop"
+
+
+def test_build_outcome_local_publication_fields_are_backward_compatible_defaults():
+    """Adding local validation identity must not break existing outcome constructors."""
+    outcome = BuildOutcome("7", BuildStatus.BLOCKED)
+
+    assert outcome.evidence_digest is None
+    assert outcome.artifact_directory is None
+    assert outcome.operational_disposition is None
 
 
 class FakeRunner:
@@ -465,7 +484,7 @@ def test_same_basename_repo_roots_never_become_contract_identity(tmp_path):
 # --------------------------------------------------------------------------- #
 _ACCEPTED_CONTRACT = {
     "issue": 7,
-    "repo": "example-repo",
+    "repo": "example/repo",
     "schema_version": 2,
     "generated_at": "2026-08-05T10:00:00Z",
     "tier": "T1",
@@ -495,6 +514,8 @@ class ContractWorkspace(FakeWorkspace):
         self.reset_targets = []
 
     def checkpoint(self, message):
+        if self.changed_files():
+            return self.commit(message)
         return self.head_revision()
 
     def head_revision(self):
@@ -596,6 +617,7 @@ def _contract_phase_result(workspace, disposition=IntentDisposition.PASS):
         from .test_contract_phase import _valid_v2
 
         document = _valid_v2(human_owned=True)
+        document["repo"] = "example/repo"
     else:
         document = _ACCEPTED_CONTRACT
     text = json.dumps(document)
@@ -607,6 +629,9 @@ def _contract_phase_result(workspace, disposition=IntentDisposition.PASS):
         contract_digest=artifact_sha256(document),
         checkpoint_sha=(workspace.head_revision() if disposition is IntentDisposition.PASS else None),
         policy_version="intent-v1",
+        constraint_digest=None,
+        previous_contract_digest=None,
+        revision_request_digest=None,
         findings=(),
         proof_obligations=(),
         requires_approval=disposition is IntentDisposition.APPROVAL_PENDING,
@@ -622,7 +647,46 @@ def _stub_contract_phase(monkeypatch, workspace, disposition=IntentDisposition.P
             tools=("Read", "Write"),
             cwd=workspace.path,
         )
-        result = _contract_phase_result(workspace, disposition)
+        pending = kwargs.get("pending_contract")
+        if (
+            pending is not None
+            and pending.schema_version == 3
+            and disposition is IntentDisposition.PASS
+        ):
+            contract_path = pathlib.Path(workspace.path, "contracts", "7.json")
+            contract_path.write_text(pending.contract_text, encoding="utf-8")
+            if workspace.changed_files():
+                workspace.commit("contract: accept stored test authority")
+            result = ContractPhaseResult(
+                disposition=IntentDisposition.PASS,
+                reason="contract accepted",
+                contract_text=pending.contract_text,
+                contract_document=pending.contract_document,
+                contract_digest=pending.artifact_digest,
+                checkpoint_sha=workspace.head_revision(),
+                policy_version=pending.policy_version,
+                constraint_digest=pending.constraint_digest,
+                previous_contract_digest=pending.previous_contract_digest,
+                revision_request_digest=pending.revision_request_digest,
+                findings=(),
+                proof_obligations=(),
+                requires_approval=False,
+                keep_workspace=False,
+            )
+        else:
+            result = _contract_phase_result(workspace, disposition)
+        if pending is None or pending.schema_version == 3:
+            result = replace(
+                result,
+                policy_version="intent-v2",
+                constraint_digest=kwargs["constraint_digest"],
+                previous_contract_digest=(
+                    None if pending is None else pending.previous_contract_digest
+                ),
+                revision_request_digest=(
+                    None if pending is None else pending.revision_request_digest
+                ),
+            )
         document_digest = result.contract_digest
         try:
             kwargs["decision_log"].append(
@@ -634,18 +698,29 @@ def _stub_contract_phase(monkeypatch, workspace, disposition=IntentDisposition.P
                     stage="contract",
                     timestamp=kwargs["timestamp"],
                     artifact_digest=document_digest,
-                    parent_digest=None,
+                    parent_digest=result.constraint_digest,
                     source_version=workspace.head_revision(),
                     schema_version="contract-v2",
-                    policy_version="intent-v1",
-                    sensor_version="contract-phase-v2",
-                    config_version="contract-phase-v2",
+                    policy_version=result.policy_version,
+                    sensor_version=(
+                        "contract-phase-v3"
+                        if result.policy_version == "intent-v2"
+                        else "contract-phase-v2"
+                    ),
+                    config_version=(
+                        "contract-phase-v3"
+                        if result.policy_version == "intent-v2"
+                        else "contract-phase-v2"
+                    ),
                     findings=(),
                     proof_obligations=(),
                     authority="contract-phase",
                     rationale="synthetic accepted contract",
                     disposition=disposition.value,
                     rule="contract.acceptance",
+                    constraint_digest=result.constraint_digest,
+                    previous_contract_digest=result.previous_contract_digest,
+                    revision_request_digest=result.revision_request_digest,
                 )
             )
         except RuntimeError:
@@ -680,7 +755,7 @@ def test_contract_spec_pending_maps_directly_and_never_dispatches_implementer(mo
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         **controller,
     )
 
@@ -690,7 +765,7 @@ def test_contract_spec_pending_maps_directly_and_never_dispatches_implementer(mo
     assert not workspace.pushed
     assert outcome.keep_workspace and not workspace.cleaned
     terminal = controller["decision_log"].read_verified(
-        repository="example-repo", issue="7"
+        repository="example/repo", issue="7"
     )[-1]
     assert terminal.stage == "terminal-disposition"
     assert terminal.disposition == "SPEC-PENDING"
@@ -710,7 +785,7 @@ def test_contract_approval_pending_maps_directly_and_never_dispatches_implemente
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         **controller,
     )
 
@@ -720,7 +795,7 @@ def test_contract_approval_pending_maps_directly_and_never_dispatches_implemente
     assert not workspace.pushed
     assert outcome.keep_workspace and not workspace.cleaned
     terminal = controller["decision_log"].read_verified(
-        repository="example-repo", issue="7"
+        repository="example/repo", issue="7"
     )[-1]
     assert terminal.stage == "terminal-disposition"
     assert terminal.disposition == "APPROVAL-PENDING"
@@ -743,7 +818,7 @@ def test_contract_persistence_failure_cannot_claim_approval_pending(monkeypatch)
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         **controller,
     )
 
@@ -753,34 +828,72 @@ def test_contract_persistence_failure_cannot_claim_approval_pending(monkeypatch)
     assert "persisted" in outcome.reason.lower()
     assert "sensitive" not in outcome.reason
     contract_outcome = controller["decision_log"].read_verified(
-        repository="example-repo", issue="7"
+        repository="example/repo", issue="7"
     )[-2]
     assert contract_outcome.stage == "contract-outcome"
     assert contract_outcome.disposition == "BLOCKED"
 
 
-def _persist_pending_contract(controller):
+def _persist_pending_contract(controller, workspace, *, tier="T1"):
+    import json
+
+    document = _human_owned_contract()
+    document["tier"] = tier
+    text = json.dumps(document, indent=2) + "\n"
+    digest = artifact_sha256(document)
+    store = ContractEnvelopeStore(controller["repo_root"])
+    constraints, constraint_digest = build_contract_constraints(
+        repository="example/repo",
+        issue="7",
+        tier=tier,
+        base_revision=workspace.head_revision(),
+        publication_mode=PublicationMode.PULL_REQUEST,
+        execution_policy=ExecutionPolicySpec(),
+    )
+    envelope = store.write(
+        repository="example/repo",
+        issue="7",
+        contract_text=text,
+        contract_document=document,
+        artifact_digest=digest,
+        policy_version="intent-v2",
+        constraint_document=constraints,
+        constraint_digest=constraint_digest,
+    )
+    return store, envelope
+
+
+def _persist_legacy_pending_contract(controller):
     import json
 
     from .test_contract_phase import _valid_v2
 
     document = _valid_v2(human_owned=True)
+    document["repo"] = "example/repo"
     text = json.dumps(document, indent=2) + "\n"
-    digest = artifact_sha256(document)
     store = ContractEnvelopeStore(controller["repo_root"])
     envelope = store.write(
-        repository="example-repo",
+        repository="example/repo",
         issue="7",
         contract_text=text,
         contract_document=document,
-        artifact_digest=digest,
+        artifact_digest=artifact_sha256(document),
         policy_version="intent-v1",
     )
     return store, envelope
 
 
-def _persist_accepted_contract(controller):
-    store, envelope = _persist_pending_contract(controller)
+def _persist_accepted_contract(controller, workspace):
+    document = _human_owned_contract()
+    contract_path = pathlib.Path(workspace.path, "contracts", "7.json")
+    contract_path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=workspace.path, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "contract: accepted legacy authority"],
+        cwd=workspace.path,
+        check=True,
+    )
+    store, envelope = _persist_legacy_pending_contract(controller)
     pending = store.load(
         repository=envelope.repository,
         issue=envelope.issue,
@@ -789,6 +902,709 @@ def _persist_accepted_contract(controller):
     assert pending is not None
     accepted = store.accept(pending)
     return store, accepted
+
+
+def _approve_contract(controller, envelope, *, approver="operator@example.invalid"):
+    record = ApprovalRecord(
+        schema_version=APPROVAL_SCHEMA_VERSION,
+        repository=envelope.repository,
+        issue=envelope.issue,
+        artifact_kind=ArtifactKind.CONTRACT,
+        artifact_digest=envelope.artifact_digest,
+        parent_digest=envelope.constraint_digest,
+        approver=approver,
+        approved_at="2026-09-16T12:05:00Z",
+        rationale="Approve the exact persisted Contract authority",
+    )
+    controller["approval_store"].approve(record)
+    return record
+
+
+def _seed_legacy_contract_history(controller, workspace, envelope, *, authority):
+    checkpoint = workspace.head_revision()
+    common = {
+        "event_schema_version": EVENT_SCHEMA_VERSION,
+        "repository": envelope.repository,
+        "issue": envelope.issue,
+        "run_id": controller["run_id"],
+        "timestamp": controller["timestamp"],
+        "artifact_digest": envelope.artifact_digest,
+        "parent_digest": None,
+        "source_version": checkpoint,
+        "policy_version": "intent-v1",
+        "findings": (),
+        "proof_obligations": (),
+        "constraint_digest": None,
+        "previous_contract_digest": None,
+        "revision_request_digest": None,
+    }
+    controller["decision_log"].append(
+        DecisionEvent(
+            **common,
+            stage="contract",
+            schema_version="2",
+            sensor_version="contract-author-v1",
+            config_version="contract-phase-v1",
+            authority=authority,
+            rationale="Historical exact operator-approved Contract",
+            disposition=IntentDisposition.PASS.value,
+            rule="contract.intent",
+        )
+    )
+    controller["decision_log"].append(
+        DecisionEvent(
+            **common,
+            stage="contract-outcome",
+            schema_version="contract-v2",
+            sensor_version="contract-phase-v2",
+            config_version="contract-phase-v2",
+            authority="deterministic-controller",
+            rationale="Historical accepted Contract outcome",
+            disposition=IntentDisposition.PASS.value,
+            rule="build.contract-outcome",
+        )
+    )
+
+
+class _DelayedExactBaseWorkspace(ContractWorkspace):
+    """Expose the approval-bearing base only after workspace preparation."""
+
+    def __init__(self):
+        super().__init__()
+        self.base = "symbolic-before-create"
+
+    def create(self):
+        super().create()
+        self.base = self.head_revision()
+
+
+class _ConstraintAuthorRunner(FakeRunner):
+    def __init__(self, documents):
+        super().__init__()
+        self.documents = list(documents)
+
+    def run_agent(self, prompt, *, model, system=None, tools=None, cwd=None):
+        if system == "contract-author":
+            if not self.documents:
+                raise AssertionError("unexpected contract-author turn")
+            target = pathlib.Path(cwd, "contracts", "7.json")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(self.documents.pop(0)) + "\n", encoding="utf-8")
+        return super().run_agent(
+            prompt, model=model, system=system, tools=tools, cwd=cwd
+        )
+
+
+def _human_owned_contract(*, summary="Accept declared intent before implementation begins"):
+    from .test_contract_phase import _valid_v2
+
+    document = _valid_v2(human_owned=True)
+    document["repo"] = "example/repo"
+    document["intent"]["summary"] = summary
+    return document
+
+
+def _start_constrained_contract(*, policy=None):
+    if policy is None:
+        policy = ExecutionPolicySpec()
+    source, issue = _issue()
+    workspace = _DelayedExactBaseWorkspace()
+    runner = _ConstraintAuthorRunner([_human_owned_contract()])
+    controller = _contract_controller_kwargs(workspace)
+    outcome = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        execution_policy=policy,
+        **controller,
+    )
+    return outcome, runner, workspace, controller
+
+
+def _approved_constrained_contract():
+    initial, runner, workspace, controller = _start_constrained_contract()
+    assert initial.status is BuildStatus.APPROVAL_PENDING
+    store = ContractEnvelopeStore(controller["repo_root"])
+    pending = store.inspect(
+        repository="example/repo", issue="7", policy_version=None
+    )
+    assert pending is not None
+    approval = _approve_contract(controller, pending.envelope)
+    controller["run_id"] = "run-approved-contract"
+    return runner, workspace, controller, store, pending, approval
+
+
+def test_constraints_are_derived_after_create_with_ordered_typed_policy():
+    policy = ExecutionPolicySpec(
+        implementation_writable_paths=("src/z.py", "src/a.py"),
+        verification_commands=(
+            VerificationCommandSpec("second", ("python", "-m", "b"), "zero", "default"),
+            VerificationCommandSpec("first", ("python", "-m", "a"), "nonzero", "default"),
+        ),
+        network_profile="model-only-v1",
+    )
+
+    outcome, runner, workspace, controller = _start_constrained_contract(policy=policy)
+
+    assert outcome.status is BuildStatus.APPROVAL_PENDING
+    assert runner.calls == ["contract-author"]
+    record = ContractEnvelopeStore(controller["repo_root"]).inspect(
+        repository="example/repo", issue="7", policy_version=None
+    )
+    assert record is not None
+    envelope = record.envelope
+    assert envelope.schema_version == 3
+    assert envelope.policy_version == "intent-v2"
+    assert envelope.constraint_document == {
+        "schema_version": "contract-execution-constraints-v1",
+        "repository": "example/repo",
+        "issue": "7",
+        "tier": "T1",
+        "base_revision": workspace.base,
+        "publication_mode": "pull_request",
+        "network_profile": "model-only-v1",
+        "implementation_writable_paths": ["src/z.py", "src/a.py"],
+        "verification_commands": [
+            {
+                "name": "second",
+                "argv": ["python", "-m", "b"],
+                "expected_exit": "zero",
+                "environment_profile": "default",
+            },
+            {
+                "name": "first",
+                "argv": ["python", "-m", "a"],
+                "expected_exit": "nonzero",
+                "environment_profile": "default",
+            },
+        ],
+    }
+    assert outcome.parent_digest == envelope.constraint_digest
+    contract_decisions = [
+        event
+        for event in controller["decision_log"].read_verified(
+            repository="example/repo", issue="7"
+        )
+        if event.stage in {"contract", "contract-outcome"}
+    ]
+    assert [(event.stage, event.config_version) for event in contract_decisions] == [
+        ("contract-outcome", "contract-phase-v3")
+    ]
+
+
+def test_generic_contract_build_projects_the_complete_typed_default_policy():
+    outcome, _runner, _workspace, controller = _start_constrained_contract()
+
+    assert outcome.status is BuildStatus.APPROVAL_PENDING
+    record = ContractEnvelopeStore(controller["repo_root"]).inspect(
+        repository="example/repo", issue="7", policy_version=None
+    )
+    assert record is not None
+    constraints = record.envelope.constraint_document
+    assert constraints is not None
+    assert constraints["network_profile"] == "default"
+    assert constraints["implementation_writable_paths"] == []
+    assert constraints["verification_commands"] == []
+
+
+def test_invalid_exact_base_blocks_with_fixed_constraint_code_before_dispatch():
+    source, issue = _issue()
+    workspace = ContractWorkspace()
+    workspace.base = "symbolic"
+    workspace.head_revision = lambda: "also-symbolic"
+    runner = _ConstraintAuthorRunner([_human_owned_contract()])
+
+    outcome = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        **_contract_controller_kwargs(workspace),
+    )
+
+    assert outcome.status is BuildStatus.BLOCKED
+    assert outcome.reason == "contract-constraints-invalid"
+    assert runner.calls == []
+    assert workspace.created
+    assert workspace.cleaned
+    assert not outcome.keep_workspace
+
+
+def test_initial_preapproval_replacement_blocks_before_pending_publication(
+    monkeypatch,
+):
+    source, issue = _issue()
+    workspace = _DelayedExactBaseWorkspace()
+    document = _human_owned_contract()
+    runner = _ConstraintAuthorRunner([document])
+    controller = _contract_controller_kwargs(workspace)
+    _constraints, constraint_digest = build_contract_constraints(
+        repository="example/repo",
+        issue="7",
+        tier="T1",
+        base_revision=workspace.head_revision(),
+        publication_mode=PublicationMode.PULL_REQUEST,
+        execution_policy=ExecutionPolicySpec(),
+    )
+    preapproval = ApprovalRecord(
+        schema_version=APPROVAL_SCHEMA_VERSION,
+        repository="example/repo",
+        issue="7",
+        artifact_kind=ArtifactKind.CONTRACT,
+        artifact_digest=artifact_sha256(document),
+        parent_digest=constraint_digest,
+        approver="operator@example.invalid",
+        approved_at="2026-09-16T11:59:00Z",
+        rationale="Approval created before any current pending envelope existed",
+    )
+    approval_store = controller["approval_store"]
+    approval_store.approve(preapproval)
+    real_require = approval_store.require
+    reads = 0
+
+    def replace_after_first_observation(**kwargs):
+        nonlocal reads
+        observed = real_require(**kwargs)
+        reads += 1
+        if reads == 1:
+            approval_store.approve(
+                replace(
+                    preapproval,
+                    approved_at="2026-09-16T12:00:00Z",
+                    rationale="Replacement with unchanged artifact and parent digests",
+                )
+            )
+        return observed
+
+    monkeypatch.setattr(approval_store, "require", replace_after_first_observation)
+
+    outcome = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        **controller,
+    )
+
+    assert outcome.status is BuildStatus.BLOCKED
+    assert reads == 1
+    assert runner.calls == ["contract-author"]
+    assert (
+        ContractEnvelopeStore(controller["repo_root"]).inspect(
+            repository="example/repo", issue="7", policy_version=None
+        )
+        is None
+    )
+    assert not workspace.pushed
+
+
+def test_replaced_approval_before_accept_blocks_without_promoting_or_dispatching(
+    monkeypatch,
+):
+    runner, workspace, controller, store, pending, approval = (
+        _approved_constrained_contract()
+    )
+    approval_store = controller["approval_store"]
+    real_require = approval_store.require
+    calls = 0
+
+    def replace_after_phase_authentication(**kwargs):
+        nonlocal calls
+        current = real_require(**kwargs)
+        calls += 1
+        if calls == 1:
+            approval_store.approve(
+                replace(
+                    approval,
+                    approver="replacement@example.invalid",
+                    rationale="Replacement operator metadata",
+                )
+            )
+        return current
+
+    monkeypatch.setattr(approval_store, "require", replace_after_phase_authentication)
+    source, issue = _issue()
+    outcome = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        **controller,
+    )
+
+    assert outcome.status is BuildStatus.BLOCKED
+    assert calls == 4
+    assert runner.calls == ["contract-author"]
+    current = store.inspect(
+        repository="example/repo", issue="7", policy_version=None
+    )
+    assert current == pending
+    assert not store.accepted_path_for("7").exists()
+
+
+@pytest.mark.parametrize("transition", ["replace", "remove"])
+def test_approval_change_during_implementation_blocks_before_judge(
+    transition,
+):
+    runner, workspace, controller, store, _pending, approval = (
+        _approved_constrained_contract()
+    )
+    approval_store = controller["approval_store"]
+    real_run = runner.run_agent
+
+    def mutate_approval_after_implementation(
+        prompt, *, model, system=None, tools=None, cwd=None
+    ):
+        result = real_run(
+            prompt, model=model, system=system, tools=tools, cwd=cwd
+        )
+        if system == "implementer":
+            if transition == "replace":
+                approval_store.approve(
+                    replace(
+                        approval,
+                        approved_at="2026-09-16T12:06:00Z",
+                        rationale="Replacement after protected dispatch",
+                    )
+                )
+            else:
+                files = list(pathlib.Path(approval_store.root).glob("*.json"))
+                assert len(files) == 1
+                files[0].unlink()
+        return result
+
+    runner.run_agent = mutate_approval_after_implementation
+    source, issue = _issue()
+    outcome = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        **controller,
+    )
+
+    assert outcome.status is BuildStatus.BLOCKED
+    assert runner.calls == ["contract-author", "implementer"]
+    assert store.accepted_path_for("7").is_file()
+    assert not workspace.pushed
+
+
+def test_v3_pending_resumes_without_another_contract_author_turn():
+    initial, runner, workspace, controller = _start_constrained_contract()
+    assert initial.status is BuildStatus.APPROVAL_PENDING
+
+    source, issue = _issue()
+    resumed = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        **controller,
+    )
+
+    assert resumed.status is BuildStatus.APPROVAL_PENDING
+    assert resumed.artifact_digest == initial.artifact_digest
+    assert resumed.parent_digest == initial.parent_digest
+    assert runner.calls == ["contract-author"]
+
+
+def test_exact_revision_request_atomically_replaces_the_pending_candidate():
+    initial, runner, workspace, controller = _start_constrained_contract()
+    store = ContractEnvelopeStore(controller["repo_root"])
+    pending = store.inspect(repository="example/repo", issue="7", policy_version=None)
+    assert pending is not None
+    request = build_revision_request(
+        repository="example/repo",
+        issue="7",
+        rejected_contract_digest=pending.envelope.artifact_digest,
+        constraint_digest=pending.envelope.constraint_digest,
+        feedback_document={
+            "schema_version": "contract-revision-feedback-v1",
+            "required_changes": ["Clarify the controller-owned boundary."],
+        },
+        requested_by="operator",
+        requested_at="2026-09-16T10:00:00Z",
+    )
+    stored_request = store.write_revision_request(pending, request)
+    runner.documents.append(_human_owned_contract(summary="Clarify the exact boundary"))
+
+    source, issue = _issue()
+    revised = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        **controller,
+    )
+
+    assert revised.status is BuildStatus.APPROVAL_PENDING
+    assert revised.artifact_digest != initial.artifact_digest
+    current = store.inspect(repository="example/repo", issue="7", policy_version=None)
+    assert current is not None
+    assert current.envelope.artifact_digest == revised.artifact_digest
+    assert current.envelope.previous_contract_digest == initial.artifact_digest
+    assert current.envelope.revision_request_digest == stored_request.request.request_digest
+    assert runner.calls == ["contract-author", "contract-author"]
+
+    _approve_contract(controller, current.envelope)
+    controller["run_id"] = "run-revision-post-cas-approval"
+    source, issue = _issue()
+    resumed = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        **controller,
+    )
+
+    assert resumed.status is BuildStatus.SHIPPED
+    assert runner.calls == [
+        "contract-author",
+        "contract-author",
+        "implementer",
+        "judge",
+    ]
+
+
+def test_revision_preapproval_cannot_cross_cas_or_reuse_spent_author_turn():
+    initial, runner, workspace, controller = _start_constrained_contract()
+    assert initial.status is BuildStatus.APPROVAL_PENDING
+    store = ContractEnvelopeStore(controller["repo_root"])
+    rejected = store.inspect(
+        repository="example/repo", issue="7", policy_version=None
+    )
+    assert rejected is not None
+    request = build_revision_request(
+        repository="example/repo",
+        issue="7",
+        rejected_contract_digest=rejected.envelope.artifact_digest,
+        constraint_digest=rejected.envelope.constraint_digest,
+        feedback_document={
+            "schema_version": "contract-revision-feedback-v1",
+            "required_changes": ["Remove the independently human-owned operation."],
+        },
+        requested_by="operator",
+        requested_at="2026-09-16T10:00:00Z",
+    )
+    stored_request = store.write_revision_request(rejected, request)
+    from .test_contract_phase import _valid_v2
+
+    revised_document = _valid_v2(human_owned=False)
+    revised_document["repo"] = "example/repo"
+    preapproval = ApprovalRecord(
+        schema_version=APPROVAL_SCHEMA_VERSION,
+        repository="example/repo",
+        issue="7",
+        artifact_kind=ArtifactKind.CONTRACT,
+        artifact_digest=artifact_sha256(revised_document),
+        parent_digest=rejected.envelope.constraint_digest,
+        approver="operator@example.invalid",
+        approved_at="2026-09-16T09:59:00Z",
+        rationale="Approval created before revised candidate publication",
+    )
+    controller["approval_store"].approve(preapproval)
+    runner.documents.append(revised_document)
+    controller["run_id"] = "run-revision-policy-pass"
+
+    source, issue = _issue()
+    revised = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        **controller,
+    )
+
+    assert revised.status is BuildStatus.BLOCKED
+    assert runner.calls == ["contract-author", "contract-author"]
+    current = store.inspect(
+        repository="example/repo", issue="7", policy_version=None
+    )
+    assert current == rejected
+    assert store.load_revision_request(current) == stored_request
+    assert not store.generation_path_for(rejected.envelope).exists()
+
+    approval_files = list(pathlib.Path(controller["approval_store"].root).glob("*.json"))
+    assert len(approval_files) == 1
+    approval_files[0].unlink()
+    runner.documents.append(revised_document)
+    controller["run_id"] = "run-revision-publish"
+    source, issue = _issue()
+    published = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        **controller,
+    )
+
+    assert published.status is BuildStatus.BLOCKED
+    current = store.inspect(
+        repository="example/repo", issue="7", policy_version=None
+    )
+    assert current == rejected
+    assert store.load_revision_request(current) == stored_request
+    assert not store.generation_path_for(rejected.envelope).exists()
+    assert runner.calls == ["contract-author", "contract-author"]
+
+
+def test_missing_failed_revision_attempt_evidence_cannot_redispatch_author():
+    initial, runner, workspace, controller = _start_constrained_contract()
+    store = ContractEnvelopeStore(controller["repo_root"])
+    pending = store.inspect(repository="example/repo", issue="7", policy_version=None)
+    assert pending is not None
+    request = build_revision_request(
+        repository="example/repo",
+        issue="7",
+        rejected_contract_digest=pending.envelope.artifact_digest,
+        constraint_digest=pending.envelope.constraint_digest,
+        feedback_document={
+            "schema_version": "contract-revision-feedback-v1",
+            "required_changes": ["Clarify the controller-owned boundary."],
+        },
+        requested_by="operator",
+        requested_at="2026-09-16T10:00:00Z",
+    )
+    stored_request = store.write_revision_request(pending, request)
+
+    def fail_revision(prompt, *, model, system=None, tools=None, cwd=None):
+        runner.calls.append(system)
+        return RunResult(False, "failed revision", model)
+
+    runner.run_agent = fail_revision
+    source, issue = _issue()
+    failed = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        **controller,
+    )
+
+    assert failed.status is BuildStatus.BLOCKED
+    current = store.inspect(repository="example/repo", issue="7", policy_version=None)
+    assert current == pending
+    assert store.load_revision_request(current) == stored_request
+    assert current.envelope.artifact_digest == initial.artifact_digest
+    attempts = list(
+        (pathlib.Path(controller["repo_root"]) / ".factory/contracts/revisions").glob(
+            ".attempt-issue-7.*.json"
+        )
+    )
+    assert len(attempts) == 1
+    attempts[0].unlink()
+
+    controller["run_id"] = "run-revision-failed-retry"
+    source, issue = _issue()
+    retried = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        **controller,
+    )
+
+    assert retried.status is BuildStatus.BLOCKED
+    assert runner.calls == ["contract-author", "contract-author"]
+
+
+def test_contract_outcome_failure_rolls_back_revised_pending_authority():
+    initial, runner, workspace, controller = _start_constrained_contract()
+    store = ContractEnvelopeStore(controller["repo_root"])
+    pending = store.inspect(repository="example/repo", issue="7", policy_version=None)
+    assert pending is not None
+    request = build_revision_request(
+        repository="example/repo",
+        issue="7",
+        rejected_contract_digest=pending.envelope.artifact_digest,
+        constraint_digest=pending.envelope.constraint_digest,
+        feedback_document={
+            "schema_version": "contract-revision-feedback-v1",
+            "required_changes": ["Clarify the controller-owned boundary."],
+        },
+        requested_by="operator",
+        requested_at="2026-09-16T10:00:00Z",
+    )
+    stored_request = store.write_revision_request(pending, request)
+    runner.documents.append(_human_owned_contract(summary="Clarify the exact boundary"))
+    real_log = controller["decision_log"]
+
+    class FailContractOutcome:
+        def append(self, event):
+            if event.stage == "contract-outcome":
+                raise RuntimeError("injected contract-outcome persistence failure")
+            return real_log.append(event)
+
+        def read_verified(self, **kwargs):
+            return real_log.read_verified(**kwargs)
+
+    controller["decision_log"] = FailContractOutcome()
+    controller["run_id"] = "run-revision-outcome-failure"
+    source, issue = _issue()
+
+    outcome = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        **controller,
+    )
+
+    assert outcome.status is BuildStatus.BLOCKED
+    current = store.inspect(repository="example/repo", issue="7", policy_version=None)
+    assert current is not None
+    assert current.envelope == pending.envelope
+    assert store.load_revision_request(current) == stored_request
+    assert current.envelope.artifact_digest == initial.artifact_digest
+
+
+def test_constraint_change_blocks_pending_contract_before_author_dispatch():
+    initial, runner, workspace, controller = _start_constrained_contract()
+    assert initial.status is BuildStatus.APPROVAL_PENDING
+    changed = ExecutionPolicySpec(implementation_writable_paths=("other",))
+
+    source, issue = _issue()
+    stale = _build(
+        source,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        execution_policy=changed,
+        **controller,
+    )
+
+    assert stale.status is BuildStatus.BLOCKED
+    assert stale.reason == "contract-constraints-stale"
+    assert runner.calls == ["contract-author"]
 
 
 def _reformat_persisted_contract_text(path):
@@ -819,9 +1635,9 @@ def _assert_reformatted_store_blocks_before_dispatch(*, accepted):
     runner = FakeRunner()
     controller = _contract_controller_kwargs(workspace)
     store, _record = (
-        _persist_accepted_contract(controller)
+        _persist_accepted_contract(controller, workspace)
         if accepted
-        else _persist_pending_contract(controller)
+        else _persist_pending_contract(controller, workspace)
     )
     path = store.accepted_path_for("7") if accepted else store.path_for("7")
     _reformat_persisted_contract_text(path)
@@ -832,7 +1648,7 @@ def _assert_reformatted_store_blocks_before_dispatch(*, accepted):
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         **controller,
     )
 
@@ -849,12 +1665,12 @@ def test_reformatted_accepted_contract_bytes_block_before_author_dispatch():
     _assert_reformatted_store_blocks_before_dispatch(accepted=True)
 
 
-def test_same_stored_contract_stays_pending_without_contract_author_dispatch():
+def test_schema_two_pending_requires_a_fresh_lifecycle_without_author_dispatch():
     src, issue = _issue()
     workspace = ContractWorkspace()
     runner = FakeRunner()
     controller = _contract_controller_kwargs(workspace)
-    store, envelope = _persist_pending_contract(controller)
+    store, _envelope = _persist_legacy_pending_contract(controller)
 
     outcome = _build(
         src,
@@ -862,12 +1678,12 @@ def test_same_stored_contract_stays_pending_without_contract_author_dispatch():
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         **controller,
     )
 
-    assert outcome.status is BuildStatus.APPROVAL_PENDING
-    assert outcome.artifact_digest == envelope.artifact_digest
+    assert outcome.status is BuildStatus.BLOCKED
+    assert outcome.reason == "legacy pending contract requires a fresh lifecycle"
     assert runner.calls == []
     assert store.path_for("7").exists()
 
@@ -877,7 +1693,7 @@ def test_pending_status_reauthenticates_after_contract_outcome_decision():
     workspace = ContractWorkspace()
     runner = FakeRunner()
     controller = _contract_controller_kwargs(workspace)
-    store, _envelope = _persist_pending_contract(controller)
+    store, _envelope = _persist_pending_contract(controller, workspace)
     real_log = controller["decision_log"]
     replaced = False
 
@@ -901,7 +1717,7 @@ def test_pending_status_reauthenticates_after_contract_outcome_decision():
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         **controller,
     )
 
@@ -919,7 +1735,9 @@ def _assert_post_promotion_replacement_blocks_next_agent(monkeypatch, *, feature
     runner = FakeRunner(judge_replies=["verdict: PASS"])
     _stub_contract_phase(monkeypatch, workspace)
     controller = _contract_controller_kwargs(workspace)
-    store, _envelope = _persist_pending_contract(controller)
+    store, _envelope = _persist_pending_contract(
+        controller, workspace, tier="T2" if feature else "T1"
+    )
     real_accept = ContractEnvelopeStore.accept
 
     def accept_then_replace(self, pending):
@@ -935,7 +1753,7 @@ def _assert_post_promotion_replacement_blocks_next_agent(monkeypatch, *, feature
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         **controller,
     )
 
@@ -959,7 +1777,7 @@ def _contract_build_that_replaces_authority_after_agent(monkeypatch, *, stage):
     workspace = ContractWorkspace()
     _stub_contract_phase(monkeypatch, workspace)
     controller = _contract_controller_kwargs(workspace)
-    store, _envelope = _persist_pending_contract(controller)
+    store, _envelope = _persist_pending_contract(controller, workspace)
 
     class ReplacingRunner(FakeRunner):
         def run_agent(self, prompt, *, model, system=None, tools=None, cwd=None):
@@ -977,7 +1795,7 @@ def _contract_build_that_replaces_authority_after_agent(monkeypatch, *, stage):
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         **controller,
     )
     return outcome, runner, workspace
@@ -1013,7 +1831,7 @@ def test_accepted_generation_change_during_commit_blocks_before_push(monkeypatch
     runner = FakeRunner(judge_replies=["verdict: PASS"])
     _stub_contract_phase(monkeypatch, workspace)
     controller = _contract_controller_kwargs(workspace)
-    store, _envelope = _persist_pending_contract(controller)
+    store, _envelope = _persist_pending_contract(controller, workspace)
     real_commit = workspace.commit
 
     def commit_then_replace(message):
@@ -1029,7 +1847,7 @@ def test_accepted_generation_change_during_commit_blocks_before_push(monkeypatch
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         **controller,
     )
 
@@ -1044,7 +1862,7 @@ def test_accepted_generation_change_during_replay_blocks_before_push(monkeypatch
     runner = FakeRunner(judge_replies=["verdict: PASS"])
     _stub_contract_phase(monkeypatch, workspace)
     controller = _contract_controller_kwargs(workspace)
-    store, _envelope = _persist_pending_contract(controller)
+    store, _envelope = _persist_pending_contract(controller, workspace)
     real_log = controller["decision_log"]
     final_disposition_reads = 0
 
@@ -1069,7 +1887,7 @@ def test_accepted_generation_change_during_replay_blocks_before_push(monkeypatch
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         **controller,
     )
 
@@ -1085,7 +1903,7 @@ def test_accepted_generation_change_during_push_blocks_before_pr(monkeypatch):
     runner = FakeRunner(judge_replies=["verdict: PASS"])
     _stub_contract_phase(monkeypatch, workspace)
     controller = _contract_controller_kwargs(workspace)
-    store, _envelope = _persist_pending_contract(controller)
+    store, _envelope = _persist_pending_contract(controller, workspace)
     real_push = workspace.push
 
     def push_then_replace(revision=None, *, expected_remote_tip=None):
@@ -1101,7 +1919,7 @@ def test_accepted_generation_change_during_push_blocks_before_pr(monkeypatch):
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         **controller,
     )
 
@@ -1116,7 +1934,7 @@ def test_pending_status_reauthenticates_the_current_store_record(monkeypatch):
     workspace = ContractWorkspace()
     runner = FakeRunner()
     controller = _contract_controller_kwargs(workspace)
-    store, envelope = _persist_pending_contract(controller)
+    store, envelope = _persist_pending_contract(controller, workspace)
     real_load = ContractEnvelopeStore.load
     reads = 0
 
@@ -1139,24 +1957,99 @@ def test_pending_status_reauthenticates_the_current_store_record(monkeypatch):
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         **controller,
     )
 
     assert outcome.status is BuildStatus.BLOCKED
     assert runner.calls == []
-    assert reads >= 2
+    assert reads == 2, (
+        "approval-pending publication reauthenticates both before and after its "
+        "terminal decision"
+    )
     assert store.path_for("7").exists(), "replacement evidence must be preserved"
     assert outcome.artifact_digest is None
     assert envelope.artifact_digest not in outcome.reason
 
 
-def test_revoked_approval_for_accepted_contract_returns_same_digest_pending():
+def test_minted_accepted_schema_two_without_historical_lifecycle_is_blocked():
+    src, issue = _issue()
+    workspace = ContractWorkspace()
+    runner = FakeRunner(judge_replies=["verdict: PASS"])
+    controller = _contract_controller_kwargs(workspace)
+    document = dict(_ACCEPTED_CONTRACT)
+    text = json.dumps(document)
+    store = ContractEnvelopeStore(controller["repo_root"])
+    pending = store.write(
+        repository="example/repo",
+        issue="7",
+        contract_text=text,
+        contract_document=document,
+        artifact_digest=artifact_sha256(document),
+        policy_version="intent-v1",
+    )
+    accepted = store.load(
+        repository="example/repo", issue="7", policy_version="intent-v1"
+    )
+    assert accepted is not None
+    store.accept(accepted)
+    _approve_contract(controller, pending)
+
+    outcome = _build(
+        src,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        **controller,
+    )
+
+    assert pending.artifact_digest == artifact_sha256(document)
+    assert outcome.status is BuildStatus.BLOCKED
+    assert runner.calls == []
+    assert store.accepted_path_for("7").is_file()
+
+
+def test_exact_historical_schema_two_lifecycle_can_continue_without_new_contract_event():
+    src, issue = _issue()
+    workspace = ContractWorkspace()
+    runner = FakeRunner(judge_replies=["verdict: PASS"])
+    controller = _contract_controller_kwargs(workspace)
+    store, accepted = _persist_accepted_contract(controller, workspace)
+    envelope = accepted.envelope
+    approval = _approve_contract(controller, envelope)
+    _seed_legacy_contract_history(
+        controller, workspace, envelope, authority=approval.approver
+    )
+
+    outcome = _build(
+        src,
+        issue,
+        runner,
+        workspace,
+        require_contract=True,
+        repository="example/repo",
+        **controller,
+    )
+
+    assert outcome.status is BuildStatus.SHIPPED
+    assert runner.calls == ["implementer", "judge"]
+    history = controller["decision_log"].read_verified(
+        repository="example/repo", issue="7"
+    )
+    assert [event.stage for event in history].count("contract") == 1
+    assert [event.stage for event in history].count("contract-outcome") == 1
+    assert not store.path_for("7").exists()
+    assert store.accepted_path_for("7").is_file()
+
+
+def test_revoked_approval_for_historical_accepted_contract_blocks():
     src, issue = _issue()
     workspace = ContractWorkspace()
     runner = FakeRunner()
     controller = _contract_controller_kwargs(workspace)
-    store, accepted = _persist_accepted_contract(controller)
+    store, accepted = _persist_accepted_contract(controller, workspace)
     envelope = accepted.envelope
     controller["approval_store"].approve(
         ApprovalRecord(
@@ -1171,6 +2064,12 @@ def test_revoked_approval_for_accepted_contract_returns_same_digest_pending():
             rationale="Temporarily approve the exact accepted contract",
         )
     )
+    _seed_legacy_contract_history(
+        controller,
+        workspace,
+        envelope,
+        authority="operator@example.invalid",
+    )
     approval_files = list(
         pathlib.Path(controller["repo_root"], "approvals").glob("*.json")
     )
@@ -1183,13 +2082,13 @@ def test_revoked_approval_for_accepted_contract_returns_same_digest_pending():
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         **controller,
     )
 
-    assert outcome.status is BuildStatus.APPROVAL_PENDING
-    assert outcome.artifact_kind == ArtifactKind.CONTRACT.value
-    assert outcome.artifact_digest == envelope.artifact_digest
+    assert outcome.status is BuildStatus.BLOCKED
+    assert outcome.artifact_kind is None
+    assert outcome.artifact_digest is None
     assert runner.calls == []
     assert not store.path_for("7").exists()
     assert store.accepted_path_for("7").is_file()
@@ -1200,8 +2099,14 @@ def test_mismatched_replacement_approval_blocks_accepted_contract_without_author
     workspace = ContractWorkspace()
     runner = FakeRunner()
     controller = _contract_controller_kwargs(workspace)
-    store, accepted = _persist_accepted_contract(controller)
+    store, accepted = _persist_accepted_contract(controller, workspace)
     envelope = accepted.envelope
+    _seed_legacy_contract_history(
+        controller,
+        workspace,
+        envelope,
+        authority="operator@example.invalid",
+    )
     replacement_digest = (
         "0" * 64 if envelope.artifact_digest != "0" * 64 else "1" * 64
     )
@@ -1225,12 +2130,12 @@ def test_mismatched_replacement_approval_blocks_accepted_contract_without_author
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         **controller,
     )
 
     assert outcome.status is BuildStatus.BLOCKED
-    assert "match" in outcome.reason.lower()
+    assert outcome.reason == "contract lifecycle failed closed"
     assert runner.calls == []
     assert not store.path_for("7").exists()
     assert store.accepted_path_for("7").is_file()
@@ -1241,7 +2146,7 @@ def test_corrupt_accepted_contract_blocks_before_contract_author_dispatch():
     workspace = ContractWorkspace()
     runner = FakeRunner()
     controller = _contract_controller_kwargs(workspace)
-    store, _accepted = _persist_accepted_contract(controller)
+    store, _accepted = _persist_accepted_contract(controller, workspace)
     path = store.accepted_path_for("7")
     path.write_text('{"schema_version":1,"schema_version":1}\n', encoding="utf-8")
 
@@ -1251,7 +2156,7 @@ def test_corrupt_accepted_contract_blocks_before_contract_author_dispatch():
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         **controller,
     )
 
@@ -1265,7 +2170,7 @@ def test_pending_and_accepted_contract_conflict_blocks_before_author_dispatch():
     workspace = ContractWorkspace()
     runner = FakeRunner()
     controller = _contract_controller_kwargs(workspace)
-    store, _accepted = _persist_accepted_contract(controller)
+    store, _accepted = _persist_accepted_contract(controller, workspace)
     store.path_for("7").write_bytes(store.accepted_path_for("7").read_bytes())
     store.path_for("7").chmod(0o600)
 
@@ -1275,7 +2180,7 @@ def test_pending_and_accepted_contract_conflict_blocks_before_author_dispatch():
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         **controller,
     )
 
@@ -1290,7 +2195,7 @@ def test_corrupt_stored_contract_blocks_before_contract_author_dispatch():
     workspace = ContractWorkspace()
     runner = FakeRunner()
     controller = _contract_controller_kwargs(workspace)
-    store, _envelope = _persist_pending_contract(controller)
+    store, _envelope = _persist_pending_contract(controller, workspace)
     path = store.path_for("7")
     path.write_text('{"schema_version":1,"schema_version":1}\n', encoding="utf-8")
     path.chmod(0o600)
@@ -1301,7 +2206,7 @@ def test_corrupt_stored_contract_blocks_before_contract_author_dispatch():
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         **controller,
     )
 
@@ -1322,7 +2227,7 @@ def test_contract_enabled_t1_dispatches_author_before_implementation(monkeypatch
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         **_contract_controller_kwargs(workspace),
     )
 
@@ -1341,7 +2246,7 @@ def test_contract_mode_refuses_a_workspace_without_checkpoint_capabilities():
         runner,
         workspace,
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
     )
 
     assert outcome.status is BuildStatus.BLOCKED

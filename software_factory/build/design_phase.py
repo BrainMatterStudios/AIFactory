@@ -21,6 +21,7 @@ from software_factory.analyzers import (
     build_analyzer,
     run_analyzer,
 )
+from software_factory.analyzers.base import analyzer_workspace_identity
 from software_factory.build.briefs import design_author_brief
 from software_factory.build.design_gate_store import (
     DesignGateStore,
@@ -41,6 +42,7 @@ from software_factory.core.approvals import (
     ApprovalStore,
     ArtifactKind,
 )
+from software_factory.core.authority import AuthorityFailureKind
 from software_factory.core.contracts import (
     artifact_sha256,
     canonical_json_bytes,
@@ -50,7 +52,6 @@ from software_factory.core.design import DesignGateResult, DesignGateState
 from software_factory.core.design.capabilities import (
     CapabilityAssessment,
     assess_capabilities,
-    capability_document,
     derive_required_capabilities,
 )
 from software_factory.core.design.configuration import (
@@ -60,16 +61,28 @@ from software_factory.core.design.configuration import (
 )
 from software_factory.core.design.gate import (
     DESIGN_GATE_AUTHORITY,
+    CapabilityAuthority,
     analyzer_execution_document,
     analyzer_spec_sha256,
-    capability_assessment_from_document,
+    capability_authority_document,
+    capability_authority_from_document,
     design_gate_document,
     design_gate_sha256,
     evaluate_design_gate,
     finding_override_document,
     parse_design_config_document,
+    validate_capability_authority_protocol,
 )
-from software_factory.core.design.schema import parse_design_json
+from software_factory.core.design.provider_capabilities import (
+    ProviderCapabilityAssessment,
+    assess_provider_capabilities,
+    provider_capability_evidence_document,
+    provider_capability_evidence_sha256,
+)
+from software_factory.core.design.schema import (
+    design_validation_diagnostic,
+    parse_design_json,
+)
 from software_factory.trace.decisions import (
     EVENT_SCHEMA_VERSION,
     DecisionEvent,
@@ -81,6 +94,7 @@ from software_factory.trace.redact import redact
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 _JSON_WHITESPACE = " \t\r\n"
 _MAX_DESIGN_BYTES = 2 * 1024 * 1024
+_MAX_DESIGN_AUTHOR_ATTEMPTS = 2
 
 DesignDispatch = Callable[[str, str], RunResult]
 ParentBoundary = Callable[[str], None]
@@ -111,6 +125,47 @@ class _ExternalFailure(RuntimeError):
         super().__init__(operation)
         self.operation = operation
         self.cause = cause
+
+
+_GATE_STORE_SAFE_FAILURES = {
+    "capability document is invalid": "capability-document",
+    "design config document is invalid": "design-config-document",
+    "design document is invalid": "design-document",
+    "gate replay evidence is invalid": "replay-evidence",
+    "gate result does not match lifecycle digests": "lifecycle-digests",
+    "gate result document is invalid": "result-document",
+    "analyzer documents are not canonical": "analyzer-order",
+    "override documents are not canonical": "override-order",
+    "stored gate result does not match deterministic replay": "deterministic-replay",
+    "gate storage cannot be written safely": "storage-write",
+    "design storage cannot be written safely": "storage-write",
+    "gate storage is unreadable": "storage-read",
+}
+_GATE_STORE_AUTHORITY_FAILURES = {
+    AuthorityFailureKind.ABSENT: "authority-absent",
+    AuthorityFailureKind.UNREADABLE_RUNTIME: "authority-unreadable-runtime",
+    AuthorityFailureKind.INTEGRITY: "authority-integrity",
+    AuthorityFailureKind.POLICY_STALE: "authority-policy-stale",
+    AuthorityFailureKind.UNSUPPORTED: "authority-unsupported",
+}
+
+
+def _gate_store_failure_code(failure: _ExternalFailure) -> str:
+    operation = {
+        "gate store write": "gate-write",
+        "gate store replay": "gate-read",
+    }.get(failure.operation, "gate-store")
+    cause = failure.cause
+    if not isinstance(cause, DesignGateStoreError):
+        return f"{operation}:external-failure"
+    detail = _GATE_STORE_SAFE_FAILURES.get(str(cause))
+    if detail is None:
+        detail = (
+            _GATE_STORE_AUTHORITY_FAILURES[cause.kind]
+            if type(cause.kind) is AuthorityFailureKind
+            else "authority-failure"
+        )
+    return f"{operation}:{detail}"
 
 
 def _strict_object(payload: str) -> dict[str, Any]:
@@ -196,16 +251,25 @@ def _design_config(
 
 
 def _reassess(
-    capabilities: CapabilityAssessment,
+    capabilities: CapabilityAuthority,
     *,
     required: frozenset[Any],
-) -> CapabilityAssessment:
-    if type(capabilities) is not CapabilityAssessment:
+) -> CapabilityAuthority:
+    if type(capabilities) not in {CapabilityAssessment, ProviderCapabilityAssessment}:
         raise ValueError("capability assessment is invalid")
-    authenticated = capability_assessment_from_document(capability_document(capabilities))
+    authenticated = capability_authority_from_document(
+        capability_authority_document(capabilities)
+    )
     if authenticated != capabilities:
         raise ValueError("capability assessment is invalid")
-    return assess_capabilities(
+    if type(authenticated) is CapabilityAssessment:
+        return assess_capabilities(
+            declarations=authenticated.declarations,
+            observations=authenticated.observations,
+            required=required,
+        )
+    return assess_provider_capabilities(
+        context=authenticated.context,
         declarations=authenticated.declarations,
         observations=authenticated.observations,
         required=required,
@@ -324,8 +388,9 @@ def run_design_phase(
     parent_boundary: ParentBoundary,
     workspace: Workspace,
     repo_root: str | Path,
-    capabilities: CapabilityAssessment,
+    capabilities: CapabilityAuthority,
     analyzer_specs: Sequence[AnalyzerSpec],
+    design_configuration: Mapping[str, Any] | None = None,
     approval_store: ApprovalStore,
     design_store: DesignEnvelopeStore,
     gate_store: DesignGateStore,
@@ -336,6 +401,7 @@ def run_design_phase(
     policy_version: str = "design-policy-v1",
     design_author_role: str = "design-author",
     allow_author_dispatch: bool = True,
+    authorized_capability_context_transition: tuple[str, str] | None = None,
 ) -> DesignPhaseResult:
     """Author or resume one exact Design IR and grant authority only after replay."""
     design: DesignEnvelope | None = None
@@ -350,6 +416,19 @@ def run_design_phase(
             or not _normalized_role(run_id)
             or not _normalized_role(timestamp)
             or type(allow_author_dispatch) is not bool
+            or (
+                authorized_capability_context_transition is not None
+                and (
+                    type(authorized_capability_context_transition) is not tuple
+                    or len(authorized_capability_context_transition) != 2
+                    or any(
+                        not _valid_digest(value)
+                        for value in authorized_capability_context_transition
+                    )
+                    or authorized_capability_context_transition[0]
+                    == authorized_capability_context_transition[1]
+                )
+            )
             or not callable(dispatch)
             or not callable(parent_boundary)
             or not _valid_digest(contract_digest)
@@ -379,9 +458,23 @@ def run_design_phase(
             )
 
         try:
-            config_document, specs, config_digest = _design_config(
-                role=design_author_role, analyzer_specs=analyzer_specs
-            )
+            if design_configuration is None:
+                config_document, specs, config_digest = _design_config(
+                    role=design_author_role, analyzer_specs=analyzer_specs
+                )
+            else:
+                if type(design_configuration) is not dict:
+                    raise ValueError("design configuration is invalid")
+                config_document, specs = parse_design_config_document(
+                    json.loads(canonical_json_bytes(design_configuration))
+                )
+                if (
+                    config_document["design_protocol"] != "design_ir_v1"
+                    or config_document["design_author_role"] != design_author_role
+                    or specs != tuple(analyzer_specs)
+                ):
+                    raise ValueError("design configuration does not match inputs")
+                config_digest = artifact_sha256(config_document)
         except (TypeError, ValueError, UnicodeError):
             return _result(DesignPhaseDisposition.BLOCKED, "Design configuration is invalid")
 
@@ -431,6 +524,7 @@ def run_design_phase(
                 analyzers=specs,
             )
             preflight = _reassess(capabilities, required=preflight_required)
+            validate_capability_authority_protocol(config_document, preflight)
         except (TypeError, ValueError):
             return _result(
                 DesignPhaseDisposition.UNAVAILABLE,
@@ -442,13 +536,12 @@ def run_design_phase(
                 "Required design capabilities are unavailable",
             )
 
-        workspace_path = Path(workspace.path)
-        supplied_root = Path(repo_root)
-        if (
-            not workspace_path.is_absolute()
-            or not supplied_root.is_absolute()
-            or workspace_path != supplied_root
-        ):
+        workspace_identity = getattr(workspace, "path", None)
+        try:
+            if type(workspace_identity) is not str or str(repo_root) != workspace_identity:
+                raise ValueError("workspace identities differ")
+            analyzer_workspace = analyzer_workspace_identity(workspace_identity)
+        except (OSError, TypeError, ValueError):
             return _result(DesignPhaseDisposition.BLOCKED, "Design workspace identity is invalid")
 
         try:
@@ -493,6 +586,69 @@ def run_design_phase(
                 DesignPhaseDisposition.BLOCKED,
                 "Current design gate has no matching design",
             )
+        if current_gate is not None:
+            try:
+                stored_capabilities = capability_authority_from_document(
+                    current_gate.envelope.capability_document
+                )
+                stored_gate_result = DesignGateStore._replay_envelope(
+                    current_gate.envelope
+                )
+            except (TypeError, ValueError):
+                return _result(
+                    DesignPhaseDisposition.UNAVAILABLE,
+                    "Stored capability authority is unavailable",
+                    design=(None if current_design is None else current_design.envelope),
+                )
+            if type(stored_capabilities) is not type(preflight):
+                return _result(
+                    DesignPhaseDisposition.UNAVAILABLE,
+                    "Stored and current capability protocols do not match",
+                    design=(None if current_design is None else current_design.envelope),
+                )
+            context_changed_without_authority = False
+            if type(preflight) is ProviderCapabilityAssessment:
+                stored_context = stored_capabilities.context
+                current_context = preflight.context
+                if stored_context == current_context and (
+                    provider_capability_evidence_document(stored_capabilities)
+                    != provider_capability_evidence_document(preflight)
+                    or provider_capability_evidence_sha256(stored_capabilities)
+                    != provider_capability_evidence_sha256(preflight)
+                ):
+                    return _result(
+                        DesignPhaseDisposition.UNAVAILABLE,
+                        "Capability evidence changed without a new context",
+                        design=(None if current_design is None else current_design.envelope),
+                    )
+                immutable_context_matches = (
+                    stored_context.repository == current_context.repository
+                    and stored_context.issue == current_context.issue
+                    and stored_context.parent_digest == current_context.parent_digest
+                    and stored_context.config_digest == current_context.config_digest
+                    and stored_context.base_revision == current_context.base_revision
+                )
+                fingerprint_matches = (
+                    stored_context.workspace_fingerprint
+                    == current_context.workspace_fingerprint
+                )
+                exact_transition = authorized_capability_context_transition == (
+                    stored_context.workspace_fingerprint,
+                    current_context.workspace_fingerprint,
+                )
+                context_changed_without_authority = not (
+                    immutable_context_matches
+                    and (fingerprint_matches or exact_transition)
+                )
+            if (
+                context_changed_without_authority
+                and stored_gate_result.state is DesignGateState.PASS
+            ):
+                return _result(
+                    DesignPhaseDisposition.UNAVAILABLE,
+                    "Capability context changed after gate authorization",
+                    design=(None if current_design is None else current_design.envelope),
+                )
         if current_design is not None and not _matching_design(
             current_design,
             repository=repository,
@@ -539,71 +695,96 @@ def run_design_phase(
                     design=(None if current_design is None else current_design.envelope),
                     gate=reauthor_gate,
                 )
-            brief = design_author_brief(
-                issue,
-                contract_text=contract_text,
-                contract_digest=contract_digest,
-                prior_findings=_prior_findings(reauthor_gate),
-                role=design_author_role,
-            )
-            try:
-                turn = external(
-                    "design author dispatch",
-                    lambda: dispatch(design_author_role, brief),
+            validation_errors: tuple[str, ...] = ()
+            document: dict[str, Any] | None = None
+            for author_attempt in range(_MAX_DESIGN_AUTHOR_ATTEMPTS):
+                if author_attempt:
+                    try:
+                        unchanged = workspace_unchanged()
+                    except (_ParentFailure, _ExternalFailure):
+                        return _result(
+                            DesignPhaseDisposition.UNAVAILABLE,
+                            "Design workspace could not be reauthenticated before schema correction",
+                        )
+                    if not unchanged:
+                        return _result(
+                            DesignPhaseDisposition.BLOCKED,
+                            "Design workspace changed before schema correction",
+                        )
+                brief = design_author_brief(
+                    issue,
+                    contract_text=contract_text,
+                    contract_digest=contract_digest,
+                    prior_findings=_prior_findings(reauthor_gate),
+                    validation_errors=validation_errors,
+                    role=design_author_role,
                 )
-            except _ParentFailure:
-                return _result(
-                    DesignPhaseDisposition.UNAVAILABLE,
-                    "Contract authority changed during design authoring",
-                )
-            except _ExternalFailure:
-                return _result(
-                    DesignPhaseDisposition.UNAVAILABLE,
-                    "Design author turn is unavailable",
-                )
-            try:
-                unchanged = workspace_unchanged()
-            except (_ParentFailure, _ExternalFailure):
-                return _result(
-                    DesignPhaseDisposition.UNAVAILABLE,
-                    "Design workspace could not be reauthenticated",
-                )
-            if not unchanged:
+                try:
+                    turn = external(
+                        "design author dispatch",
+                        lambda brief=brief: dispatch(design_author_role, brief),
+                    )
+                except _ParentFailure:
+                    return _result(
+                        DesignPhaseDisposition.UNAVAILABLE,
+                        "Contract authority changed during design authoring",
+                    )
+                except _ExternalFailure:
+                    return _result(
+                        DesignPhaseDisposition.UNAVAILABLE,
+                        "Design author turn is unavailable",
+                    )
+                try:
+                    unchanged = workspace_unchanged()
+                except (_ParentFailure, _ExternalFailure):
+                    return _result(
+                        DesignPhaseDisposition.UNAVAILABLE,
+                        "Design workspace could not be reauthenticated",
+                    )
+                if not unchanged:
+                    return _result(
+                        DesignPhaseDisposition.BLOCKED,
+                        "Design author changed the authenticated workspace",
+                    )
+                if type(turn) is not RunResult or type(turn.ok) is not bool:
+                    return _result(
+                        DesignPhaseDisposition.UNAVAILABLE,
+                        "Design author result is unavailable",
+                    )
+                if not turn.ok:
+                    return _result(
+                        DesignPhaseDisposition.UNAVAILABLE,
+                        "Design author turn did not complete",
+                    )
+                if type(turn.output) is not str:
+                    return _result(
+                        DesignPhaseDisposition.BLOCKED,
+                        "Design author output is not strict JSON",
+                    )
+                try:
+                    raw = turn.output.encode("utf-8")
+                    if len(raw) > _MAX_DESIGN_BYTES:
+                        raise ValueError("oversized")
+                    report = parse_design_json(raw)
+                    document = _strict_object(turn.output)
+                except (TypeError, ValueError, UnicodeError):
+                    return _result(
+                        DesignPhaseDisposition.BLOCKED,
+                        "Design author output is not strict JSON",
+                    )
+                if not report.errors:
+                    validation_errors = ()
+                    break
+                validation_errors = report.errors
+            if validation_errors:
                 return _result(
                     DesignPhaseDisposition.BLOCKED,
-                    "Design author changed the authenticated workspace",
+                    (
+                        "Design author output is not valid Design IR v1 ("
+                        f"{design_validation_diagnostic(validation_errors)})"
+                    ),
                 )
-            if type(turn) is not RunResult or type(turn.ok) is not bool:
-                return _result(
-                    DesignPhaseDisposition.UNAVAILABLE,
-                    "Design author result is unavailable",
-                )
-            if not turn.ok:
-                return _result(
-                    DesignPhaseDisposition.UNAVAILABLE,
-                    "Design author turn did not complete",
-                )
-            if type(turn.output) is not str:
-                return _result(
-                    DesignPhaseDisposition.BLOCKED,
-                    "Design author output is not strict JSON",
-                )
-            try:
-                raw = turn.output.encode("utf-8")
-                if len(raw) > _MAX_DESIGN_BYTES:
-                    raise ValueError("oversized")
-                report = parse_design_json(raw)
-                document = _strict_object(turn.output)
-            except (TypeError, ValueError, UnicodeError):
-                return _result(
-                    DesignPhaseDisposition.BLOCKED,
-                    "Design author output is not strict JSON",
-                )
-            if report.errors:
-                return _result(
-                    DesignPhaseDisposition.BLOCKED,
-                    "Design author output is not valid Design IR v1",
-                )
+            assert document is not None
             if (
                 document.get("repo") != repository
                 or document.get("issue") != issue.id
@@ -744,7 +925,7 @@ def run_design_phase(
                 continue
 
             context = AnalyzerContext(
-                workspace=workspace_path,
+                workspace=analyzer_workspace,
                 repository=repository,
                 issue=issue.id,
                 artifact_fingerprint=expected_fingerprint,
@@ -845,7 +1026,7 @@ def run_design_phase(
         expected_gate_digest = (
             None if current_gate is None else current_gate.envelope.gate_result_digest
         )
-        capability_doc = capability_document(post_capabilities)
+        capability_doc = capability_authority_document(post_capabilities)
         try:
             stored_gate = external(
                 "gate store write",
@@ -880,10 +1061,11 @@ def run_design_phase(
                 design=design,
                 gate=gate,
             )
-        except _ExternalFailure:
+        except _ExternalFailure as failure:
             return _result(
                 DesignPhaseDisposition.UNAVAILABLE,
-                "Design gate authority could not be stored or replayed",
+                "Design gate authority could not be stored or replayed "
+                f"(safe code: {_gate_store_failure_code(failure)})",
                 design=design,
                 gate=gate,
             )
