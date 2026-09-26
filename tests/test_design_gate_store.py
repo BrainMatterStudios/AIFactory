@@ -17,6 +17,7 @@ from software_factory.core.design.capabilities import capability_document
 from software_factory.core.design.gate import (
     DesignGateState,
     analyzer_execution_document,
+    capability_authority_document,
     design_gate_document,
     design_gate_sha256,
     finding_override_document,
@@ -27,7 +28,9 @@ from .test_design_gate import (
     evaluate,
     execution,
     finding,
+    provider_capabilities,
     traced_design,
+    v2_config_document,
     valid_contract,
 )
 
@@ -125,6 +128,61 @@ def test_round_trip_is_canonical_private_and_replay_complete(tmp_path):
     assert (location / "current").stat().st_mode & 0o777 == 0o700
     assert only_record(location / "generations").stat().st_mode & 0o777 == 0o600
     assert only_record(location / "current").stat().st_mode & 0o777 == 0o600
+
+
+def test_provider_capability_document_round_trips_without_v1_projection(tmp_path):
+    location = root(tmp_path)
+    location.parent.mkdir()
+    store = DesignGateStore(location)
+    analyzer = execution()
+    values = inputs(analyzer=analyzer)
+    config = v2_config_document()
+    config["design_analyzers"] = [
+        {"name": analyzer.name, "required": analyzer.required, "options": {}}
+    ]
+    config_digest = artifact_sha256(config)
+    assessment = provider_capabilities(
+        required_analyzer=True, config_digest=config_digest
+    )
+    values["design_config_document"] = config
+    values["config_digest"] = config_digest
+    values["capability_document"] = capability_authority_document(assessment)
+    values["result"] = evaluate(
+        contract=values["contract_document"],
+        design=values["design_document"],
+        assessment=assessment,
+        analyzers=(analyzer,),
+        config_document=config,
+        expected_fingerprint=analyzer.artifact_fingerprint,
+    )
+
+    stored = store.store(**values, expected_current_digest=None)
+    replayed = store.read_current(repository=REPOSITORY, issue=ISSUE)
+
+    assert replayed == stored
+    assert stored.envelope.capability_document["schema_version"] == (
+        "provider-capability-assessment-v1"
+    )
+
+
+def test_store_rejects_v2_config_with_legacy_capability_authority(tmp_path):
+    location = root(tmp_path)
+    location.parent.mkdir()
+    store = DesignGateStore(location)
+    values = inputs(analyzer=execution(required=False))
+    config = v2_config_document()
+    values["design_config_document"] = config
+    values["config_digest"] = artifact_sha256(config)
+    values["result"] = evaluate(
+        contract=values["contract_document"],
+        design=values["design_document"],
+        assessment=capabilities(),
+        analyzers=values["analyzer_documents"] and (execution(required=False),),
+        config_document=config,
+    )
+
+    with pytest.raises(DesignGateStoreError, match=r"capability|protocol|replay"):
+        store.store(**values, expected_current_digest=None)
 
 
 def test_reads_are_noncreating_and_required_digest_is_not_optional(tmp_path):

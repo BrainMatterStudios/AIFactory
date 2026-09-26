@@ -7,8 +7,9 @@ from pathlib import Path
 import pytest
 
 from software_factory.adapters.base import Issue, RunResult
+from software_factory.build import design_phase as design_phase_module
 from software_factory.build.briefs import design_author_brief
-from software_factory.build.design_gate_store import DesignGateStore
+from software_factory.build.design_gate_store import DesignGateStore, DesignGateStoreError
 from software_factory.build.design_phase import (
     DesignPhaseDisposition,
     run_design_phase,
@@ -29,9 +30,20 @@ from software_factory.core.design.capabilities import (
 )
 from software_factory.core.design.capability_names import Capability
 from software_factory.core.design.configuration import AnalyzerSpec
+from software_factory.core.design.provider_capabilities import (
+    assess_provider_capabilities,
+    provider_capability_sha256,
+)
 from software_factory.trace.decisions import DecisionLog
 
-from .test_design_gate import traced_design, valid_contract
+from .fixtures.synthetic_sensitive_values import JUDGE_SECRET_MARKER, LLM_PROVIDER_KEY
+from .test_design_gate import (
+    provider_capabilities,
+    traced_design,
+    v2_config_document,
+    valid_contract,
+)
+from .test_workspace_boundary import OpaqueMemoryWorkspace
 
 
 class FixedWorkspace:
@@ -146,6 +158,172 @@ def test_author_brief_is_raw_json_only_and_omits_controller_paths():
     assert ".factory" not in brief
 
 
+def test_author_brief_contains_complete_design_ir_v1_schema_guide():
+    issue = Issue("42", "Title", "Body")
+    brief = design_author_brief(
+        issue,
+        contract_text='{"schema_version":2}',
+        contract_digest="a" * 64,
+    )
+
+    assert "Design IR v1 authoring schema" in brief
+    assert (
+        "Top-level exact keys (all required; no extras): "
+        "components, data_flows, decisions, deployment_assumptions, generated_at, "
+        "interfaces, issue, open_questions, parent_contract_digest, repo, "
+        "required_capabilities, risks, schema_version, security_boundaries, summary, "
+        "tier, traceability."
+    ) in brief
+    record_keys = {
+        "components": {
+            "depends_on", "id", "interfaces", "name", "responsibility", "security_boundary"
+        },
+        "interfaces": {
+            "consumers", "failure_contract", "id", "input_contract", "name",
+            "output_contract", "producer",
+        },
+        "data_flows": {
+            "classification", "data", "destination", "id", "protection", "source"
+        },
+        "security_boundaries": {
+            "assets", "controls", "failure_response", "id", "name", "trust_assumptions"
+        },
+        "deployment_assumptions": {
+            "assumption", "evidence_obligation", "id", "validation"
+        },
+        "decisions": {
+            "alternatives", "choice", "consequences", "id", "question", "rationale"
+        },
+        "risks": {"condition", "evidence_obligation", "id", "impact", "mitigation"},
+        "open_questions": {
+            "authority", "id", "question", "resolution", "severity", "status"
+        },
+        "traceability": {"contract_id", "design_refs", "evidence_obligations"},
+    }
+    for collection, keys in record_keys.items():
+        assert f"- {collection} exact keys: {', '.join(sorted(keys))}." in brief
+
+    assert (
+        "required_capabilities values: analyzer_evidence, approval_pause, "
+        "artifact_fingerprinting, bounded_writable_paths, controller_state_separation, "
+        "credential_scan, deployment_forbidden, isolated_worktree, merge_forbidden, "
+        "objective_verification."
+    ) in brief
+    assert "classification values: confidential, internal, public, restricted." in brief
+    assert "severity values: blocking, high, low, medium." in brief
+    assert "status values: delegated, open, resolved." in brief
+    assert "`issue` is the exact issue identity string shown below" in brief
+    assert "`repo` is the exact accepted Contract `repo` string" in brief
+    assert "Open questions with status `open` require null `resolution` and `authority`." in brief
+    assert "External endpoints use `external.<name>`" in brief
+    assert "All references must resolve" in brief
+
+
+def test_provider_capability_authority_reaches_gate_storage_without_v1_projection(
+    tmp_path: Path,
+):
+    values = _inputs(tmp_path)
+    config = v2_config_document()
+    config_digest = artifact_sha256(config)
+    values["design_configuration"] = config
+    values["capabilities"] = provider_capabilities(
+        parent_digest=values["contract_digest"], config_digest=config_digest
+    )
+
+    result = _run(values)
+
+    assert result.disposition is DesignPhaseDisposition.APPROVAL_PENDING
+    stored = values["gate_store"].read_current(
+        repository=values["repository"], issue=values["issue"].id
+    )
+    assert stored is not None
+    assert stored.envelope.capability_document["schema_version"] == (
+        "provider-capability-assessment-v1"
+    )
+
+
+def test_stored_v1_and_current_provider_authority_never_form_a_mixed_chain(
+    tmp_path: Path,
+):
+    values = _inputs(tmp_path)
+    first = _run(values)
+    assert first.disposition is DesignPhaseDisposition.APPROVAL_PENDING
+    values["capabilities"] = provider_capabilities(
+        parent_digest=values["contract_digest"]
+    )
+    values["allow_author_dispatch"] = False
+
+    mixed = _run(values)
+
+    assert mixed.disposition is DesignPhaseDisposition.UNAVAILABLE
+    assert len(values["_dispatch_calls"]) == 1
+    stored = values["gate_store"].read_current(
+        repository=values["repository"], issue=values["issue"].id
+    )
+    assert stored is not None
+    assert stored.envelope.capability_document["schema_version"] == "capability-assessment-v1"
+
+
+@pytest.mark.parametrize("drift", ("declaration", "evidence"))
+def test_same_context_provider_drift_cannot_replace_an_approved_gate(
+    tmp_path: Path, drift: str
+):
+    values = _inputs(tmp_path)
+    config = v2_config_document()
+    config_digest = artifact_sha256(config)
+    values["design_configuration"] = config
+    original = provider_capabilities(
+        parent_digest=values["contract_digest"], config_digest=config_digest
+    )
+    values["capabilities"] = original
+
+    pending = _run(values)
+    assert pending.disposition is DesignPhaseDisposition.APPROVAL_PENDING
+    assert pending.design is not None
+    _approve(values, pending.design.artifact_digest)
+    stored_before = values["gate_store"].read_current(
+        repository=values["repository"], issue=values["issue"].id
+    )
+    assert stored_before is not None
+
+    declarations = original.declarations
+    observations = original.observations
+    if drift == "declaration":
+        declarations = (
+            replace(
+                declarations[0],
+                capabilities=(
+                    declarations[0].capabilities
+                    | frozenset({Capability.OBJECTIVE_VERIFICATION})
+                ),
+            ),
+            *declarations[1:],
+        )
+    else:
+        observations = (
+            replace(observations[0], evidence_digests=("a" * 64,)),
+            *observations[1:],
+        )
+    values["capabilities"] = assess_provider_capabilities(
+        context=original.context,
+        declarations=declarations,
+        observations=observations,
+        required=original.required,
+    )
+    assert provider_capability_sha256(values["capabilities"]) != (
+        provider_capability_sha256(original)
+    )
+    values["allow_author_dispatch"] = False
+
+    result = _run(values)
+
+    assert result.disposition is DesignPhaseDisposition.UNAVAILABLE
+    stored_after = values["gate_store"].read_current(
+        repository=values["repository"], issue=values["issue"].id
+    )
+    assert stored_after == stored_before
+
+
 def test_preflight_blocks_before_dispatch_when_capability_is_unverifiable(tmp_path: Path):
     values = _inputs(tmp_path)
     values["capabilities"] = assess_capabilities(
@@ -163,12 +341,197 @@ def test_preflight_blocks_before_dispatch_when_capability_is_unverifiable(tmp_pa
 @pytest.mark.parametrize("output", ["```json\n{}\n```", "{broken", "{} trailing"])
 def test_author_output_is_strict_raw_json(tmp_path: Path, output: str):
     values = _inputs(tmp_path)
-    values["dispatch"] = lambda role, brief: RunResult(True, output, "guarded")
+    calls: list[str] = []
+
+    def dispatch(role: str, brief: str) -> RunResult:
+        calls.append(brief)
+        return RunResult(True, output, "guarded")
+
+    values["dispatch"] = dispatch
 
     result = _run(values)
 
     assert result.disposition is DesignPhaseDisposition.BLOCKED
     assert "broken" not in result.reason
+    assert len(calls) == 1
+
+
+def test_parseable_invalid_design_gets_one_bounded_correction_turn(tmp_path: Path):
+    values = _inputs(tmp_path)
+    invalid = json.loads(json.dumps(values["_design"]))
+    invalid["data_flows"][0]["SECRET_TRANSPORT"] = "must-not-reach-the-retry-brief"
+    briefs: list[str] = []
+
+    def dispatch(role: str, brief: str) -> RunResult:
+        briefs.append(brief)
+        if len(briefs) == 2:
+            assert values["design_store"].read_current(
+                repository=values["repository"], issue=values["issue"].id
+            ) is None
+        document = invalid if len(briefs) == 1 else values["_design"]
+        return RunResult(True, json.dumps(document), "guarded")
+
+    values["dispatch"] = dispatch
+
+    result = _run(values)
+
+    assert result.disposition is DesignPhaseDisposition.APPROVAL_PENDING
+    assert result.design is not None
+    assert len(briefs) == 2
+    assert "Previous design-author output failed strict Design IR v1 validation" in briefs[1]
+    assert "data_flows[0]:unknown-field" in briefs[1]
+    assert "Design IR v1 authoring schema" in briefs[1]
+    assert values["contract_text"] in briefs[1]
+    assert "SECRET_TRANSPORT" not in briefs[1]
+    assert "must-not-reach-the-retry-brief" not in briefs[1]
+
+
+def test_second_parseable_invalid_design_blocks_without_third_dispatch(tmp_path: Path):
+    values = _inputs(tmp_path)
+    invalid = json.loads(json.dumps(values["_design"]))
+    invalid["data_flows"][0]["unexpected"] = "never-authority"
+    briefs: list[str] = []
+
+    def dispatch(role: str, brief: str) -> RunResult:
+        briefs.append(brief)
+        return RunResult(True, json.dumps(invalid), "guarded")
+
+    values["dispatch"] = dispatch
+
+    result = _run(values)
+
+    assert result.disposition is DesignPhaseDisposition.BLOCKED
+    assert result.reason.endswith(
+        "(1 validation error; safe codes: data_flows[0]:unknown-field)"
+    )
+    assert len(briefs) == 2
+    assert values["design_store"].read_current(
+        repository=values["repository"], issue=values["issue"].id
+    ) is None
+
+
+def test_workspace_change_after_invalid_design_blocks_before_correction(tmp_path: Path):
+    values = _inputs(tmp_path)
+    invalid = json.loads(json.dumps(values["_design"]))
+    invalid["data_flows"][0]["unexpected"] = "never-authority"
+    calls = 0
+
+    def dispatch(role: str, brief: str) -> RunResult:
+        nonlocal calls
+        calls += 1
+        values["workspace"].fingerprint = "e" * 64
+        return RunResult(True, json.dumps(invalid), "guarded")
+
+    values["dispatch"] = dispatch
+
+    result = _run(values)
+
+    assert result.disposition is DesignPhaseDisposition.BLOCKED
+    assert result.reason == "Design author changed the authenticated workspace"
+    assert calls == 1
+
+
+def test_workspace_drift_between_invalid_design_and_correction_blocks_retry(
+    tmp_path: Path,
+):
+    values = _inputs(tmp_path)
+    invalid = json.loads(json.dumps(values["_design"]))
+    invalid["data_flows"][0]["unexpected"] = "never-authority"
+    first_dispatch_finished = False
+    reads_after_first_dispatch = 0
+
+    class DriftingWorkspace(FixedWorkspace):
+        def review_fingerprint(self) -> str:
+            nonlocal reads_after_first_dispatch
+            self.calls += 1
+            if not first_dispatch_finished:
+                return self.fingerprint
+            reads_after_first_dispatch += 1
+            return self.fingerprint if reads_after_first_dispatch == 1 else "e" * 64
+
+    workspace = DriftingWorkspace(tmp_path / "worktree")
+    values["workspace"] = workspace
+    values["repo_root"] = workspace.path
+    calls = 0
+
+    def dispatch(role: str, brief: str) -> RunResult:
+        nonlocal calls, first_dispatch_finished
+        calls += 1
+        first_dispatch_finished = True
+        return RunResult(True, json.dumps(invalid), "guarded")
+
+    values["dispatch"] = dispatch
+
+    result = _run(values)
+
+    assert result.disposition is DesignPhaseDisposition.BLOCKED
+    assert result.reason == "Design workspace changed before schema correction"
+    assert calls == 1
+
+
+def test_parent_drift_between_invalid_design_and_correction_blocks_retry(
+    tmp_path: Path,
+):
+    values = _inputs(tmp_path)
+    invalid = json.loads(json.dumps(values["_design"]))
+    invalid["data_flows"][0]["unexpected"] = "never-authority"
+    first_dispatch_finished = False
+    boundaries_after_first_dispatch = 0
+    calls = 0
+
+    def boundary(parent: str) -> None:
+        nonlocal boundaries_after_first_dispatch
+        if first_dispatch_finished:
+            boundaries_after_first_dispatch += 1
+            if boundaries_after_first_dispatch == 4:
+                raise RuntimeError("parent drift")
+
+    def dispatch(role: str, brief: str) -> RunResult:
+        nonlocal calls, first_dispatch_finished
+        calls += 1
+        first_dispatch_finished = True
+        return RunResult(True, json.dumps(invalid), "guarded")
+
+    values["parent_boundary"] = boundary
+    values["dispatch"] = dispatch
+
+    result = _run(values)
+
+    assert result.disposition is DesignPhaseDisposition.UNAVAILABLE
+    assert result.reason == (
+        "Design workspace could not be reauthenticated before schema correction"
+    )
+    assert calls == 1
+
+
+def test_invalid_design_reports_safe_bounded_diagnostic_codes_without_echo(
+    tmp_path: Path,
+):
+    values = _inputs(tmp_path)
+    invalid = json.loads(json.dumps(values["_design"]))
+    invalid["schema_version"] = 2
+    invalid["SECRET_API_KEY"] = LLM_PROVIDER_KEY
+    invalid["required_capabilities"] = ["secret-capability-value"]
+    del invalid["components"][0]["name"]
+    invalid["components"][0]["depends_on"] = ["secret-component-reference"]
+    values["dispatch"] = lambda role, brief: RunResult(
+        True, json.dumps(invalid), "guarded"
+    )
+
+    result = _run(values)
+
+    assert result.disposition is DesignPhaseDisposition.BLOCKED
+    assert "5 validation errors" in result.reason
+    assert "components[0].depends_on:unresolved-reference" in result.reason
+    assert "components[0].name:missing-field" in result.reason
+    assert "document:unknown-field" in result.reason
+    assert "required_capabilities[0]:enum" in result.reason
+    assert "schema_version:schema-version" in result.reason
+    assert "SECRET" not in result.reason
+    assert "sk-live" not in result.reason
+    assert "secret-capability-value" not in result.reason
+    assert "secret-component-reference" not in result.reason
+    assert len(result.reason.encode("utf-8")) <= 1024
 
 
 def test_failed_or_wrong_typed_dispatch_is_constant_and_never_echoed(tmp_path: Path):
@@ -206,6 +569,47 @@ def test_workspace_mutation_during_dispatch_blocks(tmp_path: Path):
     result = _run(values)
 
     assert result.disposition is DesignPhaseDisposition.BLOCKED
+
+
+def test_design_authoring_accepts_an_opaque_workspace_identity(tmp_path: Path):
+    values = _inputs(tmp_path)
+    workspace = OpaqueMemoryWorkspace()
+    values["workspace"] = workspace
+    values["repo_root"] = workspace.path
+
+    result = _run(values)
+
+    assert result.disposition is DesignPhaseDisposition.APPROVAL_PENDING
+    assert result.design is not None
+    assert values["_dispatch_calls"]
+
+
+def test_design_analyzer_receives_the_opaque_workspace_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    spec = AnalyzerSpec("remote", False, {})
+    values = _inputs(tmp_path, specs=(spec,))
+    workspace = OpaqueMemoryWorkspace()
+    values["workspace"] = workspace
+    values["repo_root"] = workspace.path
+    observed: list[object] = []
+
+    monkeypatch.setattr(design_phase_module, "build_analyzer", lambda _spec: object())
+
+    def unavailable_remote_analyzer(*, adapter, spec, context, fingerprint):
+        observed.append(context.workspace)
+        raise RuntimeError("remote analyzer unavailable")
+
+    monkeypatch.setattr(
+        design_phase_module,
+        "run_analyzer",
+        unavailable_remote_analyzer,
+    )
+
+    result = _run(values)
+
+    assert result.disposition is DesignPhaseDisposition.APPROVAL_PENDING
+    assert observed == ["workspace://remote/test"]
 
 
 def test_contract_mutation_at_boundary_fails_closed_without_raw_echo(tmp_path: Path):
@@ -305,6 +709,61 @@ def test_blocked_current_design_gets_exactly_one_cas_reauthor_turn(tmp_path: Pat
     assert "design.traceability" in briefs[0]
     assert second.design is not None
     assert second.design.artifact_digest != first.design.artifact_digest
+
+
+def test_blocked_provider_design_with_new_satisfied_requirement_reauthors_same_context(
+    tmp_path: Path,
+):
+    values = _inputs(tmp_path)
+    config = v2_config_document()
+    config_digest = artifact_sha256(config)
+    values["design_configuration"] = config
+    complete = provider_capabilities(
+        required_analyzer=True,
+        parent_digest=values["contract_digest"],
+        config_digest=config_digest,
+    )
+    values["capabilities"] = assess_provider_capabilities(
+        context=complete.context,
+        declarations=complete.declarations,
+        observations=complete.observations,
+        required=values["capabilities"].required,
+    )
+    blocked = json.loads(json.dumps(values["_design"]))
+    blocked["traceability"] = []
+    blocked["required_capabilities"] = sorted(
+        {*blocked["required_capabilities"], Capability.ANALYZER_EVIDENCE.value}
+    )
+    values["dispatch"] = lambda role, brief: RunResult(
+        True, json.dumps(blocked), "guarded"
+    )
+
+    first = _run(values)
+
+    assert first.disposition is DesignPhaseDisposition.BLOCKED
+    stored = values["gate_store"].read_current(
+        repository=values["repository"], issue=values["issue"].id
+    )
+    assert stored is not None
+    assert Capability.ANALYZER_EVIDENCE.value in (
+        stored.envelope.capability_document["required"]
+    )
+
+    corrected = json.loads(json.dumps(values["_design"]))
+    corrected["required_capabilities"] = blocked["required_capabilities"]
+    briefs: list[str] = []
+
+    def reauthor(role: str, brief: str) -> RunResult:
+        briefs.append(brief)
+        return RunResult(True, json.dumps(corrected), "guarded")
+
+    values["dispatch"] = reauthor
+
+    second = _run(values)
+
+    assert second.disposition is DesignPhaseDisposition.APPROVAL_PENDING
+    assert len(briefs) == 1
+    assert "design.traceability" in briefs[0]
 
 
 def test_continuation_never_dispatches_author_for_blocked_current_design(
@@ -429,6 +888,117 @@ def test_decision_append_or_replay_failure_never_grants_authority(tmp_path: Path
     result = _run(values)
 
     assert result.disposition is DesignPhaseDisposition.UNAVAILABLE
+
+
+def test_gate_store_replay_mismatch_reports_only_fixed_safe_code(tmp_path: Path):
+    values = _inputs(tmp_path)
+
+    class BrokenGateStore:
+        def read_current(self, **_kwargs):
+            return None
+
+        def store(self, **_kwargs):
+            raise DesignGateStoreError(
+                "stored gate result does not match deterministic replay"
+            )
+
+    values["gate_store"] = BrokenGateStore()
+
+    result = _run(values)
+
+    assert result.disposition is DesignPhaseDisposition.UNAVAILABLE
+    assert result.reason == (
+        "Design gate authority could not be stored or replayed "
+        "(safe code: gate-write:deterministic-replay)"
+    )
+
+
+def test_gate_store_failure_never_echoes_exception_text(tmp_path: Path):
+    values = _inputs(tmp_path)
+    secret = JUDGE_SECRET_MARKER
+
+    class BrokenGateStore:
+        def read_current(self, **_kwargs):
+            return None
+
+        def store(self, **_kwargs):
+            raise RuntimeError(secret)
+
+    values["gate_store"] = BrokenGateStore()
+
+    result = _run(values)
+
+    assert result.disposition is DesignPhaseDisposition.UNAVAILABLE
+    assert result.reason == (
+        "Design gate authority could not be stored or replayed "
+        "(safe code: gate-write:external-failure)"
+    )
+    assert secret not in result.reason
+
+
+def test_gate_store_typed_write_failure_uses_closed_safe_code(tmp_path: Path):
+    values = _inputs(tmp_path)
+    secret = JUDGE_SECRET_MARKER
+
+    class UntrustedKind:
+        value = secret
+
+    class BrokenGateStore:
+        def read_current(self, **_kwargs):
+            return None
+
+        def store(self, **_kwargs):
+            raise DesignGateStoreError(
+                "benign",
+                kind=UntrustedKind(),  # type: ignore[arg-type]
+            )
+
+    values["gate_store"] = BrokenGateStore()
+
+    result = _run(values)
+
+    assert result.disposition is DesignPhaseDisposition.UNAVAILABLE
+    assert result.reason == (
+        "Design gate authority could not be stored or replayed "
+        "(safe code: gate-write:authority-failure)"
+    )
+    assert secret not in result.reason
+
+
+def test_gate_store_typed_replay_failure_uses_closed_safe_code(tmp_path: Path):
+    values = _inputs(tmp_path)
+    real_gate_store = values["gate_store"]
+    secret = JUDGE_SECRET_MARKER
+
+    class UntrustedKind:
+        value = secret
+
+    class BrokenGateStore:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def read_current(self, **kwargs):
+            self.reads += 1
+            if self.reads == 1:
+                return None
+            raise DesignGateStoreError(
+                "benign",
+                kind=UntrustedKind(),  # type: ignore[arg-type]
+            )
+
+        def store(self, **kwargs):
+            return real_gate_store.store(**kwargs)
+
+    values["gate_store"] = BrokenGateStore()
+
+    result = _run(values)
+
+    assert result.disposition is DesignPhaseDisposition.UNAVAILABLE
+    assert result.reason == (
+        "Design gate authority could not be stored or replayed "
+        "(safe code: gate-read:authority-failure)"
+    )
+    assert secret not in result.reason
 
 
 def test_every_external_operation_is_bracketed_by_parent_boundary(tmp_path: Path):

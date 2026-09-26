@@ -428,6 +428,13 @@ A legacy plan approval never becomes a Design approval. Disabling a required
 analyzer may change configured policy, but does not preserve the released Design
 authority and must not be described as a compatibility fix.
 
+A parseable JSON object that fails Design IR v1 schema validation receives at
+most one corrective author turn. The controller supplies only bounded diagnostic
+codes plus the authoritative schema and Contract; it does not preserve or echo
+the rejected object. Both turns are metered and pass through the configured
+budget guard. Syntactically invalid JSON is not retried, and a second schema
+failure remains blocked.
+
 ### Contract migration
 
 Contract v1 is readable during v0.x but deprecated; it emits migration evidence

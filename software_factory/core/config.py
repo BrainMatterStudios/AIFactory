@@ -11,18 +11,31 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from software_factory.adapters.registry import VALID_KINDS, get_registry
-from software_factory.core.design.configuration import VALID_DESIGN_PROTOCOLS, AnalyzerSpec
+from software_factory.core.design.configuration import (
+    VALID_DESIGN_PROTOCOLS,
+    AnalyzerSpec,
+    CapabilityProviderSpec,
+    ExecutionPolicySpec,
+    VerificationCommandSpec,
+    _freeze_json,
+    thaw_json,
+)
 from software_factory.core.orchestrate.routing import Thresholds
+from software_factory.loop.state import default_state_dir
 
 DEFAULT_MANIFEST_NAMES = ("factory.config.yaml", "factory.config.yml", "factory.config.json")
 VALID_REVIEW_PROTOCOLS = frozenset({"verdict_v1", "findings_v2"})
+_SAFE_ADAPTER_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
 
 
 # --------------------------------------------------------------------------- #
@@ -72,12 +85,28 @@ class AdapterSpec:
     provider: str
     options: Mapping[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if (
+            type(self.provider) is not str
+            or not self.provider.strip()
+            or self.provider != self.provider.strip()
+        ):
+            raise ValueError("adapter provider must be a normalized non-empty string")
+        if not isinstance(self.options, Mapping):
+            raise TypeError("adapter options must be a mapping")
+        object.__setattr__(self, "options", _freeze_json(self.options, "adapter options"))
+
 
 @dataclass(frozen=True)
 class BudgetConfig:
     monthly_usd: float | None = None
     per_task_usd: float | None = None
     daily_alert_usd: float | None = None
+
+
+class PublicationMode(str, Enum):
+    PULL_REQUEST = "pull_request"
+    LOCAL_BUNDLE = "local_bundle"
 
 
 @dataclass(frozen=True)
@@ -107,6 +136,20 @@ class BuildConfig:
     design_protocol: str = "legacy_plan"
     design_analyzers: tuple[AnalyzerSpec, ...] = ()
     design_author_role: str = "design-author"
+    capability_providers: tuple[CapabilityProviderSpec, ...] = ()
+    execution_policy: ExecutionPolicySpec = field(default_factory=ExecutionPolicySpec)
+    execution_policy_explicit: bool = False
+    workspace_adapter: AdapterSpec | None = None
+    publication_mode: PublicationMode = PublicationMode.PULL_REQUEST
+    local_artifact_root: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.workspace_adapter is None:
+            return
+        if type(self.workspace_adapter) is not AdapterSpec:
+            raise TypeError("workspace_adapter must be an AdapterSpec or None")
+        if _SAFE_ADAPTER_NAME.fullmatch(self.workspace_adapter.provider) is None:
+            raise ValueError("workspace adapter provider must be a safe normalized string")
 
 
 @dataclass(frozen=True)
@@ -136,6 +179,20 @@ class FactoryConfig:
     raw: Mapping[str, Any] = field(default_factory=dict)
     source_path: Path | None = None
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.adapters, Mapping):
+            raise TypeError("adapters must be a mapping")
+        frozen_adapters: dict[str, AdapterSpec] = {}
+        for kind, spec in self.adapters.items():
+            if type(kind) is not str or kind not in VALID_KINDS:
+                raise ValueError("adapter mapping contains an unknown kind")
+            if type(spec) is not AdapterSpec:
+                raise TypeError("adapter mapping values must be AdapterSpec values")
+            frozen_adapters[kind] = spec
+        if frozen_adapters.get("workspace") != self.build_cfg.workspace_adapter:
+            raise ValueError("workspace runtime selection must match BuildConfig authority")
+        object.__setattr__(self, "adapters", MappingProxyType(frozen_adapters))
+
     # -- construction ------------------------------------------------------- #
     @classmethod
     def from_dict(cls, data: Mapping[str, Any], *, source_path: Path | None = None) -> FactoryConfig:
@@ -158,6 +215,21 @@ class FactoryConfig:
                 adapters[kind] = AdapterSpec(provider=provider, options=opts)
             else:
                 raise ValueError(f"factory.{kind} must be a string or mapping")
+            if kind == "workspace" and _SAFE_ADAPTER_NAME.fullmatch(
+                adapters[kind].provider
+            ) is None:
+                raise ValueError("factory.workspace provider must be a safe normalized string")
+        workspace_adapter = adapters.get("workspace")
+        if workspace_adapter is not None:
+            try:
+                frozen_workspace_options = thaw_json(workspace_adapter.options)
+            except (TypeError, ValueError) as exc:
+                raise type(exc)(f"factory.workspace: {exc}") from exc
+            workspace_adapter = AdapterSpec(
+                provider=workspace_adapter.provider,
+                options=frozen_workspace_options,
+            )
+            adapters["workspace"] = workspace_adapter
 
         thr = Thresholds()
         rt = (f.get("routing") or {}).get("thresholds") or {}
@@ -257,6 +329,129 @@ class FactoryConfig:
                 raise type(exc)(f"{where}.options: {exc}") from exc
             design_analyzers.append(spec)
             analyzer_names.add(name)
+        raw_providers = bd.get("capability_providers", [])
+        if type(raw_providers) is not list:
+            raise TypeError("factory.build.capability_providers must be a list")
+        capability_providers: list[CapabilityProviderSpec] = []
+        provider_names: set[str] = set()
+        for index, raw_provider in enumerate(raw_providers):
+            where = f"factory.build.capability_providers[{index}]"
+            if not isinstance(raw_provider, Mapping):
+                raise TypeError(f"{where} must be a mapping")
+            if set(raw_provider) != {"name", "options"}:
+                raise ValueError(f"{where} must have exactly name and options")
+            name = raw_provider.get("name")
+            if name in provider_names:
+                raise ValueError(
+                    "factory.build.capability_providers must have unique names; "
+                    f"duplicate {name!r}"
+                )
+            options = raw_provider.get("options")
+            if not isinstance(options, Mapping):
+                raise TypeError(f"{where}.options must be a mapping")
+            try:
+                provider_spec = CapabilityProviderSpec(name=name, options=options)
+            except (TypeError, ValueError) as exc:
+                raise type(exc)(f"{where}: {exc}") from exc
+            capability_providers.append(provider_spec)
+            provider_names.add(provider_spec.name)
+
+        execution_policy_explicit = "execution_policy" in bd
+        if execution_policy_explicit:
+            raw_policy = bd["execution_policy"]
+            policy_where = "factory.build.execution_policy"
+            if not isinstance(raw_policy, Mapping):
+                raise TypeError(f"{policy_where} must be a mapping")
+            policy_fields = {
+                "implementation_writable_paths",
+                "verification_commands",
+                "network_profile",
+            }
+            if set(raw_policy) != policy_fields:
+                raise ValueError(f"{policy_where} must have exactly {sorted(policy_fields)!r}")
+            raw_paths = raw_policy["implementation_writable_paths"]
+            if type(raw_paths) is not list:
+                raise TypeError(f"{policy_where}.implementation_writable_paths must be a list")
+            raw_commands = raw_policy["verification_commands"]
+            if type(raw_commands) is not list:
+                raise TypeError(f"{policy_where}.verification_commands must be a list")
+            commands: list[VerificationCommandSpec] = []
+            for index, raw_command in enumerate(raw_commands):
+                command_where = f"{policy_where}.verification_commands[{index}]"
+                if not isinstance(raw_command, Mapping):
+                    raise TypeError(f"{command_where} must be a mapping")
+                command_fields = {"name", "argv", "expected_exit", "environment_profile"}
+                if set(raw_command) != command_fields:
+                    raise ValueError(
+                        f"{command_where} must have exactly {sorted(command_fields)!r}"
+                    )
+                raw_argv = raw_command["argv"]
+                if type(raw_argv) is not list:
+                    raise TypeError(f"{command_where}.argv must be a list")
+                try:
+                    command = VerificationCommandSpec(
+                        name=raw_command["name"],
+                        argv=tuple(raw_argv),
+                        expected_exit=raw_command["expected_exit"],
+                        environment_profile=raw_command["environment_profile"],
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise type(exc)(f"{command_where}: {exc}") from exc
+                commands.append(command)
+            try:
+                execution_policy = ExecutionPolicySpec(
+                    implementation_writable_paths=tuple(raw_paths),
+                    verification_commands=tuple(commands),
+                    network_profile=raw_policy["network_profile"],
+                )
+            except (TypeError, ValueError) as exc:
+                raise type(exc)(f"{policy_where}: {exc}") from exc
+        else:
+            execution_policy = ExecutionPolicySpec()
+        raw_publication_mode = bd.get("publication_mode", PublicationMode.PULL_REQUEST.value)
+        if type(raw_publication_mode) is not str:
+            raise TypeError("factory.build.publication_mode must be a string")
+        try:
+            publication_mode = PublicationMode(raw_publication_mode)
+        except ValueError:
+            raise ValueError(
+                "factory.build.publication_mode must be one of "
+                f"{[mode.value for mode in PublicationMode]!r}"
+            ) from None
+        raw_artifact_root = bd.get("local_artifact_root")
+        if publication_mode is PublicationMode.LOCAL_BUNDLE:
+            if raw_artifact_root is None:
+                local_artifact_root = default_state_dir() / "validation-artifacts"
+                if not local_artifact_root.is_absolute():
+                    raise ValueError(
+                        "factory.build.local_artifact_root must be an absolute non-empty path string"
+                    )
+                local_artifact_root = str(local_artifact_root)
+            elif type(raw_artifact_root) is not str:
+                raise TypeError(
+                    "factory.build.local_artifact_root must be an absolute non-empty path string"
+                )
+            elif not raw_artifact_root.strip() or not Path(raw_artifact_root).is_absolute():
+                raise ValueError(
+                    "factory.build.local_artifact_root must be an absolute non-empty path string"
+                )
+            else:
+                local_artifact_root = raw_artifact_root
+        else:
+            if raw_artifact_root is not None:
+                raise ValueError(
+                    "factory.build.local_artifact_root is only valid for local_bundle publication_mode"
+                )
+            local_artifact_root = None
+        source_adapter = adapters.get("source")
+        if (
+            source_adapter is not None
+            and source_adapter.provider == "local-file"
+            and publication_mode is not PublicationMode.LOCAL_BUNDLE
+        ):
+            raise ValueError(
+                "local-file source is selectable only with local_bundle publication mode"
+            )
         build = BuildConfig(
             dev_branch=bd.get("dev_branch", "develop"),
             verify_cmd=bd.get("verify_cmd", "pytest -q"),
@@ -276,6 +471,12 @@ class FactoryConfig:
             design_protocol=design_protocol,
             design_analyzers=tuple(design_analyzers),
             design_author_role=design_author_role,
+            capability_providers=tuple(capability_providers),
+            execution_policy=execution_policy,
+            execution_policy_explicit=execution_policy_explicit,
+            workspace_adapter=workspace_adapter,
+            publication_mode=publication_mode,
+            local_artifact_root=local_artifact_root,
         )
 
         plugins = tuple(f.get("plugins") or ())
@@ -316,7 +517,7 @@ class FactoryConfig:
         if kind not in self.adapters:
             raise KeyError(f"no {kind} adapter configured in {self.source_path or 'manifest'}")
         spec = self.adapters[kind]
-        return get_registry().build(kind, spec.provider, spec.options)
+        return get_registry().build(kind, spec.provider, thaw_json(spec.options))
 
     def providers(self) -> dict[str, str]:
         return {k: v.provider for k, v in self.adapters.items()}

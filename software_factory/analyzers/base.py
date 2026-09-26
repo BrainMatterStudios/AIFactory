@@ -13,6 +13,7 @@ import json
 import math
 import multiprocessing
 import os
+import re
 import sys
 import time
 from collections.abc import Callable, Mapping
@@ -43,6 +44,10 @@ _CLEANUP_BUDGET_S = 1.0
 _TERMINATE_GRACE_S = 0.5
 _MAX_REVISION_BYTES = 128
 _SUCCESS_ENVELOPE_BYTES = 2 + _MAX_REVISION_BYTES
+_OPAQUE_WORKSPACE_URI = re.compile(
+    r"(?:workspace|lima)://[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?/"
+    r"(?:[A-Za-z0-9._~-]+/)*[A-Za-z0-9._~-]+\Z"
+)
 
 
 def _positive_int(value: object, field: str) -> int:
@@ -77,6 +82,31 @@ def _is_fingerprint(value: object) -> bool:
     )
 
 
+def _is_opaque_workspace_uri(value: str) -> bool:
+    if _OPAQUE_WORKSPACE_URI.fullmatch(value) is None:
+        return False
+    _scheme, authority_path = value.split("://", 1)
+    authority, path = authority_path.split("/", 1)
+    return all(
+        segment and segment not in {".", ".."}
+        for segment in (*authority.split("."), *path.split("/"))
+    )
+
+
+def analyzer_workspace_identity(value: object) -> Path | str:
+    """Validate an adapter identity and materialize local strings as ``Path``."""
+    if type(value) is str and (value.startswith("workspace://") or value.startswith("lima://")):
+        if not _is_opaque_workspace_uri(value):
+            raise ValueError("workspace URI must be normalized")
+        return value
+    if not isinstance(value, (str, Path)):
+        raise TypeError("workspace identity must be a local path or opaque URI")
+    local = Path(value)
+    if not local.is_absolute() or not local.is_dir():
+        raise ValueError("local workspace identity must be an absolute existing directory")
+    return local
+
+
 @dataclass(frozen=True)
 class AnalyzerLimits:
     """Hard limits enforced while one analyzer is collected and normalized."""
@@ -98,19 +128,25 @@ class AnalyzerLimits:
 class AnalyzerContext:
     """Explicit workspace and artifact identity available to an analyzer."""
 
-    workspace: Path
+    workspace: Path | str
     repository: str
     issue: str
     artifact_fingerprint: str
     limits: AnalyzerLimits
 
     def __post_init__(self) -> None:
-        if not isinstance(self.workspace, Path):
-            raise TypeError("workspace must be a Path")
-        if not self.workspace.is_absolute():
-            raise ValueError("workspace must be absolute")
-        if not self.workspace.is_dir():
-            raise ValueError("workspace must be an existing directory")
+        if isinstance(self.workspace, Path):
+            if not self.workspace.is_absolute():
+                raise ValueError("workspace must be absolute")
+            if not self.workspace.is_dir():
+                raise ValueError("workspace must be an existing directory")
+        elif type(self.workspace) is str:
+            if not (self.workspace.startswith("workspace://") or self.workspace.startswith("lima://")):
+                raise TypeError("workspace must be a Path or opaque workspace URI")
+            if not _is_opaque_workspace_uri(self.workspace):
+                raise ValueError("workspace URI must be normalized")
+        else:
+            raise TypeError("workspace must be a Path or opaque workspace URI")
         _normalized_text(self.repository, "repository")
         _normalized_text(self.issue, "issue")
         if not _is_fingerprint(self.artifact_fingerprint):

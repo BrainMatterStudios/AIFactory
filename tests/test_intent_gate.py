@@ -9,13 +9,14 @@ from copy import deepcopy
 
 import pytest
 
+from software_factory.build.contract_constraints import CONTRACT_POLICY_VERSION
 from software_factory.core.contracts import (
     IntentDisposition,
     IntentReport,
     ProofObligation,
     evaluate_intent,
 )
-from software_factory.core.contracts.intent import _failed
+from software_factory.core.contracts.intent import POLICY_VERSION, _failed
 from software_factory.loop.collectors import CheckResult, CheckVerdict
 
 
@@ -167,7 +168,8 @@ def test_complete_contract_passes_the_pinned_policy():
     report = evaluate_intent(_valid_contract())
 
     assert report.disposition is IntentDisposition.PASS
-    assert report.policy_version == "intent-v1"
+    assert report.policy_version == "intent-v2"
+    assert POLICY_VERSION == CONTRACT_POLICY_VERSION
     assert report.findings == ()
     assert report.proof_obligations == ()
     assert report.requires_contract_approval is False

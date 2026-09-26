@@ -35,6 +35,7 @@ VERDICT_PATH = ".factory/judge-verdict.json"
 #: The only accepted spellings. Case-insensitive, because a model writing "pass"
 #: is answering the question; anything else is not.
 _VERDICTS = {v.value: v for v in (Verdict.PASS, Verdict.REVISE, Verdict.BLOCK)}
+_MAX_VERDICT_BYTES = 256 * 1024
 
 
 class VerdictUnreadable(RuntimeError):
@@ -51,10 +52,22 @@ class JudgeVerdict:
 
 
 def verdict_file(workspace_path: str | Path) -> Path:
-    return Path(workspace_path, VERDICT_PATH)
+    if not isinstance(workspace_path, (str, Path)):
+        if not (
+            isinstance(getattr(workspace_path, "base", None), str)
+            and callable(getattr(workspace_path, "changed_files", None))
+        ):
+            raise TypeError("verdict host fallback requires a local workspace")
+        workspace_path = getattr(workspace_path, "path", None)
+        if not isinstance(workspace_path, (str, Path)):
+            raise TypeError("verdict host fallback requires a local workspace")
+    root = Path(workspace_path)
+    if not root.is_absolute() or not root.is_dir():
+        raise ValueError("verdict host fallback requires an absolute existing directory")
+    return root / VERDICT_PATH
 
 
-def clear_verdict(workspace_path: str | Path) -> None:
+def clear_verdict(workspace_path) -> None:
     """Remove any verdict left by an earlier dispatch.
 
     Called before every judge turn. Without it, a judge that fails to write —
@@ -63,11 +76,15 @@ def clear_verdict(workspace_path: str | Path) -> None:
     "absence of evidence read as approval" failure the prose parser kept having,
     reachable through the filesystem instead.
     """
+    remove = getattr(workspace_path, "remove_file", None)
     try:
-        verdict_file(workspace_path).unlink()
+        if callable(remove):
+            remove(VERDICT_PATH, missing_ok=True)
+        else:
+            verdict_file(workspace_path).unlink()
     except FileNotFoundError:
         pass
-    except OSError as e:
+    except (OSError, RuntimeError, TypeError, ValueError) as e:
         raise VerdictUnreadable(
             f"could not clear the previous verdict at {VERDICT_PATH}: {e}") from e
 
@@ -84,15 +101,18 @@ def _require(doc: dict, key: str, kind: type, default=None):
     return value
 
 
-def read_verdict(workspace_path: str | Path) -> JudgeVerdict:
+def read_verdict(workspace_path) -> JudgeVerdict:
     """Read and validate the judge's verdict. Raises `VerdictUnreadable`."""
-    path = verdict_file(workspace_path)
+    read = getattr(workspace_path, "read_file", None)
     try:
-        raw = path.read_text(encoding="utf-8")
+        if callable(read):
+            raw = read(VERDICT_PATH, max_bytes=_MAX_VERDICT_BYTES).decode("utf-8")
+        else:
+            raw = verdict_file(workspace_path).read_text(encoding="utf-8")
     except FileNotFoundError as e:
         raise VerdictUnreadable(
             f"the judge wrote no verdict at {VERDICT_PATH}") from e
-    except OSError as e:
+    except (OSError, RuntimeError, UnicodeError, ValueError, TypeError) as e:
         raise VerdictUnreadable(f"could not read {VERDICT_PATH}: {e}") from e
 
     try:

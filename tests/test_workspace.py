@@ -9,7 +9,14 @@ from pathlib import Path
 
 import pytest
 
-from software_factory.build.workspace import GitWorktree, fingerprint_repository_surface
+from software_factory.build.workspace import (
+    GitWorktree,
+    GitWorktreeFactory,
+    LocalArtifactSource,
+    WorkspaceRequest,
+    fingerprint_repository_surface,
+    workspace_state_roots_are_separate,
+)
 
 
 def _git(cwd, *args):
@@ -39,6 +46,93 @@ def _repo_with_remote(tmp_path):
     return repo, remote
 
 
+def _workspace_request(repo, *, remote_mutations_permitted=True):
+    values = {
+        "repository": "acme/widgets",
+        "issue": "42",
+        "source_repo": repo,
+        "source_bundle": None,
+        "branch": "factory/request-compatibility",
+        "base": "develop",
+        "verification_command": None,
+        "legacy_verify_cmd": "true",
+        "workspace_root": ".wt",
+    }
+    if remote_mutations_permitted is not None:
+        values["remote_mutations_permitted"] = remote_mutations_permitted
+    return WorkspaceRequest(**values)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    (
+        "workspace://remote/context",
+        "lima://aifactory-stage1/" + "a" * 64,
+    ),
+)
+def test_known_opaque_workspace_identities_are_controller_separated(tmp_path, identity):
+    workspace = type("OpaqueWorkspace", (), {"path": identity})()
+
+    assert workspace_state_roots_are_separate(
+        workspace, tmp_path / "controller-authority"
+    )
+
+
+@pytest.mark.parametrize(
+    "identity",
+    (
+        "lima://",
+        "lima://AIFactory/context",
+        "lima://aifactory-stage1/../authority",
+        "lima://aifactory-stage1/context//nested",
+        "lima://aifactory-stage1/context?query=yes",
+        "lima://aifactory-stage1/context#fragment",
+    ),
+)
+def test_malformed_lima_workspace_identities_are_not_controller_separated(
+    tmp_path, identity
+):
+    workspace = type("OpaqueWorkspace", (), {"path": identity})()
+
+    assert not workspace_state_roots_are_separate(
+        workspace, tmp_path / "controller-authority"
+    )
+
+
+def test_workspace_request_omitted_publication_policy_preserves_legacy_push(tmp_path):
+    repo, remote = _repo_with_remote(tmp_path)
+    request = _workspace_request(repo, remote_mutations_permitted=None)
+    workspace = GitWorktreeFactory({}).create(request)
+
+    assert request.remote_mutations_permitted is True
+    assert workspace.remote_mutations_permitted is True
+    workspace.create()
+    Path(workspace.path, "compatibility.txt").write_text("legacy\n", encoding="utf-8")
+    revision = workspace.commit("test: preserve request compatibility")
+    workspace.push(revision, expected_remote_tip=workspace.remote_tip())
+
+    assert (
+        _git(remote, "rev-parse", "refs/heads/factory/request-compatibility").strip()
+        == revision
+    )
+
+
+def test_workspace_request_explicit_local_policy_remains_nonpush(tmp_path):
+    repo, remote = _repo_with_remote(tmp_path)
+    before = _git(remote, "show-ref")
+    request = _workspace_request(repo, remote_mutations_permitted=False)
+    workspace = GitWorktreeFactory({}).create(request)
+
+    assert workspace.remote_mutations_permitted is False
+    workspace.create()
+    assert workspace.attest_local_validation_git_policy() is True
+    with pytest.raises(RuntimeError, match="forbids remote access"):
+        workspace.remote_tip()
+    with pytest.raises(RuntimeError, match="forbids push"):
+        workspace.push()
+    assert _git(remote, "show-ref") == before
+
+
 def test_worktree_create_test_commit_cleanup(tmp_path):
     d = _repo(tmp_path)
     ws = GitWorktree(repo_dir=d, branch="factory/issue-1", base="develop",
@@ -61,6 +155,35 @@ def test_worktree_create_test_commit_cleanup(tmp_path):
     assert not os.path.isdir(ws.path)
 
 
+def test_pull_request_default_preserves_global_smudge_filter(tmp_path, monkeypatch):
+    """Legacy PR worktrees retain ambient user Git filtering during checkout."""
+    repo = _repo(tmp_path)
+    (repo / ".gitattributes").write_text("payload.txt filter=uppercase\n")
+    (repo / "payload.txt").write_text("content\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "filtered fixture")
+    global_config = tmp_path / "global.gitconfig"
+    global_config.write_text(
+        "[filter \"uppercase\"]\n"
+        "\tsmudge = tr '[:lower:]' '[:upper:]'\n"
+        "\tclean = cat\n"
+        "\trequired = true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    workspace = GitWorktree(
+        repo_dir=repo,
+        branch="factory/pr-global-filter",
+        base="develop",
+        verify_cmd="true",
+        workspace_root=".wt",
+    )
+
+    workspace.create()
+
+    assert Path(workspace.path, "payload.txt").read_text() == "CONTENT\n"
+
+
 def test_commit_disables_repository_hooks_and_returns_the_exact_sha(tmp_path):
     repo, remote = _repo_with_remote(tmp_path)
     workspace = GitWorktree(
@@ -69,6 +192,7 @@ def test_commit_disables_repository_hooks_and_returns_the_exact_sha(tmp_path):
         base="develop",
         verify_cmd="true",
         workspace_root=".wt",
+        remote_mutations_permitted=True,
     )
     workspace.create()
     worktree = Path(workspace.path)
@@ -122,6 +246,7 @@ def test_push_targets_the_verified_sha_even_if_the_local_branch_moves(tmp_path):
         base="develop",
         verify_cmd="true",
         workspace_root=".wt",
+        remote_mutations_permitted=True,
     )
     workspace.create()
     worktree = Path(workspace.path)
@@ -147,6 +272,7 @@ def test_push_refuses_remote_tip_movement_with_a_lease(tmp_path):
         base="develop",
         verify_cmd="true",
         workspace_root=".wt",
+        remote_mutations_permitted=True,
     )
     workspace.create()
     worktree = Path(workspace.path)
@@ -179,6 +305,7 @@ def test_push_disables_repository_pre_push_hooks_that_mutate_remote_state(tmp_pa
         base="develop",
         verify_cmd="true",
         workspace_root=".wt",
+        remote_mutations_permitted=True,
     )
     workspace.create()
     worktree = Path(workspace.path)
@@ -200,6 +327,160 @@ def test_push_disables_repository_pre_push_hooks_that_mutate_remote_state(tmp_pa
     refs = _git(remote, "for-each-ref", "--format=%(refname)", "refs/heads")
     assert "refs/heads/factory/no-pre-push-hooks" in refs
     assert "refs/heads/hook-owned" not in refs
+
+
+def _remote_refs(remote: Path) -> str:
+    return _git(remote, "for-each-ref", "--format=%(refname)%00%(objectname)", "refs")
+
+
+def _push_script(path: Path) -> None:
+    path.write_text(
+        "#!/bin/sh\n"
+        "git push --no-verify origin HEAD:refs/heads/policy-leak >/dev/null 2>&1\n"
+        "cat\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o700)
+
+
+def test_local_worktree_create_disables_post_checkout_remote_mutation(tmp_path):
+    repo, remote = _repo_with_remote(tmp_path)
+    hook = repo / ".git" / "hooks" / "post-checkout"
+    _push_script(hook)
+    before = _remote_refs(remote)
+    workspace = GitWorktree(
+        repo_dir=repo,
+        branch="factory/local-no-checkout-hook",
+        base="develop",
+        verify_cmd="true",
+        workspace_root=".wt",
+        remote_mutations_permitted=False,
+    )
+
+    workspace.create()
+
+    assert _remote_refs(remote) == before
+
+
+def test_local_worktree_refuses_executable_clean_filter_before_create(tmp_path):
+    repo, remote = _repo_with_remote(tmp_path)
+    script = tmp_path / "clean-filter"
+    _push_script(script)
+    (repo / ".gitattributes").write_text("README.md filter=leak\n", encoding="utf-8")
+    _git(repo, "add", ".gitattributes")
+    _git(repo, "commit", "-q", "-m", "configure attributes")
+    _git(repo, "config", "filter.leak.clean", str(script))
+    before = _remote_refs(remote)
+    workspace = GitWorktree(
+        repo_dir=repo,
+        branch="factory/local-filter-refusal",
+        base="develop",
+        verify_cmd="true",
+        workspace_root=".wt",
+        remote_mutations_permitted=False,
+    )
+
+    with pytest.raises(RuntimeError, match=r"filter|Git policy"):
+        workspace.create()
+
+    assert _remote_refs(remote) == before
+    assert not Path(workspace.path).exists()
+
+
+def test_local_worktree_refuses_executable_worktree_config_before_create(tmp_path):
+    repo, remote = _repo_with_remote(tmp_path)
+    script = tmp_path / "worktree-clean-filter"
+    _push_script(script)
+    _git(repo, "config", "extensions.worktreeConfig", "true")
+    _git(repo, "config", "--worktree", "filter.leak.clean", str(script))
+    before = _remote_refs(remote)
+    workspace = GitWorktree(
+        repo_dir=repo,
+        branch="factory/local-worktree-config-refusal",
+        base="develop",
+        verify_cmd="true",
+        workspace_root=".wt",
+        remote_mutations_permitted=False,
+    )
+
+    with pytest.raises(RuntimeError, match=r"filter|Git policy"):
+        workspace.create()
+
+    assert _remote_refs(remote) == before
+    assert not Path(workspace.path).exists()
+
+
+def test_local_worktree_forces_fsmonitor_off_for_status_surfaces(tmp_path):
+    repo, remote = _repo_with_remote(tmp_path)
+    monitor = tmp_path / "fsmonitor"
+    _push_script(monitor)
+    _git(repo, "config", "core.fsmonitor", str(monitor))
+    before = _remote_refs(remote)
+    workspace = GitWorktree(
+        repo_dir=repo,
+        branch="factory/local-no-fsmonitor",
+        base="develop",
+        verify_cmd="true",
+        workspace_root=".wt",
+        remote_mutations_permitted=False,
+    )
+
+    workspace.create()
+    workspace.changed_files()
+
+    assert _remote_refs(remote) == before
+
+
+def test_local_worktree_disables_reference_transaction_hook(tmp_path):
+    repo, remote = _repo_with_remote(tmp_path)
+    hook = repo / ".git" / "hooks" / "reference-transaction"
+    hook.write_text(
+        "#!/bin/sh\n"
+        f"git --git-dir={remote} update-ref refs/heads/policy-leak "
+        "$(git rev-parse HEAD)\n",
+        encoding="utf-8",
+    )
+    hook.chmod(0o700)
+    before = _remote_refs(remote)
+    workspace = GitWorktree(
+        repo_dir=repo,
+        branch="factory/local-no-ref-hook",
+        base="develop",
+        verify_cmd="true",
+        workspace_root=".wt",
+        remote_mutations_permitted=False,
+    )
+
+    workspace.create()
+
+    assert _remote_refs(remote) == before
+
+
+def test_local_worktree_refuses_process_filter_added_after_create_and_preserves_work(
+    tmp_path,
+):
+    repo, remote = _repo_with_remote(tmp_path)
+    workspace = GitWorktree(
+        repo_dir=repo,
+        branch="factory/local-process-filter",
+        base="develop",
+        verify_cmd="true",
+        workspace_root=".wt",
+        remote_mutations_permitted=False,
+    )
+    workspace.create()
+    worktree = Path(workspace.path)
+    (worktree / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+    script = tmp_path / "process-filter"
+    _push_script(script)
+    _git(worktree, "config", "filter.leak.process", str(script))
+    before = _remote_refs(remote)
+
+    with pytest.raises(RuntimeError, match=r"filter|Git policy"):
+        workspace.commit("feat: must remain local")
+
+    assert _remote_refs(remote) == before
+    assert (worktree / "candidate.txt").read_text(encoding="utf-8") == "candidate\n"
 
 
 def test_verify_cmd_failure_is_reported(tmp_path):
@@ -234,6 +515,115 @@ def test_head_revision_is_the_exact_current_commit(tmp_path):
     _, workspace, worktree = _workspace(tmp_path)
 
     assert workspace.head_revision() == _git(worktree, "rev-parse", "HEAD").strip()
+
+
+@pytest.mark.parametrize("committed", [False, True])
+def test_changed_files_disables_rename_folding_for_dirty_and_committed_changes(
+    tmp_path, committed
+):
+    repo = _repo(tmp_path)
+    (repo / "src").mkdir()
+    (repo / "src" / "old.py").write_text("value = 1\n", encoding="utf-8")
+    _git(repo, "add", "src/old.py")
+    _git(repo, "commit", "-q", "-m", "add old product path")
+    workspace = GitWorktree(
+        repo_dir=repo,
+        branch=f"factory/rename-{'committed' if committed else 'dirty'}",
+        base="develop",
+        verify_cmd="true",
+        workspace_root=".wt",
+    )
+    workspace.create()
+    worktree = Path(workspace.path)
+    _git(worktree, "mv", "src/old.py", "src/new.py")
+    if committed:
+        _git(worktree, "commit", "-q", "-m", "rename product path")
+
+    assert workspace.changed_files() == ["src/new.py", "src/old.py"]
+
+
+def test_changed_files_preserves_deletions_symlinks_binaries_and_root_boundaries(
+    tmp_path,
+):
+    repo = _repo(tmp_path)
+    for root in ("src", "assets", "src2"):
+        (repo / root).mkdir()
+    (repo / "src" / "delete.py").write_text("remove = True\n", encoding="utf-8")
+    (repo / "assets" / "old.bin").write_bytes(b"\x00before\xff")
+    (repo / "src2" / "sibling.py").write_text("sibling = True\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "add path fixtures")
+    workspace = GitWorktree(
+        repo_dir=repo,
+        branch="factory/mixed-paths",
+        base="develop",
+        verify_cmd="true",
+        workspace_root=".wt",
+    )
+    workspace.create()
+    worktree = Path(workspace.path)
+    (worktree / "src" / "delete.py").unlink()
+    (worktree / "assets" / "old.bin").write_bytes(b"\x00after\xfe")
+    (worktree / "src" / "link").symlink_to("../README.md")
+    (worktree / "src2" / "sibling.py").write_text(
+        "sibling = False\n", encoding="utf-8"
+    )
+
+    assert workspace.changed_files() == [
+        "assets/old.bin",
+        "src/delete.py",
+        "src/link",
+        "src2/sibling.py",
+    ]
+
+
+def test_git_worktree_exports_exact_revision_artifacts_with_argv_and_no_ref_leak(
+    tmp_path, monkeypatch
+):
+    """The one-ref bundle is self-contained and leaves no synthetic local ref."""
+    _, workspace, worktree = _workspace(tmp_path)
+    base = workspace.head_revision()
+    (worktree / "product.py").write_text("validated = True\n", encoding="utf-8")
+    implementation = workspace.commit("feat: validated product")
+    calls = []
+    byte_calls = []
+    real_git = workspace._git
+    real_git_bytes = workspace._git_bytes
+
+    def record_git(*arguments, cwd=None):
+        calls.append(arguments)
+        return real_git(*arguments, cwd=cwd)
+
+    def record_git_bytes(*arguments, cwd=None):
+        byte_calls.append(arguments)
+        return real_git_bytes(*arguments, cwd=cwd)
+
+    monkeypatch.setattr(workspace, "_git", record_git)
+    monkeypatch.setattr(workspace, "_git_bytes", record_git_bytes)
+    workspace.configure_publication_policy(remote_mutations_permitted=False)
+
+    payload = workspace.collect_local_git_artifacts(
+        base_revision=base,
+        implementation_revision=implementation,
+        product_paths=("product.py",),
+        controller_roots=(".factory", ".superpowers", "contracts", "reviews"),
+    )
+
+    bundle_call = next(call for call in calls if call[:2] == ("bundle", "create"))
+    assert bundle_call[0:2] == ("bundle", "create")
+    assert bundle_call[3:] == (f"refs/heads/{implementation}",)
+    assert payload.inventory.implementation_paths == ("product.py",)
+    assert payload.authority_bundle
+    assert payload.implementation_patch
+    assert isinstance(workspace, LocalArtifactSource)
+    assert _git(worktree, "branch", "--list", implementation) == ""
+    generated_diff_calls = [
+        call
+        for call in byte_calls
+        if "diff" in call and ("--name-only" in call or "--binary" in call)
+    ]
+    assert generated_diff_calls
+    assert all("--no-renames" in call for call in generated_diff_calls)
 
 
 def test_checkpoint_commits_the_current_change_and_returns_its_sha(tmp_path):

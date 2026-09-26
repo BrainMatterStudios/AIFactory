@@ -34,6 +34,18 @@ from software_factory.core.design.capabilities import (
     derive_required_capabilities,
 )
 from software_factory.core.design.capability_names import Capability
+from software_factory.core.design.provider_capabilities import (
+    PROVIDER_CAPABILITY_ASSESSMENT_VERSION,
+    CapabilityContext,
+    CapabilityObligation,
+    ProviderCapabilityAssessment,
+    ProviderCapabilityDeclaration,
+    ProviderCapabilityObservation,
+    ProviderRole,
+    assess_provider_capabilities,
+    provider_capability_document,
+    provider_capability_sha256,
+)
 from software_factory.core.design.schema import validate_design_report
 
 if TYPE_CHECKING:
@@ -46,10 +58,27 @@ _SEVERITIES = frozenset({"critical", "high", "medium", "low", "info"})
 _CATEGORIES = frozenset(
     {"security", "correctness", "architecture", "requirements", "test", "maintainability"}
 )
-_CONFIG_FIELDS = frozenset(
+_CONFIG_V1_FIELDS = frozenset(
     {"schema_version", "design_protocol", "design_author_role", "design_analyzers"}
 )
+_CONFIG_V2_FIELDS = _CONFIG_V1_FIELDS | frozenset(
+    {
+        "capability_providers",
+        "execution_policy",
+        "workspace_adapter",
+        "publication_mode",
+        "local_artifact_root",
+    }
+)
 _CONFIG_ANALYZER_FIELDS = frozenset({"name", "required", "options"})
+_CONFIG_PROVIDER_FIELDS = frozenset({"name", "options"})
+_CONFIG_EXECUTION_POLICY_FIELDS = frozenset(
+    {"implementation_writable_paths", "verification_commands", "network_profile"}
+)
+_CONFIG_COMMAND_FIELDS = frozenset(
+    {"name", "argv", "expected_exit", "environment_profile"}
+)
+_CONFIG_WORKSPACE_FIELDS = frozenset({"provider", "options"})
 _ANALYZER_DOCUMENT_FIELDS = frozenset(
     {
         "name",
@@ -224,19 +253,29 @@ def analyzer_spec_sha256(spec: object) -> str:
 def parse_design_config_document(document: object) -> tuple[dict[str, Any], tuple[Any, ...]]:
     """Strictly authenticate the identity-bearing Design workflow configuration."""
     from software_factory.core.design.configuration import (
+        DESIGN_CONFIG_V2_VERSION,
         DESIGN_CONFIG_VERSION,
         AnalyzerSpec,
+        CapabilityProviderSpec,
+        ExecutionPolicySpec,
+        VerificationCommandSpec,
+        execution_policy_document,
         thaw_json,
     )
 
-    if type(document) is not dict or set(document) != _CONFIG_FIELDS:
-        raise ValueError("design config must have exact design-config-v1 fields")
+    if type(document) is not dict:
+        raise ValueError("design config must be an object")
+    schema_version = document.get("schema_version")
+    expected_fields = {
+        DESIGN_CONFIG_VERSION: _CONFIG_V1_FIELDS,
+        DESIGN_CONFIG_V2_VERSION: _CONFIG_V2_FIELDS,
+    }.get(schema_version)
+    if expected_fields is None or set(document) != expected_fields:
+        raise ValueError("design config must have exact versioned fields")
     try:
         normalized = json.loads(canonical_json_bytes(document))
     except (TypeError, ValueError, UnicodeError) as exc:
         raise ValueError("design config must be strict JSON") from exc
-    if normalized["schema_version"] != DESIGN_CONFIG_VERSION:
-        raise ValueError("design config schema_version is unsupported")
     if normalized["design_protocol"] != "design_ir_v1":
         raise ValueError("design config must select design_ir_v1")
     if not _normalized_text(normalized["design_author_role"]):
@@ -251,13 +290,16 @@ def parse_design_config_document(document: object) -> tuple[dict[str, Any], tupl
             raise ValueError("design config analyzer fields are invalid")
         if type(raw["options"]) is not dict:
             raise ValueError("design config analyzer options must be an object")
-        spec = AnalyzerSpec(raw["name"], raw["required"], raw["options"])
+        try:
+            spec = AnalyzerSpec(raw["name"], raw["required"], raw["options"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("design config analyzer is invalid") from exc
         if spec.name in names:
             raise ValueError("design config analyzer names must be unique")
         names.add(spec.name)
         specs.append(spec)
-    rebuilt = {
-        "schema_version": DESIGN_CONFIG_VERSION,
+    rebuilt: dict[str, Any] = {
+        "schema_version": normalized["schema_version"],
         "design_protocol": "design_ir_v1",
         "design_author_role": normalized["design_author_role"],
         "design_analyzers": [
@@ -265,6 +307,97 @@ def parse_design_config_document(document: object) -> tuple[dict[str, Any], tupl
             for item in specs
         ],
     }
+    if normalized["schema_version"] == DESIGN_CONFIG_V2_VERSION:
+        raw_providers = normalized["capability_providers"]
+        if type(raw_providers) is not list:
+            raise ValueError("design config capability providers must be a list")
+        providers: list[CapabilityProviderSpec] = []
+        provider_names: set[str] = set()
+        for raw in raw_providers:
+            if type(raw) is not dict or set(raw) != _CONFIG_PROVIDER_FIELDS:
+                raise ValueError("design config capability provider fields are invalid")
+            if type(raw["options"]) is not dict:
+                raise ValueError("design config capability provider options must be an object")
+            try:
+                provider = CapabilityProviderSpec(raw["name"], raw["options"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError("design config capability provider is invalid") from exc
+            if provider.name in provider_names:
+                raise ValueError("design config capability provider names must be unique")
+            provider_names.add(provider.name)
+            providers.append(provider)
+
+        raw_policy = normalized["execution_policy"]
+        if type(raw_policy) is not dict or set(raw_policy) != _CONFIG_EXECUTION_POLICY_FIELDS:
+            raise ValueError("design config execution policy fields are invalid")
+        raw_paths = raw_policy["implementation_writable_paths"]
+        raw_commands = raw_policy["verification_commands"]
+        if type(raw_paths) is not list or type(raw_commands) is not list:
+            raise ValueError("design config execution policy arrays are invalid")
+        commands: list[VerificationCommandSpec] = []
+        for raw in raw_commands:
+            if type(raw) is not dict or set(raw) != _CONFIG_COMMAND_FIELDS:
+                raise ValueError("design config verification command fields are invalid")
+            if type(raw["argv"]) is not list:
+                raise ValueError("design config verification command argv must be a list")
+            try:
+                commands.append(
+                    VerificationCommandSpec(
+                        raw["name"],
+                        tuple(raw["argv"]),
+                        raw["expected_exit"],
+                        raw["environment_profile"],
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("design config verification command is invalid") from exc
+        try:
+            policy = ExecutionPolicySpec(
+                tuple(raw_paths), tuple(commands), raw_policy["network_profile"]
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("design config execution policy is invalid") from exc
+
+        raw_workspace = normalized["workspace_adapter"]
+        workspace: dict[str, Any] | None
+        if raw_workspace is None:
+            workspace = None
+        else:
+            if type(raw_workspace) is not dict or set(raw_workspace) != _CONFIG_WORKSPACE_FIELDS:
+                raise ValueError("design config workspace adapter fields are invalid")
+            if type(raw_workspace["options"]) is not dict:
+                raise ValueError("design config workspace adapter options must be an object")
+            try:
+                workspace_spec = CapabilityProviderSpec(
+                    raw_workspace["provider"], raw_workspace["options"]
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError("design config workspace adapter is invalid") from exc
+            workspace = {
+                "provider": workspace_spec.name,
+                "options": thaw_json(workspace_spec.options),
+            }
+        publication_mode = normalized["publication_mode"]
+        local_artifact_root = normalized["local_artifact_root"]
+        if type(publication_mode) is not str or publication_mode not in {
+            "pull_request",
+            "local_bundle",
+        }:
+            raise ValueError("design config publication mode is invalid")
+        if publication_mode == "pull_request" and local_artifact_root is not None:
+            raise ValueError("pull request design config must not have an artifact root")
+        if publication_mode == "local_bundle" and local_artifact_root != "controller_state":
+            raise ValueError("local bundle design config must use controller_state artifact root")
+        rebuilt.update(
+            capability_providers=[
+                {"name": item.name, "options": thaw_json(item.options)}
+                for item in providers
+            ],
+            execution_policy=execution_policy_document(policy),
+            workspace_adapter=workspace,
+            publication_mode=publication_mode,
+            local_artifact_root=local_artifact_root,
+        )
     if rebuilt != normalized:
         raise ValueError("design config is not canonical")
     return rebuilt, tuple(specs)
@@ -374,40 +507,57 @@ def finding_override_from_document(
     return override
 
 
+CapabilityAuthority = CapabilityAssessment | ProviderCapabilityAssessment
+
+
+def capability_authority_document(assessment: CapabilityAuthority) -> dict[str, Any]:
+    """Serialize exactly one supported capability protocol without projection."""
+    if type(assessment) is CapabilityAssessment:
+        return capability_document(assessment)
+    if type(assessment) is ProviderCapabilityAssessment:
+        return provider_capability_document(assessment)
+    raise TypeError("capability authority is invalid")
+
+
+def capability_authority_sha256(assessment: CapabilityAuthority) -> str:
+    """Hash the assessment under its own native protocol."""
+    if type(assessment) is CapabilityAssessment:
+        return capability_sha256(assessment)
+    if type(assessment) is ProviderCapabilityAssessment:
+        return provider_capability_sha256(assessment)
+    raise TypeError("capability authority is invalid")
+
+
+def validate_capability_authority_protocol(
+    design_config_document: object,
+    capabilities: object,
+) -> None:
+    """Require one capability protocol selected by the authenticated config schema."""
+    from software_factory.core.design.configuration import (
+        DESIGN_CONFIG_V2_VERSION,
+        DESIGN_CONFIG_VERSION,
+    )
+
+    config, _specs = parse_design_config_document(design_config_document)
+    expected = {
+        DESIGN_CONFIG_VERSION: CapabilityAssessment,
+        DESIGN_CONFIG_V2_VERSION: ProviderCapabilityAssessment,
+    }[config["schema_version"]]
+    if type(capabilities) is not expected:
+        raise ValueError("capability authority protocol does not match design config schema")
+
+
 def _capability_document_authenticated(
     assessment: object,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    if type(assessment) is not CapabilityAssessment:
-        return None, None
     try:
-        document = capability_document(assessment)
-        if document.get("schema_version") != CAPABILITY_ASSESSMENT_VERSION:
+        if type(assessment) not in {CapabilityAssessment, ProviderCapabilityAssessment}:
             return None, None
-        declarations = tuple(
-            RunnerCapabilityDeclaration(
-                item["schema_version"],
-                item["source"],
-                frozenset(Capability(name) for name in item["capabilities"]),
-            )
-            for item in document["declarations"]
-        )
-        observations = tuple(
-            CapabilityObservation(
-                item["schema_version"],
-                item["source"],
-                frozenset(Capability(name) for name in item["confirmed"]),
-                frozenset(Capability(name) for name in item["failed"]),
-            )
-            for item in document["observations"]
-        )
-        rebuilt = assess_capabilities(
-            declarations=declarations,
-            observations=observations,
-            required=frozenset(Capability(name) for name in document["required"]),
-        )
-        if capability_document(rebuilt) != document or rebuilt != assessment:
+        document = capability_authority_document(assessment)
+        rebuilt = capability_authority_from_document(document)
+        if capability_authority_document(rebuilt) != document or rebuilt != assessment:
             return None, None
-        return document, capability_sha256(rebuilt)
+        return document, capability_authority_sha256(rebuilt)
     except (KeyError, TypeError, ValueError):
         return None, None
 
@@ -465,6 +615,151 @@ def capability_assessment_from_document(document: object) -> CapabilityAssessmen
     if capability_document(assessment) != document:
         raise ValueError("capability document is not canonical")
     return assessment
+
+
+def _provider_capability_assessment_from_document(
+    document: object,
+) -> ProviderCapabilityAssessment:
+    expected_fields = {
+        "schema_version",
+        "context",
+        "declarations",
+        "observations",
+        "required",
+        "obligations",
+        "satisfied",
+        "missing",
+        "unverifiable",
+        "failed",
+        "effective",
+    }
+    if type(document) is not dict or set(document) != expected_fields:
+        raise ValueError("provider capability document fields are invalid")
+    if document["schema_version"] != PROVIDER_CAPABILITY_ASSESSMENT_VERSION:
+        raise ValueError("provider capability document schema is unsupported")
+    context_fields = {
+        "schema_version",
+        "repository",
+        "issue",
+        "parent_digest",
+        "config_digest",
+        "base_revision",
+        "workspace_fingerprint",
+    }
+    declaration_fields = {
+        "schema_version",
+        "source",
+        "provider_role",
+        "capabilities",
+    }
+    observation_fields = {
+        "schema_version",
+        "source",
+        "provider_role",
+        "context_digest",
+        "confirmed",
+        "failed",
+        "evidence_digests",
+    }
+    obligation_fields = {"schema_version", "capability", "provider_role"}
+
+    def names(value: object, where: str) -> frozenset[Capability]:
+        if type(value) is not list or any(type(item) is not str for item in value):
+            raise ValueError(f"{where} is invalid")
+        if len(value) != len(set(value)):
+            raise ValueError(f"{where} is invalid")
+        return frozenset(Capability(item) for item in value)
+
+    def obligations(value: object, where: str) -> frozenset[CapabilityObligation]:
+        if type(value) is not list:
+            raise ValueError(f"{where} is invalid")
+        records = []
+        for item in value:
+            if type(item) is not dict or set(item) != obligation_fields:
+                raise ValueError(f"{where} is invalid")
+            records.append(
+                CapabilityObligation(
+                    Capability(item["capability"]), ProviderRole(item["provider_role"])
+                )
+            )
+        if len(records) != len(set(records)):
+            raise ValueError(f"{where} is invalid")
+        return frozenset(records)
+
+    try:
+        context_document = document["context"]
+        if type(context_document) is not dict or set(context_document) != context_fields:
+            raise ValueError("provider capability context fields are invalid")
+        context = CapabilityContext(**context_document)
+        raw_declarations = document["declarations"]
+        raw_observations = document["observations"]
+        if type(raw_declarations) is not list or type(raw_observations) is not list:
+            raise ValueError("provider capability records are invalid")
+        declarations = []
+        for item in raw_declarations:
+            if type(item) is not dict or set(item) != declaration_fields:
+                raise ValueError("provider declaration fields are invalid")
+            declarations.append(
+                ProviderCapabilityDeclaration(
+                    item["schema_version"],
+                    item["source"],
+                    ProviderRole(item["provider_role"]),
+                    names(item["capabilities"], "provider declaration capabilities"),
+                )
+            )
+        observations = []
+        for item in raw_observations:
+            if type(item) is not dict or set(item) != observation_fields:
+                raise ValueError("provider observation fields are invalid")
+            evidence = item["evidence_digests"]
+            if type(evidence) is not list or any(type(value) is not str for value in evidence):
+                raise ValueError("provider observation evidence is invalid")
+            observations.append(
+                ProviderCapabilityObservation(
+                    item["schema_version"],
+                    item["source"],
+                    ProviderRole(item["provider_role"]),
+                    item["context_digest"],
+                    names(item["confirmed"], "provider observation confirmed values"),
+                    names(item["failed"], "provider observation failed values"),
+                    tuple(evidence),
+                )
+            )
+        assessment = assess_provider_capabilities(
+            context=context,
+            declarations=tuple(declarations),
+            observations=tuple(observations),
+            required=names(document["required"], "provider required capabilities"),
+        )
+        recorded_sets = {
+            "obligations": assessment.obligations,
+            "satisfied": assessment.satisfied,
+            "missing": assessment.missing,
+            "unverifiable": assessment.unverifiable,
+            "failed": assessment.failed,
+        }
+        for field_name, expected in recorded_sets.items():
+            if obligations(document[field_name], field_name) != expected:
+                raise ValueError("provider capability classification is invalid")
+        if names(document["effective"], "provider effective capabilities") != assessment.effective:
+            raise ValueError("provider capability projection is invalid")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("provider capability document is invalid") from exc
+    if provider_capability_document(assessment) != document:
+        raise ValueError("provider capability document is not canonical")
+    return assessment
+
+
+def capability_authority_from_document(document: object) -> CapabilityAuthority:
+    """Strictly dispatch v1 or provider-aware authority by exact schema."""
+    if type(document) is not dict:
+        raise ValueError("capability document must be an object")
+    schema = document.get("schema_version")
+    if schema == CAPABILITY_ASSESSMENT_VERSION:
+        return capability_assessment_from_document(document)
+    if schema == PROVIDER_CAPABILITY_ASSESSMENT_VERSION:
+        return _provider_capability_assessment_from_document(document)
+    raise ValueError("capability document schema is unsupported")
 
 
 def _valid_execution(execution: AnalyzerExecution) -> bool:
@@ -641,7 +936,7 @@ def evaluate_design_gate(
     design_config_document: Mapping[str, Any],
     config_digest: str,
     expected_artifact_fingerprint: str,
-    capabilities: CapabilityAssessment,
+    capabilities: CapabilityAuthority,
     analyzers: Sequence[AnalyzerExecution],
     overrides: Sequence[FindingOverride] = (),
 ) -> DesignGateResult:
@@ -873,7 +1168,39 @@ def evaluate_design_gate(
             evidence_unavailable=True,
         )
     else:
-        if capabilities.missing or capabilities.unverifiable:
+        if config_valid:
+            try:
+                validate_capability_authority_protocol(config_doc, capabilities)
+            except (TypeError, ValueError):
+                add(
+                    "capability.protocol-mismatch",
+                    severity="critical",
+                    category="security",
+                    source="capability-policy",
+                    message="Capability authority protocol does not match configuration.",
+                    blocking=True,
+                )
+        provider_context_invalid = False
+        if type(capabilities) is ProviderCapabilityAssessment:
+            context = capabilities.context
+            provider_context_invalid = (
+                context.repository != contract.get("repo")
+                or context.issue != str(contract.get("issue"))
+                or context.parent_digest != actual_contract_digest
+                or context.config_digest != actual_config_digest
+                or context.workspace_fingerprint != expected_artifact_fingerprint
+            )
+        if provider_context_invalid:
+            add(
+                "capability.context-stale",
+                severity="critical",
+                category="security",
+                source="capability-policy",
+                message="Provider capability context does not match gate inputs.",
+                blocking=True,
+                evidence_unavailable=True,
+            )
+        if capabilities.missing or capabilities.unverifiable or capabilities.failed:
             add(
                 "capability.unavailable",
                 severity="high",
@@ -1030,7 +1357,10 @@ def evaluate_design_gate(
                 evidence_unavailable=item.required,
             )
 
-    if capability_doc.get("schema_version") == CAPABILITY_ASSESSMENT_VERSION and config_valid:
+    if capability_doc.get("schema_version") in {
+        CAPABILITY_ASSESSMENT_VERSION,
+        PROVIDER_CAPABILITY_ASSESSMENT_VERSION,
+    } and config_valid:
         try:
             policy_required = derive_required_capabilities(
                 design_protocol="design_ir_v1",

@@ -9,7 +9,7 @@ description = "A reusable, extensible, resilient AI software factory — orchest
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 authors = [{ name = "BrainMatterStudios" }]
 keywords = ["ai", "software-factory", "agents", "orchestration", "devops"]
 
@@ -75,6 +75,8 @@ ignore = [
 
 [project.scripts]
 factory = "software_factory.cli:main"
+aifactory-execution-bridge = "software_factory.execution.bridge:main"
+aifactory-validation-cell-guest = "software_factory.execution.cell:guest_main"
 
 [tool.setuptools.packages.find]
 include = ["software_factory*"]
@@ -83,8 +85,11 @@ include = ["software_factory*"]
 # .yaml, and the dependency-free built-in catalog fallback) inside the wheel.
 # Without this a non-editable install cannot run `factory doctor`/`personas`.
 [tool.setuptools.package-data]
-software_factory = ["**/*.md", "**/*.yaml", "**/*.yml", "core/personas/catalog.json"]
+software_factory = ["**/*.md", "**/*.yaml", "**/*.yml", "execution/assets/*.cedar", "core/personas/catalog.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+  "integration: requires an explicitly selected live validation cell",
+]

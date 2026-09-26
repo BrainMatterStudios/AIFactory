@@ -8,7 +8,7 @@ import re
 import stat
 import subprocess
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
@@ -34,13 +34,22 @@ from software_factory.build.lifecycle_replay import (
     PublishedLifecycleAuthority,
     verify_published_lifecycle,
 )
+from software_factory.build.local_artifacts import local_artifact_policy_sha256
+from software_factory.build.operational_evidence import (
+    OperationalDisposition,
+    OperationalEvidenceError,
+    OperationalEvidenceStore,
+)
 from software_factory.build.review_policy import FindingOverride
 from software_factory.build.workflow_protocol_store import (
     WorkflowProtocolSelection,
     WorkflowProtocolStore,
     WorkflowProtocolStoreError,
 )
-from software_factory.build.workspace import fingerprint_repository_surface
+from software_factory.build.workspace import (
+    DEFAULT_LOCAL_GIT_ARTIFACT_CONTROLLER_ROOTS,
+    fingerprint_repository_surface,
+)
 from software_factory.core.approvals import (
     ApprovalError,
     ApprovalRecord,
@@ -54,16 +63,26 @@ from software_factory.core.design.capabilities import (
     CapabilityObservation,
     RunnerCapabilityDeclaration,
     assess_capabilities,
-    capability_document,
     derive_required_capabilities,
 )
 from software_factory.core.design.configuration import AnalyzerSpec
 from software_factory.core.design.gate import (
+    CapabilityAuthority,
     DesignGateState,
-    capability_assessment_from_document,
+    capability_authority_document,
+    capability_authority_from_document,
+    capability_authority_sha256,
     parse_design_config_document,
+    validate_capability_authority_protocol,
 )
-from software_factory.trace.decisions import DecisionEvent, DecisionLog, DecisionLogUnreadable
+from software_factory.core.design.provider_capabilities import ProviderCapabilityAssessment
+from software_factory.core.git_environment import sanitized_git_environment
+from software_factory.trace.decisions import (
+    DecisionEvent,
+    DecisionLog,
+    DecisionLogSnapshot,
+    DecisionLogUnreadable,
+)
 
 STATUS_SCHEMA_VERSION = "factory-status-v1"
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -77,6 +96,7 @@ class FactoryStatusState(str, Enum):
     DEGRADED = "degraded"
     UNAVAILABLE = "unavailable"
     COMPLETE = "complete"
+    COMPLETED_NOT_PROMOTED = "completed-not-promoted"
 
 
 class StatusAuthorityError(RuntimeError):
@@ -92,6 +112,9 @@ _NEXT_ACTION = {
     FactoryStatusState.DEGRADED: "review optional analyzer degradation",
     FactoryStatusState.UNAVAILABLE: "restore required controller authority",
     FactoryStatusState.COMPLETE: "no action required",
+    FactoryStatusState.COMPLETED_NOT_PROMOTED: (
+        "review or import the validated local artifacts"
+    ),
 }
 
 
@@ -147,11 +170,12 @@ class FactoryStatus:
 @dataclass(frozen=True)
 class _LifecycleToken:
     contract: StoredContract
-    history: tuple[DecisionEvent, ...]
+    history: DecisionLogSnapshot | None
     protocol: WorkflowProtocolSelection
     design: StoredDesign
     gate: StoredDesignGate
     approval: ApprovalRecord
+    contract_approval: ApprovalRecord | None = None
 
 
 @dataclass(frozen=True)
@@ -182,6 +206,53 @@ def _repository_identity(value: object) -> bool:
 
 def _is_digest(value: object) -> bool:
     return type(value) is str and _DIGEST_RE.fullmatch(value) is not None
+
+
+def _contract_approval_parent(contract: StoredContract) -> str | None:
+    envelope = contract.envelope
+    if (
+        envelope.schema_version == 3
+        and envelope.policy_version == "intent-v2"
+        and _is_digest(envelope.constraint_digest)
+        and envelope.constraint_document is not None
+    ):
+        return envelope.constraint_digest
+    if (
+        envelope.schema_version == 2
+        and envelope.policy_version == "intent-v1"
+        and envelope.constraint_document is None
+        and envelope.constraint_digest is None
+        and envelope.previous_contract_digest is None
+        and envelope.revision_request_digest is None
+    ):
+        return None
+    raise StatusAuthorityError(AuthorityFailureKind.INTEGRITY)
+
+
+def _legacy_intent_v1_requires_contract_approval(document: Mapping[str, Any]) -> bool:
+    """Apply only the frozen intent-v1 human-ownership classification."""
+    intent = document.get("intent")
+    if type(intent) is not dict:
+        raise StatusAuthorityError(AuthorityFailureKind.INTEGRITY)
+    ambiguities = intent.get("ambiguities")
+    if type(ambiguities) is not list:
+        raise StatusAuthorityError(AuthorityFailureKind.INTEGRITY)
+    if any(
+        type(ambiguity) is dict
+        and ambiguity.get("status") == "resolved"
+        and ambiguity.get("severity") == "blocking"
+        and isinstance(ambiguity.get("authority"), str)
+        and bool(ambiguity["authority"].strip())
+        for ambiguity in ambiguities
+    ):
+        return True
+    operations = intent.get("irreversible_operations")
+    if type(operations) is not list:
+        raise StatusAuthorityError(AuthorityFailureKind.INTEGRITY)
+    return any(
+        type(operation) is dict and operation.get("human_owned") is True
+        for operation in operations
+    )
 
 
 def _status(
@@ -217,7 +288,12 @@ def _status(
     )
 
 
-def _authenticated_roots(repo_root: str | Path, state_root: str | Path) -> tuple[Path, Path]:
+def _authenticated_roots(
+    repo_root: str | Path,
+    state_root: str | Path,
+    *,
+    controller_bound: bool = False,
+) -> tuple[Path, Path]:
     repo = Path(repo_root)
     state_path = Path(state_root)
     try:
@@ -235,13 +311,38 @@ def _authenticated_roots(repo_root: str | Path, state_root: str | Path) -> tuple
         raise
     except (OSError, RuntimeError) as exc:
         raise StatusAuthorityError(AuthorityFailureKind.UNREADABLE_RUNTIME) from exc
+    nested_controller_authority = (
+        controller_bound
+        and resolved_state.parent == resolved_repo
+        and resolved_state.name == "controller-authority"
+    )
     if (
         resolved_repo == resolved_state
-        or resolved_repo in resolved_state.parents
         or resolved_state in resolved_repo.parents
+        or (resolved_repo in resolved_state.parents and not nested_controller_authority)
     ):
         raise StatusAuthorityError(AuthorityFailureKind.INTEGRITY)
     return resolved_repo, resolved_state
+
+
+def _authenticated_contract_root(
+    contract_root: str | Path | None, *, repo: Path, state: Path
+) -> Path:
+    if contract_root is None:
+        return repo
+    root = Path(contract_root)
+    try:
+        info = root.lstat()
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise StatusAuthorityError(AuthorityFailureKind.INTEGRITY)
+        resolved = root.resolve(strict=True)
+    except StatusAuthorityError:
+        raise
+    except (OSError, RuntimeError) as exc:
+        raise StatusAuthorityError(AuthorityFailureKind.UNREADABLE_RUNTIME) from exc
+    if resolved not in {repo, state}:
+        raise StatusAuthorityError(AuthorityFailureKind.INTEGRITY)
+    return resolved
 
 
 def _assessment(
@@ -251,26 +352,35 @@ def _assessment(
     design_protocol: str,
     analyzers: Sequence[AnalyzerSpec],
     design: Mapping[str, Any] | None,
-    capability_input: Mapping[str, Any] | CapabilityAssessment | None,
-) -> CapabilityAssessment | None:
+    capability_input: Mapping[str, Any] | CapabilityAuthority | None,
+    design_config: Mapping[str, Any] | None = None,
+) -> CapabilityAuthority | None:
     if capability_input is not None:
-        if type(capability_input) is CapabilityAssessment:
-            document = capability_document(capability_input)
-            return capability_assessment_from_document(document)
-        return capability_assessment_from_document(capability_input)
-    if declarations is None or observations is None:
+        if type(capability_input) in {CapabilityAssessment, ProviderCapabilityAssessment}:
+            document = capability_authority_document(capability_input)
+        else:
+            document = capability_input
+        assessment = capability_authority_from_document(document)
+    elif declarations is not None and observations is not None:
+        required = derive_required_capabilities(
+            design_protocol=design_protocol,
+            tier="T2" if design_protocol == "design_ir_v1" else "T1",
+            analyzers=analyzers,
+            design=design,
+        )
+        assessment = assess_capabilities(
+            declarations=declarations,
+            observations=observations,
+            required=required,
+        )
+    else:
         return None
-    required = derive_required_capabilities(
-        design_protocol=design_protocol,
-        tier="T2" if design_protocol == "design_ir_v1" else "T1",
-        analyzers=analyzers,
-        design=design,
-    )
-    return assess_capabilities(
-        declarations=declarations,
-        observations=observations,
-        required=required,
-    )
+    if design_config is None:
+        if type(assessment) is ProviderCapabilityAssessment:
+            raise ValueError("provider capability authority requires design configuration")
+    else:
+        validate_capability_authority_protocol(design_config, assessment)
+    return assessment
 
 
 def project_status(
@@ -280,9 +390,10 @@ def project_status(
     state_root: str | Path,
     capability_declarations: Sequence[RunnerCapabilityDeclaration] | None = None,
     capability_observations: Sequence[CapabilityObservation] | None = None,
-    capability_assessment: Mapping[str, Any] | CapabilityAssessment | None = None,
+    capability_assessment: Mapping[str, Any] | CapabilityAuthority | None = None,
     design_protocol: str = "legacy_plan",
     design_analyzers: Sequence[AnalyzerSpec] = (),
+    design_config: Mapping[str, Any] | None = None,
     current_artifact_fingerprint: str | None = None,
 ) -> FactoryStatus:
     """Project-level readiness from caller-supplied trusted observations only."""
@@ -304,6 +415,7 @@ def project_status(
             analyzers=design_analyzers,
             design=None,
             capability_input=capability_assessment,
+            design_config=design_config,
         )
     except BaseException:
         return _status(
@@ -319,7 +431,7 @@ def project_status(
             state=FactoryStatusState.UNAVAILABLE,
             phase="project",
         )
-    unavailable = bool(assessment.missing or assessment.unverifiable)
+    unavailable = bool(assessment.missing or assessment.unverifiable or assessment.failed)
     return _status(
         repository=repository,
         issue=None,
@@ -347,12 +459,16 @@ def _approval_state(
             parent_digest=parent_digest,
         )
     except ApprovalError as exc:
-        if exc.kind in {AuthorityFailureKind.ABSENT, AuthorityFailureKind.POLICY_STALE}:
-            return False, FactoryStatusState.APPROVAL_PENDING
-        if exc.kind is AuthorityFailureKind.UNREADABLE_RUNTIME:
-            return False, FactoryStatusState.UNAVAILABLE
-        return False, FactoryStatusState.BLOCKED
+        return False, _approval_failure_state(exc)
     return True, None
+
+
+def _approval_failure_state(exc: ApprovalError) -> FactoryStatusState:
+    if exc.kind in {AuthorityFailureKind.ABSENT, AuthorityFailureKind.POLICY_STALE}:
+        return FactoryStatusState.APPROVAL_PENDING
+    if exc.kind is AuthorityFailureKind.UNREADABLE_RUNTIME:
+        return FactoryStatusState.UNAVAILABLE
+    return FactoryStatusState.BLOCKED
 
 
 def _approval_record(
@@ -383,8 +499,28 @@ def _lifecycle_unchanged(
     issue: str,
     repo: Path,
     state: Path,
-    policy_version: str,
+    policy_version: str | None,
 ) -> bool:
+    return _current_lifecycle_token(
+        expected,
+        repository=repository,
+        issue=issue,
+        repo=repo,
+        state=state,
+        policy_version=policy_version,
+    ) == expected
+
+
+def _current_lifecycle_token(
+    expected: _LifecycleToken,
+    *,
+    repository: str,
+    issue: str,
+    repo: Path,
+    state: Path,
+    policy_version: str | None,
+) -> _LifecycleToken | None:
+    """Read one bounded, authenticated lifecycle authority token."""
     try:
         contract = ContractEnvelopeStore(repo).inspect(
             repository=repository, issue=issue, policy_version=policy_version
@@ -403,20 +539,39 @@ def _lifecycle_unchanged(
         gate = DesignGateStore(state / "design-gates").read_current(
             repository=repository, issue=issue
         )
+        approvals = ApprovalStore(state / "approvals")
         approval = _approval_record(
-            ApprovalStore(state / "approvals"),
+            approvals,
             repository=repository,
             issue=issue,
             kind=ArtifactKind.DESIGN,
             artifact_digest=expected.design.envelope.artifact_digest,
             parent_digest=expected.contract.envelope.artifact_digest,
         )
-        return (
-            protocol is not None
-            and design is not None
-            and gate is not None
-            and approval is not None
-            and _LifecycleToken(contract, history, protocol, design, gate, approval) == expected
+        contract_approval = None
+        if expected.contract_approval is not None:
+            contract_approval = approvals.require(
+                repository=repository,
+                issue=issue,
+                artifact_kind=ArtifactKind.CONTRACT,
+                artifact_digest=expected.contract.envelope.artifact_digest,
+                parent_digest=_contract_approval_parent(expected.contract),
+            )
+        if (
+            protocol is None
+            or design is None
+            or gate is None
+            or approval is None
+        ):
+            return None
+        return _LifecycleToken(
+            contract,
+            history,
+            protocol,
+            design,
+            gate,
+            approval,
+            contract_approval,
         )
     except (
         ApprovalError,
@@ -429,7 +584,7 @@ def _lifecycle_unchanged(
         TypeError,
         ValueError,
     ):
-        return False
+        return None
 
 
 def _pending_unchanged(
@@ -440,9 +595,10 @@ def _pending_unchanged(
     issue: str,
     repo: Path,
     state: Path,
-    policy_version: str,
+    policy_version: str | None,
 ) -> bool:
     try:
+        approval_parent = _contract_approval_parent(contract)
         current = ContractEnvelopeStore(repo).inspect(
             repository=repository, issue=issue, policy_version=policy_version
         )
@@ -451,7 +607,7 @@ def _pending_unchanged(
             issue=issue,
             artifact_kind=ArtifactKind.CONTRACT,
             artifact_digest=contract.envelope.artifact_digest,
-            parent_digest=None,
+            parent_digest=approval_parent,
         )
         return current == contract and current_approval == approval
     except (ApprovalError, ContractStoreError, OSError, TypeError, ValueError):
@@ -460,15 +616,17 @@ def _pending_unchanged(
 
 def _decision_history(
     state_root: Path, *, repository: str, issue: str
-) -> tuple[DecisionEvent, ...]:
+) -> DecisionLogSnapshot | None:
     root = state_root / "decisions"
     if not root.exists() and not root.is_symlink():
-        return ()
+        return None
     try:
-        return DecisionLog(root).read_verified(repository=repository, issue=issue)
+        return DecisionLog(root).read_verified_snapshot(
+            repository=repository, issue=issue
+        )
     except DecisionLogUnreadable as exc:
         if exc.kind is AuthorityFailureKind.ABSENT:
-            return ()
+            return None
         raise
 
 
@@ -486,6 +644,7 @@ def _publication_fingerprint(repo_root: Path, revision: str) -> str:
             "--end-of-options",
             f"{revision}^{{tree}}",
         ],
+        env=sanitized_git_environment(),
         capture_output=True,
         text=True,
         check=False,
@@ -498,6 +657,130 @@ def _publication_fingerprint(repo_root: Path, revision: str) -> str:
     ):
         raise ValueError("publication artifact is unavailable")
     return hashlib.sha256(b"software-factory-publication-v1\0" + tree.encode("ascii")).hexdigest()
+
+
+def _evidence_revisions_are_exact(
+    repo_root: Path, *, base_revision: str, implementation_revision: str
+) -> bool:
+    """Bind both evidence revisions to exact local objects and ancestry."""
+    if _GIT_OBJECT_RE.fullmatch(base_revision) is None:
+        return False
+    if _GIT_OBJECT_RE.fullmatch(implementation_revision) is None:
+        return False
+    command = [
+        "git",
+        "-C",
+        os.fspath(repo_root),
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.attributesFile=/dev/null",
+    ]
+    environment = sanitized_git_environment()
+    for revision in (base_revision, implementation_revision):
+        resolved = subprocess.run(
+            [
+                *command,
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                f"{revision}^{{commit}}",
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if resolved.returncode != 0 or resolved.stdout.strip() != revision:
+            return False
+    ancestry = subprocess.run(
+        [
+            *command,
+            "merge-base",
+            "--is-ancestor",
+            base_revision,
+            implementation_revision,
+        ],
+        env=environment,
+        capture_output=True,
+        check=False,
+    )
+    return ancestry.returncode == 0
+
+
+def _evidence_artifact_policy_matches(
+    repo_root: Path,
+    *,
+    base_revision: str,
+    implementation_revision: str,
+    artifact_policy_digest: str,
+    contracts_dir: str,
+) -> bool:
+    """Recompute the exact non-controller product delta bound by evidence."""
+    environment = sanitized_git_environment()
+    changed = subprocess.run(
+        [
+            "git",
+            "-C",
+            os.fspath(repo_root),
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.attributesFile=/dev/null",
+            "--literal-pathspecs",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            base_revision,
+            implementation_revision,
+            "--",
+        ],
+        env=environment,
+        capture_output=True,
+        check=False,
+    )
+    if changed.returncode != 0 or (
+        changed.stdout and not changed.stdout.endswith(b"\0")
+    ):
+        return False
+    controller_roots = tuple(
+        sorted(
+            {
+                *(
+                    root
+                    for root in DEFAULT_LOCAL_GIT_ARTIFACT_CONTROLLER_ROOTS
+                    if root != "contracts"
+                ),
+                contracts_dir,
+            }
+        )
+    )
+
+    def controlled(path: str) -> bool:
+        return any(path == root or path.startswith(f"{root}/") for root in controller_roots)
+
+    implementation_paths = tuple(
+        sorted(
+            path
+            for path in (os.fsdecode(item) for item in changed.stdout.split(b"\0") if item)
+            if not controlled(path)
+        )
+    )
+    try:
+        return artifact_policy_digest == local_artifact_policy_sha256(
+            controller_roots=controller_roots,
+            implementation_paths=implementation_paths,
+        )
+    except (TypeError, ValueError, UnicodeError):
+        return False
 
 
 def _terminal_is_complete(
@@ -515,6 +798,7 @@ def _terminal_is_complete(
     review_revise_cap: int,
     expected_review_artifact_fingerprint: str,
     expected_contract_intent_authority: str,
+    expected_terminal_disposition: str,
 ) -> bool:
     if not history:
         return False
@@ -533,9 +817,12 @@ def _terminal_is_complete(
             gate_result_digest=envelope.gate_result_digest,
             gate_evidence_digest=envelope.gate_result_document["evidence_digest"],
             config_digest=envelope.config_digest,
-            policy_version=envelope.policy_version,
+            policy_version=contract.envelope.policy_version,
             code_surface_digest=tail.artifact_digest,
             publication_revision=tail.source_version,
+            constraint_digest=contract.envelope.constraint_digest,
+            previous_contract_digest=contract.envelope.previous_contract_digest,
+            revision_request_digest=contract.envelope.revision_request_digest,
             expected_contract_intent_authority=expected_contract_intent_authority,
             expected_review_protocol=review_protocol,
             expected_sensors=review_sensors,
@@ -544,6 +831,7 @@ def _terminal_is_complete(
             revise_count=review_revise_count,
             restart_count=review_restart_count,
             revise_cap=review_revise_cap,
+            expected_terminal_disposition=expected_terminal_disposition,
         ),
     )
     return replay.valid
@@ -555,16 +843,18 @@ def _completion_snapshot_is_stable(
     repository: str,
     issue: str,
     repo: Path,
+    contract_root: Path | None = None,
     state: Path,
-    policy_version: str,
+    policy_version: str | None,
 ) -> bool:
     """Authenticate a bounded token-observe-token-observe-token completion pair."""
+    contract_authority = repo if contract_root is None else contract_root
     try:
         if not _lifecycle_unchanged(
             expected.lifecycle,
             repository=repository,
             issue=issue,
-            repo=repo,
+            repo=contract_authority,
             state=state,
             policy_version=policy_version,
         ):
@@ -574,7 +864,7 @@ def _completion_snapshot_is_stable(
             expected.lifecycle,
             repository=repository,
             issue=issue,
-            repo=repo,
+            repo=contract_authority,
             state=state,
             policy_version=policy_version,
         ):
@@ -586,7 +876,7 @@ def _completion_snapshot_is_stable(
                 expected.lifecycle,
                 repository=repository,
                 issue=issue,
-                repo=repo,
+                repo=contract_authority,
                 state=state,
                 policy_version=policy_version,
             )
@@ -611,10 +901,12 @@ def issue_status(
     issue: str,
     repo_root: str | Path,
     state_root: str | Path,
-    policy_version: str = "intent-v1",
+    contract_root: str | Path | None = None,
+    controller_bound: bool = False,
+    policy_version: str | None = None,
     capability_declarations: Sequence[RunnerCapabilityDeclaration] | None = None,
     capability_observations: Sequence[CapabilityObservation] | None = None,
-    capability_assessment: Mapping[str, Any] | CapabilityAssessment | None = None,
+    capability_assessment: Mapping[str, Any] | CapabilityAuthority | None = None,
     design_config: Mapping[str, Any] | None = None,
     current_artifact_fingerprint: str | None = None,
     review_protocol: str | None = None,
@@ -623,6 +915,7 @@ def issue_status(
     review_revise_count: int = 0,
     review_restart_count: int = 0,
     review_revise_cap: int = 2,
+    contracts_dir: str = "contracts",
 ) -> FactoryStatus:
     """Project one issue from authenticated persisted authority without mutation."""
     if (
@@ -636,8 +929,15 @@ def issue_status(
         raise ValueError("factory status lifecycle identity is invalid")
     artifacts: dict[str, str] = {}
     try:
-        repo, state = _authenticated_roots(repo_root, state_root)
-        contract = ContractEnvelopeStore(repo).inspect(
+        repo, state = _authenticated_roots(
+            repo_root, state_root, controller_bound=controller_bound
+        )
+        contract_authority = _authenticated_contract_root(
+            contract_root, repo=repo, state=state
+        )
+        if controller_bound and contract_authority != state:
+            raise StatusAuthorityError(AuthorityFailureKind.INTEGRITY)
+        contract = ContractEnvelopeStore(contract_authority).inspect(
             repository=repository, issue=issue, policy_version=policy_version
         )
     except (ContractStoreError, StatusAuthorityError) as exc:
@@ -661,9 +961,25 @@ def issue_status(
             state=FactoryStatusState.UNAVAILABLE,
             phase="contract",
         )
+    authenticated_policy_version = contract.envelope.policy_version
     artifacts["contract"] = contract.envelope.artifact_digest
     try:
-        history = _decision_history(state, repository=repository, issue=issue)
+        contract_approval_parent = _contract_approval_parent(contract)
+    except StatusAuthorityError:
+        return _status(
+            repository=repository,
+            issue=issue,
+            state=FactoryStatusState.BLOCKED,
+            phase="contract",
+            artifact_digests=artifacts,
+        )
+    if contract_approval_parent is not None:
+        artifacts["constraint"] = contract_approval_parent
+    try:
+        history_snapshot = _decision_history(
+            state, repository=repository, issue=issue
+        )
+        history = history_snapshot.events if history_snapshot is not None else ()
     except DecisionLogUnreadable as exc:
         return _status(
             repository=repository,
@@ -684,7 +1000,7 @@ def issue_status(
             issue=issue,
             kind=ArtifactKind.CONTRACT,
             artifact_digest=contract.envelope.artifact_digest,
-            parent_digest=None,
+            parent_digest=contract_approval_parent,
         )
         approval = _approval_record(
             approvals,
@@ -692,7 +1008,7 @@ def issue_status(
             issue=issue,
             kind=ArtifactKind.CONTRACT,
             artifact_digest=contract.envelope.artifact_digest,
-            parent_digest=None,
+            parent_digest=contract_approval_parent,
         )
         if approved and (
             approval is None
@@ -701,9 +1017,9 @@ def issue_status(
                 approval,
                 repository=repository,
                 issue=issue,
-                repo=repo,
+                repo=contract_authority,
                 state=state,
-                policy_version=policy_version,
+                policy_version=authenticated_policy_version,
             )
         ):
             failure = FactoryStatusState.UNAVAILABLE
@@ -744,7 +1060,7 @@ def issue_status(
     artifacts["design"] = design.envelope.artifact_digest
     if (
         design.envelope.parent_digest != contract.envelope.artifact_digest
-        or design.envelope.policy_version != policy_version
+        or design.envelope.policy_version != authenticated_policy_version
     ):
         return _status(
             repository=repository,
@@ -840,7 +1156,7 @@ def issue_status(
         or envelope.design_digest != design.envelope.artifact_digest
         or envelope.design_document != design.envelope.design_document
         or envelope.config_digest != design.envelope.config_digest
-        or envelope.policy_version != design.envelope.policy_version
+        or envelope.policy_version != authenticated_policy_version
     ):
         return _status(
             repository=repository,
@@ -852,18 +1168,19 @@ def issue_status(
             finding_counts=counts,
         )
     try:
-        stored_config, specs = parse_design_config_document(envelope.design_config_document)
+        stored_config, _specs = parse_design_config_document(envelope.design_config_document)
         assessment = _assessment(
             declarations=capability_declarations,
             observations=capability_observations,
             design_protocol="design_ir_v1",
-            analyzers=specs,
+            analyzers=_specs,
             design=design.envelope.design_document,
             capability_input=capability_assessment,
+            design_config=stored_config,
         )
         if assessment is None:
             raise ValueError("current capability observation is absent")
-        current_capability_document = capability_document(assessment)
+        current_capability_document = capability_authority_document(assessment)
         if design_config is None:
             raise ValueError("current design configuration is absent")
         expected_config = dict(design_config)
@@ -901,7 +1218,9 @@ def issue_status(
     effective = tuple(item.value for item in assessment.effective)
     result_state = DesignGateState(envelope.gate_result_document["state"])
     lifecycle_token = (
-        _LifecycleToken(contract, history, protocol, design, gate, approval_record)
+        _LifecycleToken(
+            contract, history_snapshot, protocol, design, gate, approval_record
+        )
         if approved and approval_record is not None
         else None
     )
@@ -909,9 +1228,9 @@ def issue_status(
         lifecycle_token,
         repository=repository,
         issue=issue,
-        repo=repo,
+        repo=contract_authority,
         state=state,
-        policy_version=policy_version,
+        policy_version=authenticated_policy_version,
     ):
         return _status(
             repository=repository,
@@ -958,44 +1277,102 @@ def issue_status(
             finding_counts=counts,
         )
     terminal_claimed = any(
-        event.stage == "final-disposition" and event.disposition == "SHIPPED" for event in history
+        event.stage == "final-disposition"
+        and event.disposition in {"SHIPPED", "VALIDATED"}
+        for event in history
+    )
+    expected_terminal_disposition = (
+        history[-1].disposition
+        if history
+        and history[-1].stage == "final-disposition"
+        and history[-1].disposition in {"SHIPPED", "VALIDATED"}
+        else "SHIPPED"
     )
     completion_review_fingerprint: str | None = None
+    contract_approval_record: ApprovalRecord | None = None
+    contract_approval_failure: FactoryStatusState | None = None
     try:
-        contract_policy = evaluate_intent(contract.envelope.contract_document)
         if contract.envelope.contract_document.get("schema_version") == 1:
             expected_contract_intent_authority = "compatibility-policy"
-        elif contract_policy.requires_contract_approval:
-            expected_contract_intent_authority = approvals.require(
-                repository=repository,
-                issue=issue,
-                artifact_kind=ArtifactKind.CONTRACT,
-                artifact_digest=contract.envelope.artifact_digest,
-                parent_digest=None,
-            ).approver
+        elif authenticated_policy_version == "intent-v1":
+            if _legacy_intent_v1_requires_contract_approval(
+                contract.envelope.contract_document
+            ):
+                try:
+                    historical_approval = approvals.require(
+                        repository=repository,
+                        issue=issue,
+                        artifact_kind=ArtifactKind.CONTRACT,
+                        artifact_digest=contract.envelope.artifact_digest,
+                        parent_digest=None,
+                    )
+                except ApprovalError as exc:
+                    contract_approval_failure = _approval_failure_state(exc)
+                else:
+                    contract_approval_record = historical_approval
+                    expected_contract_intent_authority = historical_approval.approver
+            else:
+                expected_contract_intent_authority = "deterministic-policy"
         else:
-            expected_contract_intent_authority = "deterministic-policy"
-        if capability_fresh:
-            completion_review_fingerprint = fingerprint_repository_surface(repo)
-            complete = _terminal_is_complete(
-                history,
-                repo_root=repo,
-                contract=contract,
-                design=design,
-                gate=gate,
-                review_protocol=review_protocol,
-                review_sensors=tuple(review_sensors),
-                review_overrides=tuple(review_overrides),
-                review_revise_count=review_revise_count,
-                review_restart_count=review_restart_count,
-                review_revise_cap=review_revise_cap,
-                expected_review_artifact_fingerprint=completion_review_fingerprint,
-                expected_contract_intent_authority=expected_contract_intent_authority,
-            )
+            contract_policy = evaluate_intent(contract.envelope.contract_document)
+            if contract_policy.requires_contract_approval:
+                try:
+                    contract_approval_record = approvals.require(
+                        repository=repository,
+                        issue=issue,
+                        artifact_kind=ArtifactKind.CONTRACT,
+                        artifact_digest=contract.envelope.artifact_digest,
+                        parent_digest=contract_approval_parent,
+                    )
+                except ApprovalError as exc:
+                    contract_approval_failure = _approval_failure_state(exc)
+                else:
+                    expected_contract_intent_authority = contract_approval_record.approver
+            else:
+                expected_contract_intent_authority = "deterministic-policy"
+        if contract_approval_failure is None:
+            if lifecycle_token is not None and contract_approval_record is not None:
+                lifecycle_token = replace(
+                    lifecycle_token,
+                    contract_approval=contract_approval_record,
+                )
+            if capability_fresh:
+                completion_review_fingerprint = fingerprint_repository_surface(repo)
+                complete = _terminal_is_complete(
+                    history,
+                    repo_root=repo,
+                    contract=contract,
+                    design=design,
+                    gate=gate,
+                    review_protocol=review_protocol,
+                    review_sensors=tuple(review_sensors),
+                    review_overrides=tuple(review_overrides),
+                    review_revise_count=review_revise_count,
+                    review_restart_count=review_restart_count,
+                    review_revise_cap=review_revise_cap,
+                    expected_review_artifact_fingerprint=completion_review_fingerprint,
+                    expected_contract_intent_authority=expected_contract_intent_authority,
+                    expected_terminal_disposition=expected_terminal_disposition,
+                )
+            else:
+                complete = False
         else:
             complete = False
     except (OSError, RuntimeError, TypeError, ValueError):
         complete = False
+    if contract_approval_failure is not None:
+        return _status(
+            repository=repository,
+            issue=issue,
+            state=(
+                FactoryStatusState.BLOCKED
+                if terminal_claimed
+                else contract_approval_failure
+            ),
+            phase="approval",
+            artifact_digests=artifacts,
+            finding_counts=counts,
+        )
     if complete:
         if (
             lifecycle_token is None
@@ -1005,8 +1382,9 @@ def issue_status(
                 repository=repository,
                 issue=issue,
                 repo=repo,
+                contract_root=contract_authority,
                 state=state,
-                policy_version=policy_version,
+                policy_version=authenticated_policy_version,
             )
         ):
             return _status(
@@ -1018,11 +1396,99 @@ def issue_status(
                 finding_counts=counts,
             )
         artifacts["publication"] = history[-1].artifact_digest or ""
+        validated = expected_terminal_disposition == "VALIDATED"
+        if validated:
+            try:
+                evidence_store = OperationalEvidenceStore(state / "operational-evidence")
+                first_lifecycle = _current_lifecycle_token(
+                    lifecycle_token,
+                    repository=repository,
+                    issue=issue,
+                    repo=contract_authority,
+                    state=state,
+                    policy_version=authenticated_policy_version,
+                )
+                first_evidence = evidence_store.read_current(
+                    repository=repository, issue=issue
+                )
+                second_lifecycle = _current_lifecycle_token(
+                    lifecycle_token,
+                    repository=repository,
+                    issue=issue,
+                    repo=contract_authority,
+                    state=state,
+                    policy_version=authenticated_policy_version,
+                )
+                completed_evidence = evidence_store.read_current(
+                    repository=repository, issue=issue
+                )
+                if (
+                    first_lifecycle != lifecycle_token
+                    or second_lifecycle != first_lifecycle
+                    or completed_evidence != first_evidence
+                ):
+                    raise OperationalEvidenceError(
+                        "completion authorities changed during status snapshot"
+                    )
+                evidence = (
+                    None if completed_evidence is None else completed_evidence.evidence
+                )
+                if (
+                    completed_evidence is None
+                    or evidence is None
+                    or evidence.disposition
+                    is not OperationalDisposition.COMPLETED_NOT_PROMOTED
+                    or evidence.repository != repository
+                    or evidence.issue != issue
+                    or evidence.contract_digest != contract.envelope.artifact_digest
+                    or evidence.design_digest != design.envelope.artifact_digest
+                    or evidence.gate_digest != gate.envelope.gate_result_digest
+                    or evidence.capability_digest
+                    != capability_authority_sha256(assessment)
+                    or evidence.implementation_revision != history[-1].source_version
+                    or not _evidence_revisions_are_exact(
+                        repo,
+                        base_revision=evidence.base_revision,
+                        implementation_revision=evidence.implementation_revision or "",
+                    )
+                    or evidence.verification_passed is not True
+                    or evidence.secret_scan_passed is not True
+                    or evidence.remote_mutations_permitted is not False
+                    or evidence.artifact_policy_digest is None
+                    or not _evidence_artifact_policy_matches(
+                        repo,
+                        base_revision=evidence.base_revision,
+                        implementation_revision=evidence.implementation_revision or "",
+                        artifact_policy_digest=evidence.artifact_policy_digest or "",
+                        contracts_dir=contracts_dir,
+                    )
+                ):
+                    raise OperationalEvidenceError(
+                        "completed operational evidence does not match lifecycle authority"
+                    )
+                artifacts["operational_evidence"] = completed_evidence.digest
+            except (OperationalEvidenceError, OSError, TypeError, ValueError):
+                artifacts.pop("publication", None)
+                return _status(
+                    repository=repository,
+                    issue=issue,
+                    state=FactoryStatusState.BLOCKED,
+                    phase="complete",
+                    artifact_digests=artifacts,
+                    approval_current=True,
+                    gate_fresh=False,
+                    effective_capabilities=effective,
+                    finding_counts=counts,
+                )
         return _status(
             repository=repository,
             issue=issue,
-            state=FactoryStatusState.COMPLETE,
-            phase="complete",
+            state=(
+                FactoryStatusState.COMPLETED_NOT_PROMOTED
+                if validated
+                else FactoryStatusState.COMPLETE
+            ),
+            phase="completed-not-promoted" if validated else "complete",
             artifact_digests=artifacts,
             approval_current=True,
             gate_fresh=True,
@@ -1061,9 +1527,9 @@ def issue_status(
         lifecycle_token,
         repository=repository,
         issue=issue,
-        repo=repo,
+        repo=contract_authority,
         state=state,
-        policy_version=policy_version,
+        policy_version=authenticated_policy_version,
     ):
         return _status(
             repository=repository,

@@ -1,0 +1,529 @@
+# AIFactory disposable validation cell — Lima VZ / native Apple Silicon.
+# Product repository bytes enter only through `limactl copy`; host mounts stay
+# empty and the first-match rule rejects every dynamic TCP/UDP forward.
+vmType: vz
+arch: aarch64
+images:
+  - location: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img
+    arch: aarch64
+    digest: sha256:afa139bac6f2629c1e1f2f8f34215f3a9ad9779801bcb945521ba1a45016743f
+cpus: 4
+memory: 8GiB
+disk: 64GiB
+mounts: []
+# Lima appends a permissive loopback fallback even for an empty list. In Lima
+# 2.2, explicit false preserves 0.0.0.0's all-interface matcher (IPv4/IPv6).
+portForwards:
+  - guestIP: "0.0.0.0"
+    guestIPMustBeZero: false
+    guestPortRange: [1, 65535]
+    proto: any
+    ignore: true
+hostResolver:
+  enabled: false
+propagateProxyEnv: false
+ssh:
+  loadDotSSHPubKeys: false
+  forwardAgent: false
+  forwardX11: false
+containerd:
+  system: false
+  user: false
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/sh
+      set -eu
+      # Lima may re-run system provisioning after a stop/start. Sealing or a
+      # completed bootstrap authority record prevents network/package access
+      # from reopening after creation.
+      if [ -f /var/lib/aifactory/sealed ] || [ -f /etc/aifactory/instance.json ] || [ -f /var/lib/aifactory/bpf-lsm-configured ]; then
+        exit 0
+      fi
+      export DEBIAN_FRONTEND=noninteractive
+
+      # A validation cell records executable identities during bootstrap, so
+      # background package replacement would invalidate its authority later.
+      # Stop and permanently mask every Ubuntu automatic-update entry point
+      # before this provisioner performs its one explicit package transaction.
+      systemctl mask --now apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service
+      install -o root -g root -m 0644 /dev/stdin /etc/apt/apt.conf.d/99aifactory-no-periodic <<'APT'
+      APT::Periodic::Enable "0";
+      APT::Periodic::Update-Package-Lists "0";
+      APT::Periodic::Unattended-Upgrade "0";
+      APT
+
+      # Bootstrap-only package access. `factory validation-cell seal` records
+      # the dependency tree and disables this provisioning/registry surface.
+      install -d -o root -g root -m 0755 /etc/apt/keyrings
+      apt-get update
+      apt-get install -y --no-install-recommends ca-certificates curl git nftables nodejs npm python3 python3-pip
+      /usr/sbin/nft --version | grep '^nftables v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\( .\{1,80\}\)\{0,1\}$' >/dev/null
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+        -o /etc/apt/keyrings/docker.asc
+      chmod 0644 /etc/apt/keyrings/docker.asc
+      . /etc/os-release
+      printf '%s\n' \
+        "deb [arch=arm64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" \
+        >/etc/apt/sources.list.d/docker.list
+      apt-get update
+      apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io
+
+      # Publish every optional-readiness prerequisite before controller-owned
+      # network bootstrap. Lima stops retrying optional probes when its final
+      # boot requirement completes, so an npm install or image pull here can
+      # race the last probe and leave a provisioned instance degraded.
+      install -d -o root -g root -m 0700 /opt/aifactory-cell/bootstrap
+      install -d -o root -g root -m 0700 /opt/aifactory-cell/toolchains
+      install -d -o root -g root -m 0700 /var/lib/aifactory
+      install -d -o root -g root -m 0700 /var/lib/aifactory/execution-state
+      install -d -o root -g root -m 0700 /var/lib/aifactory/leash-dependencies
+      # The model login remains guest-local, root-owned, and outside every
+      # workspace/import/export tree. The bridge mounts only this child into
+      # the Leash agent container at /root/.claude.
+      install -d -o root -g root -m 0700 /var/lib/aifactory/model-auth
+      install -d -o root -g root -m 0700 /var/lib/aifactory/model-auth/.claude
+      # Automated bridge runs never consult interactive or persisted Leash
+      # settings. This empty root-private directory is its fixed LEASH_HOME.
+      install -d -o root -g root -m 0700 /var/lib/aifactory/automated-leash-home
+      install -d -o root -g root -m 0700 /srv/aifactory
+      install -d -o root -g root -m 0711 /srv/aifactory/imports
+      install -d -o root -g root -m 0700 /srv/aifactory/exports
+      install -d -o root -g root -m 0711 /srv/aifactory/workspaces
+      install -d -o root -g root -m 0700 /etc/aifactory
+      install -d -o root -g root -m 0755 /usr/local/libexec
+
+      # Readiness runs as Lima's unprivileged transport user, which cannot
+      # traverse the root:root:0700 authority parents. This root-owned helper
+      # exposes only two fixed metadata checks and never prints their values.
+      install -o root -g root -m 0755 /dev/stdin /usr/local/sbin/aifactory-readiness-check <<'SH'
+      #!/bin/sh
+      set -eu
+      [ "$#" -eq 1 ] || exit 1
+      case "$1" in
+        workspace-root)
+          /usr/bin/test "$(LC_ALL=C /usr/bin/stat -c '%F:%U:%G:%a' /srv/aifactory/workspaces 2>/dev/null)" = "directory:root:root:711"
+          ;;
+        authority-root)
+          /usr/bin/test "$(LC_ALL=C /usr/bin/stat -c '%F:%U:%G:%a' /var/lib/aifactory/execution-state 2>/dev/null)" = "directory:root:root:700"
+          ;;
+        bpf-lsm)
+          /usr/bin/test "$(LC_ALL=C /usr/bin/stat -c '%F:%U:%G:%a' /var/lib/aifactory/bpf-lsm-configured 2>/dev/null)" = "regular file:root:root:600"
+          /usr/bin/grep -Fqx 'aifactory-bpf-lsm-configured-v1' /var/lib/aifactory/bpf-lsm-configured
+          /usr/bin/tr ',' '\n' </sys/kernel/security/lsm | /usr/bin/grep -Fqx bpf
+          ;;
+        *)
+          exit 1
+          ;;
+      esac
+      SH
+
+      # Registry installation is controller-owned because Lima 2.2 gives each
+      # boot requirement only about ten minutes. The controller invokes this
+      # fixed helper with its own bounded stage before recording any installed
+      # Leash identity.
+      install -o root -g root -m 0755 /dev/stdin /usr/local/sbin/aifactory-bootstrap-leash <<'SH'
+      #!/bin/sh
+      set -eu
+      [ "$#" -eq 0 ] || exit 1
+      /usr/bin/npm install --global @strongdm/leash@1.1.7 >/dev/null
+      /usr/local/bin/leash --version | /usr/bin/grep -F 'version: 1.1.7' >/dev/null
+      /usr/bin/rm -f -- /usr/local/sbin/aifactory-bootstrap-leash
+      printf '%s\n' '{"installed":true}'
+      SH
+
+      # Ubuntu's generic kernel contains BPF LSM support but does not activate
+      # it by default. Leash requires that hook for filesystem and process
+      # enforcement. The controller invokes this helper once, then performs a
+      # bounded stop/start and authenticates the live LSM list before any image
+      # bootstrap, copied input, dependency command, or agent execution.
+      install -o root -g root -m 0755 /dev/stdin /usr/local/sbin/aifactory-enable-bpf-lsm <<'SH'
+      #!/bin/sh
+      set -eu
+      [ "$#" -eq 0 ] || exit 1
+      /usr/bin/grep -Fqx 'CONFIG_BPF_LSM=y' "/boot/config-$(/usr/bin/uname -r)"
+      install -d -o root -g root -m 0755 /etc/default/grub.d
+      install -o root -g root -m 0644 /dev/stdin /etc/default/grub.d/99-aifactory-bpf-lsm.cfg <<'GRUB'
+      GRUB_CMDLINE_LINUX_DEFAULT="console=tty1 console=ttyAMA0 lsm=landlock,lockdown,yama,integrity,apparmor,bpf"
+      GRUB
+      /usr/sbin/update-grub >/dev/null
+      /usr/bin/grep -F 'lsm=landlock,lockdown,yama,integrity,apparmor,bpf' /boot/grub/grub.cfg >/dev/null
+      install -o root -g root -m 0600 /dev/stdin /var/lib/aifactory/bpf-lsm-configured <<'MARKER'
+      aifactory-bpf-lsm-configured-v1
+      MARKER
+      /usr/bin/rm -f -- /usr/local/sbin/aifactory-enable-bpf-lsm
+      # The controller stops the VM immediately after this helper returns.
+      # Make the marker and self-removal durable before reporting success.
+      /usr/bin/sync
+      printf '%s\n' '{"configured":true}'
+      SH
+
+      systemctl enable --now docker
+
+      # Image hydration is controller-owned because Lima 2.2 gives each boot
+      # requirement only about ten minutes. These fixed one-shot helpers accept
+      # no image input and remove themselves only after their pinned pull succeeds.
+      install -o root -g root -m 0755 /dev/stdin /usr/local/sbin/aifactory-bootstrap-coder-image <<'SH'
+      #!/bin/sh
+      set -eu
+      [ "$#" -eq 0 ] || exit 1
+      /usr/bin/docker pull public.ecr.aws/s5i7k8t3/strongdm/coder@sha256:d19d1f148e1305b649dcfbcf04b0f7933bed769ccee83136cdb7f9c180ffc9d1 >/dev/null
+      /usr/bin/docker tag public.ecr.aws/s5i7k8t3/strongdm/coder@sha256:d19d1f148e1305b649dcfbcf04b0f7933bed769ccee83136cdb7f9c180ffc9d1 public.ecr.aws/s5i7k8t3/strongdm/coder:latest
+      /usr/bin/rm -f -- /usr/local/sbin/aifactory-bootstrap-coder-image
+      printf '%s\n' '{"hydrated":"coder"}'
+      SH
+
+      install -o root -g root -m 0755 /dev/stdin /usr/local/sbin/aifactory-bootstrap-upstream-leash-image <<'SH'
+      #!/bin/sh
+      set -eu
+      [ "$#" -eq 0 ] || exit 1
+      /usr/bin/docker pull public.ecr.aws/s5i7k8t3/strongdm/leash@sha256:2c08690eddda5bffe819bd43163fa5ace3c0b00cb87f4a2357ab9e504b9c0b6f >/dev/null
+      /usr/bin/docker tag public.ecr.aws/s5i7k8t3/strongdm/leash@sha256:2c08690eddda5bffe819bd43163fa5ace3c0b00cb87f4a2357ab9e504b9c0b6f public.ecr.aws/s5i7k8t3/strongdm/leash:latest
+      /usr/bin/rm -f -- /usr/local/sbin/aifactory-bootstrap-upstream-leash-image
+      printf '%s\n' '{"hydrated":"upstream-leash"}'
+      SH
+
+      # Package installation must not have reopened either update mechanism.
+      /usr/bin/apt-config dump | grep -Fqx 'APT::Periodic::Enable "0";'
+      /usr/bin/apt-config dump | grep -Fqx 'APT::Periodic::Update-Package-Lists "0";'
+      /usr/bin/apt-config dump | grep -Fqx 'APT::Periodic::Unattended-Upgrade "0";'
+      for unit in apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service
+      do
+        systemctl is-enabled "$unit" | grep '^masked$' >/dev/null
+        if systemctl is-active --quiet "$unit"; then
+          exit 1
+        fi
+      done
+
+      # pnpm 10.18.0, leash 1.1.7, and the built AIFactory wheel are
+      # controller-staged into /opt/aifactory-cell/bootstrap. The lifecycle
+      # controller verifies their digests before installing the wheel, Leash,
+      # and the aifactory-execution-bridge / verifier launcher entry point.
+      # The normal Lima user can SCP only into its unique /tmp transport leaf.
+      # This fixed root helper atomically moves the opened leaf beneath a held
+      # root-only parent, verifies the moved inode and input digests, then
+      # installs the root-owned bootstrap bytes before invoking pip.
+      install -m 0755 /dev/stdin /usr/local/sbin/aifactory-bootstrap-stage <<'PY'
+      #!/usr/bin/python3
+      import hashlib
+      import json
+      import os
+      import re
+      import stat
+      import subprocess
+      import sys
+      import sysconfig
+      import tempfile
+
+      failure_detail = "arguments"
+
+      def main():
+          global failure_detail
+          if len(sys.argv) not in {5, 8} or re.fullmatch(r"aifactory-bootstrap-[0-9a-f]{64}", sys.argv[1]) is None:
+              raise ValueError
+          if any(re.fullmatch(r"[0-9a-f]{64}", value) is None for value in sys.argv[2:]):
+              raise ValueError
+
+          failure_detail = "stage-authority"
+          nofollow = getattr(os, "O_NOFOLLOW", 0)
+          directory = getattr(os, "O_DIRECTORY", 0)
+          tmp_fd = os.open("/tmp", os.O_RDONLY | directory | nofollow)
+          quarantine_parent = "/opt/aifactory-cell/bootstrap"
+          quarantine_leaf = f".transport-{sys.argv[1]}"
+          quarantine_fd = None
+          stage_fd = None
+          try:
+              stage_fd = os.open(sys.argv[1], os.O_RDONLY | directory | nofollow, dir_fd=tmp_fd)
+              stage_info = os.fstat(stage_fd)
+              if (not stat.S_ISDIR(stage_info.st_mode) or stage_info.st_uid == 0
+                      or stat.S_IMODE(stage_info.st_mode) != 0o700):
+                  raise ValueError
+              quarantine_fd = os.open(
+                  quarantine_parent,
+                  os.O_RDONLY | directory | nofollow,
+              )
+              quarantine_info = os.fstat(quarantine_fd)
+              if (not stat.S_ISDIR(quarantine_info.st_mode)
+                      or quarantine_info.st_uid != os.geteuid()
+                      or stat.S_IMODE(quarantine_info.st_mode) != 0o700):
+                  raise ValueError
+              try:
+                  os.stat(
+                      quarantine_leaf,
+                      dir_fd=quarantine_fd,
+                      follow_symlinks=False,
+                  )
+              except FileNotFoundError:
+                  pass
+              else:
+                  raise ValueError
+              os.rename(
+                  sys.argv[1],
+                  quarantine_leaf,
+                  src_dir_fd=tmp_fd,
+                  dst_dir_fd=quarantine_fd,
+              )
+              moved_stage = os.stat(
+                  quarantine_leaf,
+                  dir_fd=quarantine_fd,
+                  follow_symlinks=False,
+              )
+              if (moved_stage.st_dev, moved_stage.st_ino) != (
+                  stage_info.st_dev,
+                  stage_info.st_ino,
+              ):
+                  raise ValueError
+              os.close(tmp_fd)
+              tmp_fd = None
+
+              def consume(name, expected, destination):
+                  descriptor = os.open(name, os.O_RDONLY | nofollow, dir_fd=stage_fd)
+                  try:
+                      before = os.fstat(descriptor)
+                      named = os.stat(name, dir_fd=stage_fd, follow_symlinks=False)
+                      if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                              or before.st_uid != stage_info.st_uid
+                              or (before.st_dev, before.st_ino) != (named.st_dev, named.st_ino)):
+                          raise ValueError
+                      parent = os.path.dirname(destination)
+                      os.makedirs(parent, mode=0o700, exist_ok=True)
+                      temporary_fd, temporary = tempfile.mkstemp(prefix=".bootstrap-", dir=parent)
+                      try:
+                          digest = hashlib.sha256()
+                          with os.fdopen(temporary_fd, "wb") as target:
+                              os.lseek(descriptor, 0, os.SEEK_SET)
+                              remaining = before.st_size
+                              while remaining:
+                                  chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                                  if not chunk:
+                                      raise ValueError
+                                  target.write(chunk)
+                                  digest.update(chunk)
+                                  remaining -= len(chunk)
+                              if os.read(descriptor, 1):
+                                  raise ValueError
+                              target.flush()
+                              os.fsync(target.fileno())
+                          after = os.fstat(descriptor)
+                          named_after = os.stat(name, dir_fd=stage_fd, follow_symlinks=False)
+                          if ((after.st_dev, after.st_ino, after.st_size,
+                                  after.st_mtime_ns, after.st_ctime_ns)
+                                  != (before.st_dev, before.st_ino, before.st_size,
+                                      before.st_mtime_ns, before.st_ctime_ns)
+                                  or (named_after.st_dev, named_after.st_ino)
+                                  != (before.st_dev, before.st_ino)
+                                  or digest.hexdigest() != expected):
+                              raise ValueError
+                          os.chown(temporary, 0, 0)
+                          os.chmod(temporary, 0o600)
+                          os.replace(temporary, destination)
+                      finally:
+                          try:
+                              os.unlink(temporary)
+                          except FileNotFoundError:
+                              pass
+                      os.unlink(name, dir_fd=stage_fd)
+                  finally:
+                      os.close(descriptor)
+
+              wheel = "/opt/aifactory-cell/bootstrap/software_factory-0.3.0-py3-none-any.whl"
+              failure_detail = "wheel-verify"
+              consume("software_factory-0.3.0-py3-none-any.whl", sys.argv[2], wheel)
+              failure_detail = "policy-verify"
+              consume("leash.cedar", sys.argv[3], "/opt/aifactory-cell/bootstrap/leash.cedar")
+              failure_detail = "toolchain-install"
+              toolchain = "/opt/aifactory-cell/bootstrap/pnpm-10.18.0.tgz"
+              consume(
+                  "pnpm-10.18.0.tgz",
+                  sys.argv[4],
+                  toolchain,
+              )
+              if len(sys.argv) == 8:
+                  failure_detail = "leash-archive-verify"
+                  consume(
+                      "leash-image.tar",
+                      sys.argv[5],
+                      "/opt/aifactory-cell/bootstrap/leash-image.tar",
+                  )
+                  failure_detail = "leash-build-record-verify"
+                  consume(
+                      "leash-build.json",
+                      sys.argv[6],
+                      "/opt/aifactory-cell/bootstrap/leash-build.json",
+                  )
+                  failure_detail = "leash-test-record-verify"
+                  consume(
+                      "leash-tests.json",
+                      sys.argv[7],
+                      "/opt/aifactory-cell/bootstrap/leash-tests.json",
+                  )
+              named_stage = os.stat(
+                  quarantine_leaf,
+                  dir_fd=quarantine_fd,
+                  follow_symlinks=False,
+              )
+              if (named_stage.st_dev, named_stage.st_ino) != (
+                  stage_info.st_dev,
+                  stage_info.st_ino,
+              ):
+                  raise ValueError
+              os.rmdir(quarantine_leaf, dir_fd=quarantine_fd)
+              try:
+                  os.stat(
+                      quarantine_leaf,
+                      dir_fd=quarantine_fd,
+                      follow_symlinks=False,
+                  )
+              except FileNotFoundError:
+                  pass
+              else:
+                  raise ValueError
+              failure_detail = "wheel-install"
+              subprocess.run([
+                  "/usr/bin/python3",
+                  "-m",
+                  "pip",
+                  "install",
+                  "--no-index",
+                  "--no-deps",
+                  "--break-system-packages",
+                  wheel,
+              ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+              failure_detail = "installed-entrypoints"
+              def require_root_file(path, mode):
+                  info = os.lstat(path)
+                  if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                          or info.st_uid != 0 or info.st_gid != 0
+                          or stat.S_IMODE(info.st_mode) != mode):
+                      raise ValueError
+
+              require_root_file("/usr/local/bin/factory", 0o755)
+              require_root_file("/usr/local/bin/aifactory-execution-bridge", 0o755)
+              require_root_file("/usr/local/bin/aifactory-validation-cell-guest", 0o755)
+              purelib = sysconfig.get_path("purelib")
+              if type(purelib) is not str or not os.path.isabs(purelib):
+                  raise ValueError
+              require_root_file(
+                  os.path.join(purelib, "software_factory", "execution", "bridge.py"),
+                  0o644,
+              )
+              failure_detail = "toolchain-install"
+              from software_factory.execution.pnpm_toolchain import (
+                  PNPM_DESTINATION,
+                  install_pnpm_toolchain,
+              )
+              with open(toolchain, "rb") as archive:
+                  install_pnpm_toolchain(archive.read(), PNPM_DESTINATION)
+          finally:
+              if stage_fd is not None:
+                  os.close(stage_fd)
+              if quarantine_fd is not None:
+                  os.close(quarantine_fd)
+              if tmp_fd is not None:
+                  os.close(tmp_fd)
+
+      try:
+          main()
+      except BaseException:
+          print(f"aifactory-bootstrap:{failure_detail}", file=sys.stderr)
+          raise SystemExit(1) from None
+      print(json.dumps({"installed": True}, sort_keys=True, separators=(",", ":")))
+      PY
+
+      # The host bridge argv stays the exact Task 1 contract. This fixed
+      # root-owned wrapper elevates only the one-shot companion; verifier-launch
+      # mode deliberately remains the dedicated unprivileged identity.
+      printf '%s\n' \
+        '{{.User}} ALL=(root) NOPASSWD: /usr/local/libexec/aifactory-execution-bridge-real' \
+        >/etc/sudoers.d/aifactory-bridge
+      chown root:root /etc/sudoers.d/aifactory-bridge
+      chmod 0440 /etc/sudoers.d/aifactory-bridge
+      # Installed by root bootstrap after the wheel is copied:
+      # /usr/local/bin/aifactory-execution-bridge dispatches ordinary requests
+      # to /usr/local/libexec/aifactory-execution-bridge-real through sudo, but
+      # executes --verifier-launch directly as aifactory-verifier.
+
+      if ! id aifactory-verifier >/dev/null 2>&1; then
+        useradd --system --create-home --home-dir /var/lib/aifactory-verifier \
+          --shell /usr/sbin/nologin aifactory-verifier
+      fi
+      # Reserve one compile-time dependency identity at the upper edge of
+      # Ubuntu's ordinary static UID/GID range. Never repair or reassign an
+      # existing name/number: any collision or attribute drift fails closed.
+      dependency_user=aifactory-dependency
+      dependency_group=aifactory-dependency
+      dependency_uid=60000
+      dependency_gid=60000
+      dependency_home=/nonexistent
+      dependency_shell=/usr/sbin/nologin
+
+      group_by_name="$(/usr/bin/getent group "$dependency_group" || :)"
+      group_by_gid="$(/usr/bin/getent group "$dependency_gid" || :)"
+      if [ -z "$group_by_name" ]; then
+        [ -z "$group_by_gid" ] || exit 1
+        /usr/sbin/groupadd --gid "$dependency_gid" "$dependency_group"
+      fi
+      group_by_name="$(/usr/bin/getent group "$dependency_group")"
+      group_by_gid="$(/usr/bin/getent group "$dependency_gid")"
+      [ "$group_by_name" = "$group_by_gid" ]
+      [ "$(printf '%s\n' "$group_by_name" | /usr/bin/cut -d: -f1)" = "$dependency_group" ]
+      [ "$(printf '%s\n' "$group_by_name" | /usr/bin/cut -d: -f3)" = "$dependency_gid" ]
+
+      user_by_name="$(/usr/bin/getent passwd "$dependency_user" || :)"
+      user_by_uid="$(/usr/bin/getent passwd "$dependency_uid" || :)"
+      if [ -z "$user_by_name" ]; then
+        [ -z "$user_by_uid" ] || exit 1
+        /usr/sbin/useradd --no-create-home --uid "$dependency_uid" --gid "$dependency_gid" \
+          --home-dir "$dependency_home" --shell "$dependency_shell" "$dependency_user"
+      fi
+      user_by_name="$(/usr/bin/getent passwd "$dependency_user")"
+      user_by_uid="$(/usr/bin/getent passwd "$dependency_uid")"
+      [ "$user_by_name" = "$user_by_uid" ]
+      [ "$(printf '%s\n' "$user_by_name" | /usr/bin/cut -d: -f1)" = "$dependency_user" ]
+      [ "$(printf '%s\n' "$user_by_name" | /usr/bin/cut -d: -f3)" = "$dependency_uid" ]
+      [ "$(printf '%s\n' "$user_by_name" | /usr/bin/cut -d: -f4)" = "$dependency_gid" ]
+      [ "$(printf '%s\n' "$user_by_name" | /usr/bin/cut -d: -f6)" = "$dependency_home" ]
+      [ "$(printf '%s\n' "$user_by_name" | /usr/bin/cut -d: -f7)" = "$dependency_shell" ]
+      chown root:root /var/lib/aifactory /var/lib/aifactory/execution-state
+      chmod 0700 /var/lib/aifactory /var/lib/aifactory/execution-state
+
+      # Written by the root-only bootstrap helper after copied-input digest
+      # verification. Required keys: bootstrap_digest, template_digest,
+      # policy_digest, wheel_digest, bridge_digest, coder_image_digest,
+      # instance_id, verifier_uid, bridge_owner/mode, launcher_owner/mode.
+      : >/etc/aifactory/instance.json.pending
+      chown root:root /etc/aifactory/instance.json.pending
+      chmod 0600 /etc/aifactory/instance.json.pending
+
+probes:
+  - mode: readiness
+    description: Docker Engine, Git, Node and the dedicated authority root exist
+    script: |
+      #!/bin/sh
+      set -eu
+      if ! /usr/bin/sudo -n -- /usr/bin/docker version >/dev/null 2>&1; then
+        printf '%s\n' 'aifactory-readiness:docker' >&2
+        exit 1
+      fi
+      if ! git --version >/dev/null 2>&1; then
+        printf '%s\n' 'aifactory-readiness:git' >&2
+        exit 1
+      fi
+      if ! node --version >/dev/null 2>&1; then
+        printf '%s\n' 'aifactory-readiness:node' >&2
+        exit 1
+      fi
+      if ! /usr/bin/sudo -n -- /usr/local/sbin/aifactory-readiness-check workspace-root >/dev/null 2>&1; then
+        printf '%s\n' 'aifactory-readiness:workspace-root' >&2
+        exit 1
+      fi
+      if ! /usr/bin/sudo -n -- /usr/local/sbin/aifactory-readiness-check authority-root >/dev/null 2>&1; then
+        printf '%s\n' 'aifactory-readiness:authority-root' >&2
+        exit 1
+      fi
+
+message: |
+  The cell is bootstrap-only until `factory validation-cell seal` succeeds.
+  No evidence-bearing agent, probe, configure, or export is authorized yet.

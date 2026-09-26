@@ -22,7 +22,7 @@ try:
 except ImportError:
     _fcntl = None
 
-EVENT_SCHEMA_VERSION = 1
+EVENT_SCHEMA_VERSION = 2
 _DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
 _GIT_OBJECT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", None)
@@ -30,7 +30,7 @@ _DIRECTORY = getattr(os, "O_DIRECTORY", None)
 _OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
 _NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 _MAX_HISTORY_BYTES = 16 * 1024 * 1024
-_FIELDS = {
+_FIELDS_V1 = {
     "event_schema_version",
     "repository",
     "issue",
@@ -53,7 +53,18 @@ _FIELDS = {
     "previous_event_digest",
     "event_digest",
 }
-_AUTHORITY_DIGEST_FIELDS = {"artifact_digest", "parent_digest"}
+_FIELDS_V2 = _FIELDS_V1 | {
+    "constraint_digest",
+    "previous_contract_digest",
+    "revision_request_digest",
+}
+_AUTHORITY_DIGEST_FIELDS = {
+    "artifact_digest",
+    "parent_digest",
+    "constraint_digest",
+    "previous_contract_digest",
+    "revision_request_digest",
+}
 
 
 class DecisionLogUnreadable(RuntimeError):
@@ -129,12 +140,28 @@ class DecisionEvent:
     rationale: str
     disposition: str
     rule: str
+    constraint_digest: str | None = None
+    previous_contract_digest: str | None = None
+    revision_request_digest: str | None = None
     previous_event_digest: str | None = None
     event_digest: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "findings", _freeze_json(self.findings))
         object.__setattr__(self, "proof_obligations", _freeze_json(self.proof_obligations))
+
+
+@dataclass(frozen=True)
+class DecisionLogSnapshot:
+    """Verified history bound to the exact file authority read by the controller."""
+
+    events: tuple[DecisionEvent, ...]
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    links: int
 
 
 class DecisionLog:
@@ -200,15 +227,41 @@ class DecisionLog:
             raise DecisionLogUnreadable("decision history cannot be appended")
         return persisted
 
+    def preview_append(self, event: DecisionEvent) -> DecisionEvent:
+        """Build the exact next chained event without mutating the decision log.
+
+        Callers must still require the later persisted event to equal this preview.
+        The normal controller run lock serializes lifecycle writers; the equality
+        check makes any unexpected intervening append fail closed.
+        """
+        if not isinstance(event, DecisionEvent):
+            raise DecisionLogUnreadable("decision event is invalid")
+        if event.previous_event_digest is not None or event.event_digest is not None:
+            raise DecisionLogUnreadable("decision event must be unpersisted before preview")
+        self._validate_event(event, persisted=False)
+        history = self.read_verified(repository=event.repository, issue=event.issue)
+        data = self._redacted_event_data(event)
+        data["previous_event_digest"] = history[-1].event_digest if history else None
+        data["event_digest"] = artifact_sha256(
+            {key: value for key, value in data.items() if key != "event_digest"}
+        )
+        return self._record_from_data(data)
+
     def read_verified(self, *, repository: str, issue: str) -> tuple[DecisionEvent, ...]:
         """Replay and verify every schema, digest, identity, and chain link."""
+        return self.read_verified_snapshot(repository=repository, issue=issue).events
+
+    def read_verified_snapshot(
+        self, *, repository: str, issue: str
+    ) -> DecisionLogSnapshot:
+        """Return verified events plus the pinned identity of the file read."""
         self._validate_identity(repository, issue)
         expected_repository = redact(repository)
         expected_issue = redact(issue)
         directory = self._open_repository(repository, for_write=False)
         descriptor: int | None = None
         failed = False
-        history: tuple[DecisionEvent, ...] | None = None
+        snapshot: DecisionLogSnapshot | None = None
         try:
             descriptor, _created = self._open_log(directory, issue, for_write=False)
             assert _fcntl is not None
@@ -219,6 +272,20 @@ class DecisionLog:
                 expected_issue=expected_issue,
                 absent_ok=False,
             )
+            info = os.fstat(descriptor)
+            snapshot = DecisionLogSnapshot(
+                events=history,
+                device=info.st_dev,
+                inode=info.st_ino,
+                size=info.st_size,
+                mtime_ns=getattr(
+                    info, "st_mtime_ns", int(info.st_mtime * 1_000_000_000)
+                ),
+                ctime_ns=getattr(
+                    info, "st_ctime_ns", int(info.st_ctime * 1_000_000_000)
+                ),
+                links=info.st_nlink,
+            )
         except DecisionLogUnreadable:
             raise
         except (NotImplementedError, OSError, TypeError, ValueError):
@@ -227,9 +294,9 @@ class DecisionLog:
             if descriptor is not None:
                 _close_quietly(descriptor)
             _close_quietly(directory)
-        if failed or history is None:
+        if failed or snapshot is None:
             raise DecisionLogUnreadable("decision history is unreadable")
-        return history
+        return snapshot
 
     def _redacted_event_data(self, event: DecisionEvent) -> dict[str, Any]:
         data = self._event_data(event)
@@ -270,6 +337,9 @@ class DecisionLog:
             "rationale": event.rationale,
             "disposition": event.disposition,
             "rule": event.rule,
+            "constraint_digest": event.constraint_digest,
+            "previous_contract_digest": event.previous_contract_digest,
+            "revision_request_digest": event.revision_request_digest,
             "previous_event_digest": event.previous_event_digest,
             "event_digest": event.event_digest,
         }
@@ -351,12 +421,30 @@ class DecisionLog:
 
     @classmethod
     def _record_from_data(cls, data: Any) -> DecisionEvent:
-        if type(data) is not dict or set(data) != _FIELDS:
+        if type(data) is not dict:
             raise DecisionLogUnreadable("decision history is corrupt")
+        schema_version = data.get("event_schema_version")
+        if type(schema_version) is not int:
+            raise DecisionLogUnreadable("decision history is corrupt")
+        if schema_version == 1:
+            if set(data) != _FIELDS_V1:
+                raise DecisionLogUnreadable("decision history is corrupt")
+            event_data = {
+                **data,
+                "constraint_digest": None,
+                "previous_contract_digest": None,
+                "revision_request_digest": None,
+            }
+        elif schema_version == EVENT_SCHEMA_VERSION:
+            if set(data) != _FIELDS_V2:
+                raise DecisionLogUnreadable("decision history is corrupt")
+            event_data = data
+        else:
+            raise DecisionLogUnreadable("decision event has an unsupported schema version")
         invalid = False
         event: DecisionEvent | None = None
         try:
-            event = DecisionEvent(**data)
+            event = DecisionEvent(**event_data)
             cls._validate_event(event, persisted=True)
         except DecisionLogUnreadable:
             raise
@@ -370,7 +458,11 @@ class DecisionLog:
     def _validate_event(event: DecisionEvent, *, persisted: bool) -> None:
         if (
             type(event.event_schema_version) is not int
-            or event.event_schema_version != EVENT_SCHEMA_VERSION
+            or (
+                event.event_schema_version not in {1, EVENT_SCHEMA_VERSION}
+                if persisted
+                else event.event_schema_version != EVENT_SCHEMA_VERSION
+            )
         ):
             raise DecisionLogUnreadable("decision event has an unsupported schema version")
         DecisionLog._validate_identity(event.repository, event.issue)
@@ -390,11 +482,21 @@ class DecisionLog:
         ):
             if not isinstance(value, str) or not value.strip():
                 raise DecisionLogUnreadable("decision event authority metadata is invalid")
-        for digest in (event.artifact_digest, event.parent_digest):
+        for digest in (
+            event.artifact_digest,
+            event.parent_digest,
+            event.constraint_digest,
+            event.previous_contract_digest,
+            event.revision_request_digest,
+        ):
             if digest is not None and (
                 not isinstance(digest, str) or _DIGEST_RE.fullmatch(digest) is None
             ):
                 raise DecisionLogUnreadable("decision event digest metadata is invalid")
+        if (event.previous_contract_digest is None) != (
+            event.revision_request_digest is None
+        ):
+            raise DecisionLogUnreadable("decision event lineage metadata is invalid")
         if not isinstance(event.findings, tuple) or not isinstance(
             event.proof_obligations, tuple
         ):

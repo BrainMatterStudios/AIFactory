@@ -3,7 +3,7 @@
   "max_file_bytes": 1048576,
   "forbidden_paths": [
     {"rule": "path.private-state", "detail": "tracked private agent state is forbidden", "pattern": "(?i)(?:^|/)\\.(?:ai|factory)(?:/|$)"},
-    {"rule": "path.private-report", "detail": "tracked transcript, evidence, or generated report is forbidden", "pattern": "(?i)(?:^|/)[^/]*(?<![A-Za-z0-9])(?:transcripts?|evidence|reports?)(?![A-Za-z0-9])[^/]*(?:/|$)"},
+    {"rule": "path.private-report", "detail": "tracked transcript, evidence, or generated report is forbidden", "pattern": "(?i)(?:^|/)(?:(?:transcripts?|evidence|reports?)(?:/|$)|(?![^/]*\\.py$)[^/]*(?<![A-Za-z0-9])(?:transcripts?|evidence|reports?)(?![A-Za-z0-9])[^/]*(?:/|$))"},
     {"rule": "path.issue-export", "detail": "tracked issue export is forbidden", "pattern": "(?i)(?:^|/)exports?/(?:issues?|tickets?)(?:[./_-]|$)"},
     {"rule": "path.database-export", "detail": "tracked database export is forbidden", "pattern": "(?i)(?:^|/)exports?/(?:database|db|schema)(?:[./_-]|$)"},
     {"rule": "path.metric-export", "detail": "tracked metric export is forbidden", "pattern": "(?i)(?:^|/)exports?/(?:metrics?|telemetry)(?:[./_-]|$)"},
@@ -15,19 +15,42 @@
     {"rule": "secret.credential", "detail": "credential or token shape is forbidden", "pattern": "(?i)(?:\\bAKIA[0-9A-Z]{16}\\b|\\bgh[pousr]_[A-Za-z0-9]{20,}\\b|\\b(?:sk-ant-|sk-or-v1-|gsk_|sk_(?:live|test)_)[A-Za-z0-9_-]{16,}\\b|\\beyJ[A-Za-z0-9_=-]+\\.[A-Za-z0-9_=-]+\\.[A-Za-z0-9_=-]+\\b|\\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|password|secret)\\s*[:=]\\s*[\\\"'][A-Za-z0-9_./+=-]{16,}[\\\"'])"},
     {"rule": "secret.credentialed-dsn", "detail": "credentialed data-source URL is forbidden", "pattern": "(?i)\\b(?:postgres(?:ql)?|mysql|mongodb(?:\\+srv)?|redis)://[^\\s/:]+:[^\\s/@]+@"},
     {"rule": "secret.private-key", "detail": "private-key material is forbidden", "pattern": "-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----"},
-    {"rule": "private.hostname", "detail": "private hostname is forbidden", "pattern": "(?i)(?<![A-Za-z0-9_-])(?:(?:10|127)\\.[0-9.]+|172\\.(?:1[6-9]|2[0-9]|3[01])\\.[0-9.]+|192\\.168\\.[0-9.]+|169\\.254\\.[0-9.]+|(?:[A-Za-z0-9-]+\\.)+internal)(?=$|[:/.\\s\\\"'])"},
+    {"rule": "private.hostname", "detail": "private hostname is forbidden", "pattern": "(?i)(?<![A-Za-z0-9_-])(?:(?:(?:10|127)\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|172\\.(?:1[6-9]|2[0-9]|3[01])\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|192\\.168\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|169\\.254\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9]))(?!\\.[0-9])(?=$|[^A-Za-z0-9_-])|(?:[A-Za-z0-9-]+\\.)+internal(?=$|[:/.\\s\\\"']))"},
     {"rule": "private.account-id", "detail": "account identifier shape is forbidden", "pattern": "(?i)(?:\\baccount[_ -]?id\\s*[:=]\\s*[\\\"']?[0-9]{10,20}\\b|\\barn:aws[a-z-]*:[^:\\s]*:[^:\\s]*:[0-9]{12}:)"},
-    {"rule": "private.internal-url", "detail": "internal URL is forbidden", "pattern": "(?i)https?://(?:localhost|(?:10|127)\\.[0-9.]+|172\\.(?:1[6-9]|2[0-9]|3[01])\\.[0-9.]+|192\\.168\\.[0-9.]+|169\\.254\\.[0-9.]+|\\[?::1\\]?|[^/\\s]+\\.internal)(?=[:/\\s]|$)"},
+    {"rule": "private.internal-url", "detail": "internal URL is forbidden", "pattern": "(?i)https?://(?:localhost|(?:(?:10|127)\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|172\\.(?:1[6-9]|2[0-9]|3[01])\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|192\\.168\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|169\\.254\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9]))|\\[?::1\\]?|[^/\\s]+\\.internal)(?=[:/\\s]|$)"},
     {"rule": "private.absolute-path", "detail": "private absolute filesystem path is forbidden", "pattern": "(?:(?<![A-Za-z0-9_])/(?:Users|home)/[^/\\s]+/[^\\s]+|[A-Za-z]:\\\\Users\\\\[^\\s]+)"}
   ],
   "binary_allowlist": [],
   "third_party_allowlist": [],
   "content_allowlist": [
     {
+      "path": "software_factory/execution/assets/leash.cedar",
+      "git_mode": "100644",
+      "object_type": "blob",
+      "sha256": "8af17b1ed7d1b86b1e79494f13f3a71b3afe3d7a4a7b5708c36d01315a24c8f3",
+      "license": "Apache-2.0",
+      "source": "project-original:validation-cell-security-controls-v1",
+      "rule_ids": [
+        "private.hostname"
+      ]
+    },
+    {
+      "path": "software_factory/execution/bridge.py",
+      "git_mode": "100644",
+      "object_type": "blob",
+      "sha256": "6693c12614cfc4ac0eeb5e7637b9d26ba9955b93076b6edd5c3e6e6c090bc286",
+      "license": "Apache-2.0",
+      "source": "project-original:validation-cell-security-controls-v1",
+      "rule_ids": [
+        "private.absolute-path",
+        "private.hostname"
+      ]
+    },
+    {
       "path": "tests/fixtures/synthetic_sensitive_values.py",
       "git_mode": "100644",
       "object_type": "blob",
-      "sha256": "14897e0de1b5e3f6b1e6c1ab7656c33291d4cc91410c6fad1b30fcadffcae5bd",
+      "sha256": "9e52c8a64e752db3c151ea1def6621cc1e4551bf9d6a61f6f68bfd0aa8232483",
       "license": "Apache-2.0",
       "source": "project-original:synthetic-sensitive-values-v1",
       "rule_ids": [
@@ -38,6 +61,29 @@
         "secret.credential",
         "secret.credentialed-dsn",
         "secret.private-key"
+      ]
+    },
+    {
+      "path": "tests/test_execution_bridge.py",
+      "git_mode": "100644",
+      "object_type": "blob",
+      "sha256": "3c4ef9a6ce2f4758c85175865a446b59bcd384c7093b6611cd96f7a1a851805f",
+      "license": "Apache-2.0",
+      "source": "project-original:validation-cell-security-controls-v1",
+      "rule_ids": [
+        "private.hostname"
+      ]
+    },
+    {
+      "path": "tests/test_validation_cell_assets.py",
+      "git_mode": "100644",
+      "object_type": "blob",
+      "sha256": "ebfed176f747e53202007423ae4d9bf839c7d7752df7b280f2668a0101127ff7",
+      "license": "Apache-2.0",
+      "source": "project-original:validation-cell-security-controls-v1",
+      "rule_ids": [
+        "private.hostname",
+        "private.internal-url"
       ]
     }
   ]

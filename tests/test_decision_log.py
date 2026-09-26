@@ -13,15 +13,34 @@ import pytest
 
 from software_factory.core.contracts import artifact_sha256, canonical_json_bytes
 from software_factory.trace import DecisionEvent, DecisionLog, DecisionLogUnreadable
+from software_factory.trace.decisions import EVENT_SCHEMA_VERSION
 from tests.fixtures.synthetic_sensitive_values import OPENROUTER_ASSIGNMENT
 
 ARTIFACT_DIGEST = "a" * 64
 PARENT_DIGEST = "b" * 64
+CONSTRAINT_DIGEST = "c" * 64
+PREVIOUS_CONTRACT_DIGEST = "d" * 64
+REVISION_REQUEST_DIGEST = "f" * 64
+
+_SCHEMA_1_FIXTURE = (
+    b'{"artifact_digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+    b'"authority":"policy","config_version":"factory-v2","disposition":"PASS",'
+    b'"event_digest":"a321dac5bd4c309dc409711671697d3820ce0a042dc193a63d46673d96474e5c",'
+    b'"event_schema_version":1,"findings":[{"detail":"bounded","rule":"intent.scope"}],'
+    b'"issue":"42","parent_digest":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",'
+    b'"policy_version":"intent-v1","previous_event_digest":null,'
+    b'"proof_obligations":[{"evidence":["contract"],"rule":"intent.scope"}],'
+    b'"rationale":"Declared intent is complete.","repository":"acme/widgets",'
+    b'"rule":"intent.all-obligations-discharged","run_id":"run-7",'
+    b'"schema_version":"contract-v2","sensor_version":"review-v1",'
+    b'"source_version":"git:1234","stage":"contract-gate",'
+    b'"timestamp":"2026-08-05T12:00:00Z"}\n'
+)
 
 
 def _event(**overrides) -> DecisionEvent:
     values = {
-        "event_schema_version": 1,
+        "event_schema_version": EVENT_SCHEMA_VERSION,
         "repository": "acme/widgets",
         "issue": "42",
         "run_id": "run-7",
@@ -40,6 +59,9 @@ def _event(**overrides) -> DecisionEvent:
         "rationale": "Declared intent is complete.",
         "disposition": "PASS",
         "rule": "intent.all-obligations-discharged",
+        "constraint_digest": CONSTRAINT_DIGEST,
+        "previous_contract_digest": PREVIOUS_CONTRACT_DIGEST,
+        "revision_request_digest": REVISION_REQUEST_DIGEST,
     }
     values.update(overrides)
     return DecisionEvent(**values)
@@ -55,13 +77,26 @@ def _lines(path):
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
+def _rewrite_record(path, mutate):
+    record = _lines(path)[0]
+    mutate(record)
+    if "event_digest" in record:
+        record["event_digest"] = artifact_sha256(
+            {key: value for key, value in record.items() if key != "event_digest"}
+        )
+    path.write_bytes(canonical_json_bytes(record) + b"\n")
+
+
 def test_append_hashes_canonical_event_and_round_trips_immutable_data(tmp_path):
     """Changing canonical hashing, persistence, or return mutability breaks replay authority."""
     store = DecisionLog(tmp_path)
 
     persisted = store.append(_event())
 
-    assert persisted.event_digest == "a321dac5bd4c309dc409711671697d3820ce0a042dc193a63d46673d96474e5c"
+    assert persisted.event_schema_version == 2
+    assert persisted.event_digest == (
+        "26c20cb14593820cb28271a3b331d5024b6066131b4087e3e68884ea5e46c689"
+    )
     assert persisted.previous_event_digest is None
     assert store.read_verified(repository="acme/widgets", issue="42") == (persisted,)
     assert isinstance(persisted.findings, tuple)
@@ -70,6 +105,63 @@ def test_append_hashes_canonical_event_and_round_trips_immutable_data(tmp_path):
         persisted.rule = "changed"
     with pytest.raises(TypeError):
         persisted.findings[0]["rule"] = "changed"
+
+
+def test_schema_2_serializes_complete_constraint_lineage(tmp_path):
+    """Omitting a nullable key would make absence indistinguishable from old evidence."""
+    store = DecisionLog(tmp_path)
+
+    persisted = store.append(_event())
+    record = _lines(_only_log(tmp_path))[0]
+
+    assert record["event_schema_version"] == 2
+    assert record["constraint_digest"] == CONSTRAINT_DIGEST
+    assert record["previous_contract_digest"] == PREVIOUS_CONTRACT_DIGEST
+    assert record["revision_request_digest"] == REVISION_REQUEST_DIGEST
+    assert persisted.constraint_digest == CONSTRAINT_DIGEST
+    assert persisted.previous_contract_digest == PREVIOUS_CONTRACT_DIGEST
+    assert persisted.revision_request_digest == REVISION_REQUEST_DIGEST
+
+
+def test_fixed_schema_1_fixture_replays_without_rewriting_bytes(tmp_path):
+    """A schema upgrade must verify historical bytes with their original digest surface."""
+    store = DecisionLog(tmp_path)
+    path = store.path_for(repository="acme/widgets", issue="42")
+    path.parent.mkdir(parents=True, mode=0o700)
+    path.write_bytes(_SCHEMA_1_FIXTURE)
+    path.chmod(0o600)
+
+    history = store.read_verified(repository="acme/widgets", issue="42")
+
+    assert path.read_bytes() == _SCHEMA_1_FIXTURE
+    assert len(history) == 1
+    assert history[0].event_schema_version == 1
+    assert history[0].event_digest == (
+        "a321dac5bd4c309dc409711671697d3820ce0a042dc193a63d46673d96474e5c"
+    )
+    assert history[0].constraint_digest is None
+    assert history[0].previous_contract_digest is None
+    assert history[0].revision_request_digest is None
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda record: record.pop("constraint_digest"),
+        lambda record: record.__setitem__("constraint_digest", "C" * 64),
+        lambda record: record.__setitem__("previous_contract_digest", None),
+    ),
+    ids=("missing-key", "malformed-digest", "unpaired-lineage"),
+)
+def test_schema_2_rejects_incomplete_or_invalid_constraint_lineage(tmp_path, mutate):
+    """A valid self-digest must not bless an incomplete schema-2 authority record."""
+    store = DecisionLog(tmp_path)
+    store.append(_event())
+    path = _only_log(tmp_path)
+    _rewrite_record(path, mutate)
+
+    with pytest.raises(DecisionLogUnreadable, match=r"corrupt|digest|lineage"):
+        store.read_verified(repository="acme/widgets", issue="42")
 
 
 def test_each_append_chains_to_the_verified_previous_event(tmp_path):
@@ -83,6 +175,22 @@ def test_each_append_chains_to_the_verified_previous_event(tmp_path):
 
     assert second.previous_event_digest == first.event_digest
     assert len(store.read_verified(repository="acme/widgets", issue="42")) == 2
+
+
+def test_verified_snapshot_binds_history_to_the_opened_file_identity(tmp_path):
+    store = DecisionLog(tmp_path)
+    store.append(_event())
+
+    first = store.read_verified_snapshot(repository="acme/widgets", issue="42")
+    path = _only_log(tmp_path)
+    replacement = path.with_suffix(".replacement")
+    replacement.write_bytes(path.read_bytes())
+    replacement.chmod(0o600)
+    os.replace(replacement, path)
+    second = store.read_verified_snapshot(repository="acme/widgets", issue="42")
+
+    assert second.events == first.events
+    assert second != first
 
 
 def test_redacts_nested_strings_before_hashing_and_writing(tmp_path):

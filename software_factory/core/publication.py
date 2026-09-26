@@ -76,9 +76,16 @@ _PROVENANCE_KEYS = frozenset(
 _LOWER_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_POLICY_BYTES = 1024 * 1024
 _MAX_FILE_BYTES = 1048576
+_IPV4_OCTET = r"(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])"
+_PRIVATE_IPV4 = (
+    rf"(?:(?:10|127)\.{_IPV4_OCTET}\.{_IPV4_OCTET}\.{_IPV4_OCTET}"
+    rf"|172\.(?:1[6-9]|2[0-9]|3[01])\.{_IPV4_OCTET}\.{_IPV4_OCTET}"
+    rf"|192\.168\.{_IPV4_OCTET}\.{_IPV4_OCTET}"
+    rf"|169\.254\.{_IPV4_OCTET}\.{_IPV4_OCTET})"
+)
 _CANONICAL_PATH_RULES = (
     ("path.private-state", "tracked private agent state is forbidden", r"(?i)(?:^|/)\.(?:ai|factory)(?:/|$)"),
-    ("path.private-report", "tracked transcript, evidence, or generated report is forbidden", r"(?i)(?:^|/)[^/]*(?<![A-Za-z0-9])(?:transcripts?|evidence|reports?)(?![A-Za-z0-9])[^/]*(?:/|$)"),
+    ("path.private-report", "tracked transcript, evidence, or generated report is forbidden", r"(?i)(?:^|/)(?:(?:transcripts?|evidence|reports?)(?:/|$)|(?![^/]*\.py$)[^/]*(?<![A-Za-z0-9])(?:transcripts?|evidence|reports?)(?![A-Za-z0-9])[^/]*(?:/|$))"),
     ("path.issue-export", "tracked issue export is forbidden", r"(?i)(?:^|/)exports?/(?:issues?|tickets?)(?:[./_-]|$)"),
     ("path.database-export", "tracked database export is forbidden", r"(?i)(?:^|/)exports?/(?:database|db|schema)(?:[./_-]|$)"),
     ("path.metric-export", "tracked metric export is forbidden", r"(?i)(?:^|/)exports?/(?:metrics?|telemetry)(?:[./_-]|$)"),
@@ -90,9 +97,9 @@ _CANONICAL_CONTENT_RULES = (
     ("secret.credential", "credential or token shape is forbidden", r"(?i)(?:\bAKIA[0-9A-Z]{16}\b|\bgh[pousr]_[A-Za-z0-9]{20,}\b|\b(?:sk-ant-|sk-or-v1-|gsk_|sk_(?:live|test)_)[A-Za-z0-9_-]{16,}\b|\beyJ[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+\.[A-Za-z0-9_=-]+\b|\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|password|secret)\s*[:=]\s*[\"'][A-Za-z0-9_./+=-]{16,}[\"'])"),
     ("secret.credentialed-dsn", "credentialed data-source URL is forbidden", r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^\s/:]+:[^\s/@]+@"),
     ("secret.private-key", "private-key material is forbidden", r"-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----"),
-    ("private.hostname", "private hostname is forbidden", r"(?i)(?<![A-Za-z0-9_-])(?:(?:10|127)\.[0-9.]+|172\.(?:1[6-9]|2[0-9]|3[01])\.[0-9.]+|192\.168\.[0-9.]+|169\.254\.[0-9.]+|(?:[A-Za-z0-9-]+\.)+internal)(?=$|[:/.\s\"'])"),
+    ("private.hostname", "private hostname is forbidden", rf"(?i)(?<![A-Za-z0-9_-])(?:{_PRIVATE_IPV4}(?!\.[0-9])(?=$|[^A-Za-z0-9_-])|(?:[A-Za-z0-9-]+\.)+internal(?=$|[:/.\s\"']))"),
     ("private.account-id", "account identifier shape is forbidden", r"(?i)(?:\baccount[_ -]?id\s*[:=]\s*[\"']?[0-9]{10,20}\b|\barn:aws[a-z-]*:[^:\s]*:[^:\s]*:[0-9]{12}:)"),
-    ("private.internal-url", "internal URL is forbidden", r"(?i)https?://(?:localhost|(?:10|127)\.[0-9.]+|172\.(?:1[6-9]|2[0-9]|3[01])\.[0-9.]+|192\.168\.[0-9.]+|169\.254\.[0-9.]+|\[?::1\]?|[^/\s]+\.internal)(?=[:/\s]|$)"),
+    ("private.internal-url", "internal URL is forbidden", rf"(?i)https?://(?:localhost|{_PRIVATE_IPV4}|\[?::1\]?|[^/\s]+\.internal)(?=[:/\s]|$)"),
     ("private.absolute-path", "private absolute filesystem path is forbidden", r"(?:(?<![A-Za-z0-9_])/(?:Users|home)/[^/\s]+/[^\s]+|[A-Za-z]:\\Users\\[^\s]+)"),
 )
 _TRUSTED_SECRET_PATTERNS = tuple(re.compile(pattern) for pattern in DEFAULT_SECRET_PATTERNS)
@@ -110,6 +117,21 @@ _SYNTHETIC_FIXTURE_RULES = (
     "secret.credentialed-dsn",
     "secret.private-key",
 )
+_SECURITY_CONTROL_APPROVAL_SOURCE = (
+    "project-original:validation-cell-security-controls-v1"
+)
+_SECURITY_CONTROL_APPROVAL_RULES = {
+    "software_factory/execution/assets/leash.cedar": ("private.hostname",),
+    "software_factory/execution/bridge.py": (
+        "private.absolute-path",
+        "private.hostname",
+    ),
+    "tests/test_execution_bridge.py": ("private.hostname",),
+    "tests/test_validation_cell_assets.py": (
+        "private.hostname",
+        "private.internal-url",
+    ),
+}
 
 
 def _object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -238,13 +260,17 @@ def _load_provenance(value: Any, where: str) -> tuple[_Provenance, ...]:
             "third_party_allowlist approvals must name only the provenance rule"
         )
     if where == "content_allowlist":
-        if len(loaded) != 1:
+        if tuple(entry.path for entry in loaded) != tuple(
+            sorted(entry.path for entry in loaded)
+        ):
             raise PublicationPolicyError(
-                "content_allowlist must contain the one canonical synthetic fixture"
+                "content_allowlist must be in canonical path order"
             )
-        approval = loaded[0]
+        approvals = {entry.path: entry for entry in loaded}
+        approval = approvals.get(_SYNTHETIC_FIXTURE_PATH)
         if (
-            approval.path != _SYNTHETIC_FIXTURE_PATH
+            approval is None
+            or approval.path != _SYNTHETIC_FIXTURE_PATH
             or approval.git_mode != "100644"
             or approval.object_type != "blob"
             or approval.license != "Apache-2.0"
@@ -254,6 +280,21 @@ def _load_provenance(value: Any, where: str) -> tuple[_Provenance, ...]:
             raise PublicationPolicyError(
                 "content_allowlist differs from the canonical synthetic fixture approval"
             )
+        for entry in loaded:
+            if entry.path == _SYNTHETIC_FIXTURE_PATH:
+                continue
+            expected_rules = _SECURITY_CONTROL_APPROVAL_RULES.get(entry.path)
+            if (
+                expected_rules is None
+                or entry.git_mode != "100644"
+                or entry.object_type != "blob"
+                or entry.license != "Apache-2.0"
+                or entry.source != _SECURITY_CONTROL_APPROVAL_SOURCE
+                or entry.rule_ids != expected_rules
+            ):
+                raise PublicationPolicyError(
+                    "content_allowlist contains an unapproved security-control authority"
+                )
     return loaded
 
 

@@ -22,6 +22,44 @@ from software_factory.core.design.capabilities import (
 from software_factory.core.design.capability_names import Capability
 from software_factory.core.design.configuration import AnalyzerSpec
 
+LEGACY_CAPABILITY_ASSESSMENT_V1_FIXTURE = {
+    "schema_version": "capability-assessment-v1",
+    "declarations": [
+        {
+            "schema_version": "runner-capability-v1",
+            "source": "a-runner",
+            "capabilities": ["approval_pause"],
+        },
+        {
+            "schema_version": "runner-capability-v1",
+            "source": "z-controller",
+            "capabilities": ["merge_forbidden"],
+        },
+    ],
+    "observations": [
+        {
+            "schema_version": "capability-observation-v1",
+            "source": "a-runner",
+            "confirmed": ["approval_pause"],
+            "failed": [],
+        },
+        {
+            "schema_version": "capability-observation-v1",
+            "source": "z-controller",
+            "confirmed": ["merge_forbidden"],
+            "failed": [],
+        },
+    ],
+    "declared": ["approval_pause", "merge_forbidden"],
+    "confirmed": ["approval_pause", "merge_forbidden"],
+    "failed": [],
+    "effective": ["approval_pause", "merge_forbidden"],
+    "required": ["approval_pause", "merge_forbidden"],
+    "missing": [],
+    "unverifiable": [],
+}
+LEGACY_CAPABILITY_ASSESSMENT_V1_SHA256 = "b29a8821a42090a97b11d8efb12fce94f00fed64635ccb132b17d20a5a9e67ce"
+
 
 def _declaration(source: str, *capabilities: Capability) -> RunnerCapabilityDeclaration:
     return RunnerCapabilityDeclaration(
@@ -268,6 +306,23 @@ def test_capability_document_and_digest_are_deterministic_and_versioned():
     assert document["effective"] == ["approval_pause", "merge_forbidden"]
     assert capability_document(second) == document
     assert capability_sha256(first) == artifact_sha256(document)
+
+
+def test_existing_capability_assessment_v1_fixture_digest_is_unchanged():
+    first = assess_capabilities(
+        declarations=(
+            _declaration("z-controller", Capability.MERGE_FORBIDDEN),
+            _declaration("a-runner", Capability.APPROVAL_PAUSE),
+        ),
+        observations=(
+            _observation("z-controller", confirmed=frozenset({Capability.MERGE_FORBIDDEN})),
+            _observation("a-runner", confirmed=frozenset({Capability.APPROVAL_PAUSE})),
+        ),
+        required=frozenset({Capability.MERGE_FORBIDDEN, Capability.APPROVAL_PAUSE}),
+    )
+
+    assert capability_document(first) == LEGACY_CAPABILITY_ASSESSMENT_V1_FIXTURE
+    assert capability_sha256(first) == LEGACY_CAPABILITY_ASSESSMENT_V1_SHA256
 
 
 def test_assessment_is_an_immutable_record_with_sorted_trusted_inputs():

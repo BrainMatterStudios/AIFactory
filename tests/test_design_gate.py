@@ -22,11 +22,28 @@ from software_factory.core.design.capabilities import (
     assess_capabilities,
 )
 from software_factory.core.design.capability_names import Capability
+from software_factory.core.design.configuration import VerificationCommandSpec
 from software_factory.core.design.gate import (
     DesignGateState,
+    capability_authority_document,
+    capability_authority_from_document,
+    capability_authority_sha256,
     design_gate_document,
     design_gate_sha256,
     evaluate_design_gate,
+    parse_design_config_document,
+)
+from software_factory.core.design.provider_capabilities import (
+    CAPABILITY_CONTEXT_VERSION,
+    PROVIDER_CAPABILITY_DECLARATION_VERSION,
+    PROVIDER_CAPABILITY_OBSERVATION_VERSION,
+    CapabilityContext,
+    ProviderCapabilityDeclaration,
+    ProviderCapabilityObservation,
+    ProviderRole,
+    assess_provider_capabilities,
+    capability_context_sha256,
+    provider_capability_sha256,
 )
 
 from .test_design_ir import valid_design
@@ -153,6 +170,96 @@ def capabilities(
     return assess_capabilities(declarations=declared, observations=observed, required=required)
 
 
+def provider_capabilities(
+    *,
+    required_analyzer: bool = False,
+    parent_digest: str | None = None,
+    config_digest: str | None = None,
+):
+    required = capabilities(required_analyzer=required_analyzer).required
+    if parent_digest is None:
+        parent_digest = artifact_sha256(valid_contract())
+    if config_digest is None:
+        config_digest = artifact_sha256(
+            {
+                "schema_version": "design-config-v1",
+                "design_protocol": "design_ir_v1",
+                "design_author_role": "design-author",
+                "design_analyzers": (
+                    [{"name": "harness", "required": True, "options": {}}]
+                    if required_analyzer
+                    else []
+                ),
+            }
+        )
+    context = CapabilityContext(
+        CAPABILITY_CONTEXT_VERSION,
+        "acme/widgets",
+        "42",
+        parent_digest,
+        config_digest,
+        "3" * 40,
+        "f" * 64,
+    )
+    values_by_role: dict[ProviderRole, set[Capability]] = {}
+    from software_factory.core.design.provider_capabilities import (
+        derive_capability_obligations,
+    )
+
+    for obligation in derive_capability_obligations(required):
+        values_by_role.setdefault(obligation.provider_role, set()).add(
+            obligation.capability
+        )
+    declarations = []
+    observations = []
+    for role, values in values_by_role.items():
+        source = f"test-{role.value}"
+        frozen = frozenset(values)
+        declarations.append(
+            ProviderCapabilityDeclaration(
+                PROVIDER_CAPABILITY_DECLARATION_VERSION,
+                source,
+                role,
+                frozen,
+            )
+        )
+        observations.append(
+            ProviderCapabilityObservation(
+                PROVIDER_CAPABILITY_OBSERVATION_VERSION,
+                source,
+                role,
+                capability_context_sha256(context),
+                frozen,
+                frozenset(),
+            )
+        )
+    return assess_provider_capabilities(
+        context=context,
+        declarations=tuple(declarations),
+        observations=tuple(observations),
+        required=required,
+    )
+
+
+def test_provider_capability_authority_is_native_and_schema_dispatch_is_exact():
+    assessment = provider_capabilities()
+    document = capability_authority_document(assessment)
+
+    assert document["schema_version"] == "provider-capability-assessment-v1"
+    assert capability_authority_from_document(document) == assessment
+    assert capability_authority_sha256(assessment) == provider_capability_sha256(
+        assessment
+    )
+    assert any(
+        item["provider_role"] == "executor" for item in document["obligations"]
+    )
+
+    hybrid = dict(document)
+    hybrid["declared"] = []
+    with pytest.raises(ValueError, match=r"fields|schema|invalid"):
+        capability_authority_from_document(hybrid)
+
+
 def execution(
     *findings: Finding,
     name: str = "harness",
@@ -260,6 +367,24 @@ def rules(result) -> set[str]:
     return {item.id for item in result.findings}
 
 
+def v2_config_document() -> dict:
+    return {
+        "schema_version": "design-config-v2",
+        "design_protocol": "design_ir_v1",
+        "design_author_role": "design-author",
+        "design_analyzers": [],
+        "capability_providers": [],
+        "execution_policy": {
+            "implementation_writable_paths": [],
+            "verification_commands": [],
+            "network_profile": "default",
+        },
+        "workspace_adapter": None,
+        "publication_mode": "pull_request",
+        "local_artifact_root": None,
+    }
+
+
 def test_valid_exact_inputs_pass_without_creating_approval_authority():
     result = evaluate(analyzers=(execution(),))
 
@@ -268,6 +393,15 @@ def test_valid_exact_inputs_pass_without_creating_approval_authority():
     assert document["authority"] == "deterministic-controller"
     assert "approval" not in document
     assert design_gate_sha256(result) == artifact_sha256(document)
+
+
+def test_design_config_v2_rejects_legacy_all_capability_authority():
+    config = v2_config_document()
+
+    result = evaluate(config_document=config, assessment=capabilities())
+
+    assert result.state is DesignGateState.BLOCK
+    assert "capability.protocol-mismatch" in rules(result)
 
 
 def test_contract_pass_does_not_invent_an_approval_requirement():
@@ -521,6 +655,99 @@ def test_design_config_digest_claim_is_recomputed():
 
     assert result.state is DesignGateState.BLOCK
     assert "config.digest" in rules(result)
+
+
+def test_design_config_v2_round_trips_complete_authority_configuration():
+    document = {
+        "schema_version": "design-config-v2",
+        "design_protocol": "design_ir_v1",
+        "design_author_role": "design-author",
+        "design_analyzers": [
+            {"name": "harness", "required": True, "options": {"mode": "strict"}}
+        ],
+        "capability_providers": [
+            {"name": "cell-executor", "options": {"instance": "validation"}},
+            {"name": "cell-verifier", "options": {}},
+        ],
+        "execution_policy": {
+            "implementation_writable_paths": ["src", "tests"],
+            "verification_commands": [
+                {
+                    "name": "unit",
+                    "argv": ["python", "-m", "pytest", "-q"],
+                    "expected_exit": "zero",
+                    "environment_profile": "default",
+                }
+            ],
+            "network_profile": "model-api-only",
+        },
+        "workspace_adapter": {"provider": "git-worktree", "options": {}},
+        "publication_mode": "local_bundle",
+        "local_artifact_root": "controller_state",
+    }
+
+    rebuilt, analyzers = parse_design_config_document(document)
+
+    assert rebuilt == document
+    assert tuple(spec.name for spec in analyzers) == ("harness",)
+
+
+def test_verification_environment_profiles_remain_project_neutral() -> None:
+    with pytest.raises(ValueError, match=r"environment_profile must be default$"):
+        VerificationCommandSpec(
+            "unit",
+            ("python", "-m", "pytest", "-q"),
+            "zero",
+            "target-specific",
+        )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda document: document.update(schema_version="design-config-v1"),
+        lambda document: document.update(extra=True),
+        lambda document: document["capability_providers"].append(
+            {"name": "cell-executor", "options": {}}
+        ),
+        lambda document: document["execution_policy"]["verification_commands"][0].update(
+            argv="pytest -q"
+        ),
+        lambda document: document.update(
+            workspace_adapter={"provider": "git-worktree", "options": {}, "unknown": True}
+        ),
+        lambda document: document.update(publication_mode="local_bundle"),
+        lambda document: document.update(local_artifact_root="controller_state"),
+        lambda document: document.update(publication_mode=True),
+    ],
+)
+def test_design_config_v2_rejects_schema_mixing_and_noncanonical_authority(mutate):
+    document = {
+        "schema_version": "design-config-v2",
+        "design_protocol": "design_ir_v1",
+        "design_author_role": "design-author",
+        "design_analyzers": [],
+        "capability_providers": [{"name": "cell-executor", "options": {}}],
+        "execution_policy": {
+            "implementation_writable_paths": ["src"],
+            "verification_commands": [
+                {
+                    "name": "unit",
+                    "argv": ["pytest", "-q"],
+                    "expected_exit": "zero",
+                    "environment_profile": "default",
+                }
+            ],
+            "network_profile": "default",
+        },
+        "workspace_adapter": None,
+        "publication_mode": "pull_request",
+        "local_artifact_root": None,
+    }
+    mutate(document)
+
+    with pytest.raises(ValueError, match="design config"):
+        parse_design_config_document(document)
 
 
 @pytest.mark.parametrize(

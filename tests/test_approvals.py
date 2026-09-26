@@ -180,10 +180,35 @@ def test_digest_validation_rejects_noncanonical_sha256_values(tmp_path, digest):
         ApprovalStore(tmp_path).approve(_record(artifact_digest=digest))
 
 
-def test_contract_cannot_carry_a_parent_digest(tmp_path):
-    """A contract approval has no parent authority to bind."""
-    with pytest.raises(ApprovalError, match="contract"):
-        ApprovalStore(tmp_path).approve(_record(parent_digest=CONTRACT_DIGEST))
+def test_contract_approval_round_trips_with_exact_constraint_parent(tmp_path):
+    """Changing a constrained contract's parent must revoke its authority."""
+    store = ApprovalStore(tmp_path)
+    record = _record(parent_digest=PLAN_DIGEST)
+
+    store.approve(record)
+
+    assert store.require(
+        repository="acme/widgets",
+        issue="42",
+        artifact_kind=ArtifactKind.CONTRACT,
+        artifact_digest=CONTRACT_DIGEST,
+        parent_digest=PLAN_DIGEST,
+    ) == record
+    with pytest.raises(ApprovalError, match="does not match"):
+        store.require(
+            repository="acme/widgets",
+            issue="42",
+            artifact_kind=ArtifactKind.CONTRACT,
+            artifact_digest=CONTRACT_DIGEST,
+            parent_digest=OTHER_PLAN_DIGEST,
+        )
+
+
+@pytest.mark.parametrize("parent", ["C" * 64, "c" * 63, "c" * 65, "not-a-digest"])
+def test_contract_approval_rejects_malformed_constraint_parent(tmp_path, parent):
+    """Only canonical SHA-256 constraint identities may parent a contract."""
+    with pytest.raises(ApprovalError, match="SHA-256"):
+        ApprovalStore(tmp_path).approve(_record(parent_digest=parent))
 
 
 def test_plan_cannot_omit_its_parent_digest(tmp_path):
@@ -266,6 +291,54 @@ def test_corrupt_approval_json_is_not_treated_as_missing(tmp_path):
             artifact_digest=CONTRACT_DIGEST,
             parent_digest=None,
         )
+
+
+def test_recursive_approval_json_is_fixed_corrupt_authority(tmp_path):
+    """A bounded recursive document cannot escape as a raw parser failure."""
+    store = ApprovalStore(tmp_path)
+    store.approve(_record())
+    raw = (
+        b'{"SECRET-DEEP-APPROVAL":'
+        + (b"[" * 10_000)
+        + b"0"
+        + (b"]" * 10_000)
+        + b"}"
+    )
+    assert len(raw) < 1024 * 1024
+    _only_approval_file(tmp_path).write_bytes(raw)
+
+    with pytest.raises(ApprovalError) as caught:
+        store.require(
+            repository="acme/widgets",
+            issue="42",
+            artifact_kind=ArtifactKind.CONTRACT,
+            artifact_digest=CONTRACT_DIGEST,
+            parent_digest=None,
+        )
+
+    assert str(caught.value) == "approval authority is corrupt"
+    assert "SECRET" not in str(caught.value)
+
+
+def test_large_integer_approval_json_is_fixed_corrupt_authority(tmp_path):
+    """A bounded oversized integer cannot escape as a raw parser failure."""
+    store = ApprovalStore(tmp_path)
+    store.approve(_record())
+    raw = b'{"SECRET-LARGE-INTEGER":' + (b"9" * 10_000) + b"}"
+    assert len(raw) < 1024 * 1024
+    _only_approval_file(tmp_path).write_bytes(raw)
+
+    with pytest.raises(ApprovalError) as caught:
+        store.require(
+            repository="acme/widgets",
+            issue="42",
+            artifact_kind=ArtifactKind.CONTRACT,
+            artifact_digest=CONTRACT_DIGEST,
+            parent_digest=None,
+        )
+
+    assert str(caught.value) == "approval authority is corrupt"
+    assert "SECRET" not in str(caught.value)
 
 
 def test_wrong_schema_version_is_rejected(tmp_path):

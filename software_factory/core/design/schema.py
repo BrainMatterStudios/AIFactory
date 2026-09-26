@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -58,6 +59,211 @@ _VALID_STATUSES = frozenset({"open", "resolved", "delegated"})
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _RFC3339_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
 _JSON_TRANSPORT_WHITESPACE = " \t\r\n"
+_DIAGNOSTIC_CODE_LIMIT = 10
+_DIAGNOSTIC_FIELDS = frozenset(
+    _TOP_LEVEL_KEYS.union(*(keys for keys in _RECORD_KEYS.values()))
+)
+_DIAGNOSTIC_FIELD_PATTERN = "|".join(
+    re.escape(field) for field in sorted(_DIAGNOSTIC_FIELDS, key=len, reverse=True)
+)
+_DIAGNOSTIC_COLLECTION_PATTERN = "|".join(
+    re.escape(collection) for collection in sorted(_RECORD_COLLECTIONS, key=len, reverse=True)
+)
+_DIAGNOSTIC_PATH_RE = re.compile(
+    rf"^(?:document|(?:{_DIAGNOSTIC_FIELD_PATTERN})(?:\[\d+\])?|"
+    rf"(?:{_DIAGNOSTIC_COLLECTION_PATTERN})(?:\[\d+\])?"
+    rf"(?:\.(?:{_DIAGNOSTIC_FIELD_PATTERN})(?:\[\d+\])?)?)$"
+)
+_MISSING_FIELD_RE = re.compile(r"missing required field '([a-z_]+)'$")
+
+
+def _authoring_values(values: Iterable[object]) -> str:
+    """Render a deterministic comma-separated schema vocabulary."""
+    return ", ".join(sorted(str(value) for value in values))
+
+
+def design_ir_authoring_schema_guide() -> str:
+    """Render the strict Design IR v1 shape for an external design author.
+
+    The guide derives exact key sets and closed vocabularies from the same
+    authorities used by validation so prompt guidance cannot silently omit a
+    newly required field or accepted enum value.
+    """
+    lines = [
+        "Design IR v1 authoring schema:",
+        (
+            "Top-level exact keys (all required; no extras): "
+            f"{_authoring_values(_TOP_LEVEL_KEYS)}."
+        ),
+        "Top-level value rules:",
+        "- `schema_version` is the JSON integer 1 (not a boolean or string).",
+        (
+            "- `issue` is the exact issue identity string shown below, `repo` is the "
+            "exact accepted Contract `repo` string, and `summary` is a non-empty "
+            "normalized string."
+        ),
+        "- `generated_at` is an RFC 3339 UTC timestamp ending in `Z`.",
+        "- `tier` is exactly `T2`.",
+        "- `parent_contract_digest` is exactly the accepted lowercase 64-hex digest.",
+        (
+            "- `required_capabilities` is a duplicate-free array of strings; "
+            f"required_capabilities values: "
+            f"{_authoring_values(capability.value for capability in Capability)}."
+        ),
+        (
+            "- `components`, `interfaces`, `data_flows`, `security_boundaries`, "
+            "`deployment_assumptions`, `decisions`, `risks`, `open_questions`, and "
+            "`traceability` are arrays and are required even when empty."
+        ),
+        "Record shapes (every listed key is required; no extra keys):",
+    ]
+    for collection in _RECORD_COLLECTIONS:
+        lines.append(
+            f"- {collection} exact keys: {_authoring_values(_RECORD_KEYS[collection])}."
+        )
+    lines.extend(
+        [
+            "Record value rules:",
+            (
+                "- Every record field other than open-question `resolution` and "
+                "`authority` uses the exact JSON type implied below; all strings are "
+                "non-empty, normalized, and free of control characters."
+            ),
+            (
+                "- `components`: `id`, `name`, `responsibility`, and "
+                "`security_boundary` are strings; `depends_on` and `interfaces` are "
+                "duplicate-free arrays of string IDs."
+            ),
+            (
+                "- `interfaces`: `id`, `name`, `producer`, `input_contract`, "
+                "`output_contract`, and `failure_contract` are strings; `consumers` is "
+                "a duplicate-free array of endpoint IDs."
+            ),
+            (
+                "- `data_flows`: every field is a string; classification values: "
+                f"{_authoring_values(_VALID_CLASSIFICATIONS)}."
+            ),
+            (
+                "- `security_boundaries`: `id`, `name`, and `failure_response` are "
+                "strings; `assets`, `trust_assumptions`, and `controls` are "
+                "duplicate-free arrays of strings."
+            ),
+            (
+                "- `deployment_assumptions`: `id`, `assumption`, `validation`, and "
+                "`evidence_obligation` are strings."
+            ),
+            (
+                "- `decisions`: `id`, `question`, `choice`, and `rationale` are strings; "
+                "`alternatives` and `consequences` are duplicate-free arrays of strings."
+            ),
+            (
+                "- `risks`: `id`, `condition`, `impact`, `mitigation`, and "
+                "`evidence_obligation` are strings."
+            ),
+            (
+                "- `open_questions`: `id` and `question` are strings; `resolution` and "
+                "`authority` follow the lifecycle rules below."
+            ),
+            f"- severity values: {_authoring_values(_VALID_SEVERITIES)}.",
+            f"- status values: {_authoring_values(_VALID_STATUSES)}.",
+            (
+                "Open questions with status `open` require null `resolution` and "
+                "`authority`. Status `resolved` requires a non-empty string `resolution` "
+                "and permits a string or null `authority`. Status `delegated` requires "
+                "non-empty string `resolution` and `authority`."
+            ),
+            (
+                "- `traceability`: `contract_id` is a string; `design_refs` is a "
+                "duplicate-free array of design record IDs; `evidence_obligations` is a "
+                "duplicate-free array of strings."
+            ),
+            "Identity and reference rules:",
+            (
+                "- IDs are non-empty normalized strings, at most 256 UTF-8 bytes, not "
+                "absolute paths, and contain no backslash or `..` path segment. IDs are "
+                "globally unique across all collections except `traceability`."
+            ),
+            (
+                "- Component `depends_on`, component `interfaces`, "
+                "component `security_boundary`, interface endpoints, data-flow endpoints, "
+                "and traceability `design_refs` must reference the corresponding records. "
+                "All references must resolve."
+            ),
+            (
+                "- Interface and data-flow endpoints reference component IDs. External "
+                "endpoints use `external.<name>` with a non-empty name."
+            ),
+            (
+                "- Arrays contain at most 1000 records, duplicate values are forbidden, "
+                "and the complete canonical JSON document must not exceed 2 MiB."
+            ),
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _safe_diagnostic_path(error: str) -> str:
+    candidate, separator, detail = error.partition(": ")
+    if not separator or _DIAGNOSTIC_PATH_RE.fullmatch(candidate) is None:
+        candidate = "document"
+    missing = _MISSING_FIELD_RE.search(detail)
+    if missing is not None and missing.group(1) in _DIAGNOSTIC_FIELDS:
+        field = missing.group(1)
+        candidate = field if candidate == "document" else f"{candidate}.{field}"
+    return candidate
+
+
+def _safe_diagnostic_rule(error: str) -> str:
+    if "missing required field" in error:
+        return "missing-field"
+    if "unknown field" in error:
+        return "unknown-field"
+    if error.startswith("duplicate record id:"):
+        return "duplicate-id"
+    if "unresolved " in error and " reference " in error:
+        return "unresolved-reference"
+    if "must be one of" in error:
+        return "enum"
+    if error.startswith("schema_version: expected 1,"):
+        return "schema-version"
+    if ": expected " in error and ", got " in error:
+        return "type"
+    if "must be RFC 3339 UTC ending in Z" in error:
+        return "timestamp"
+    if "must be lowercase 64-hex" in error:
+        return "digest"
+    if "must not contain duplicate values" in error:
+        return "duplicate-values"
+    if "must not be absolute or escaping" in error:
+        return "unsafe-id"
+    if "must be null for an open question" in error:
+        return "question-state"
+    if "must not be empty" in error:
+        return "empty"
+    if "must be normalized" in error:
+        return "normalization"
+    if "must not contain control characters" in error:
+        return "control-character"
+    if "exceeds " in error or "must contain at most" in error:
+        return "size-limit"
+    if "contains a value that is not strict JSON" in error:
+        return "non-json-value"
+    return "validation-error"
+
+
+def design_validation_diagnostic(errors: tuple[str, ...]) -> str:
+    """Summarize validator errors without echoing agent-authored content."""
+    codes = sorted(
+        {
+            f"{_safe_diagnostic_path(error)}:{_safe_diagnostic_rule(error)}"
+            for error in errors
+        }
+    )
+    shown = codes[:_DIAGNOSTIC_CODE_LIMIT]
+    omitted = len(codes) - len(shown)
+    suffix = f", +{omitted} more codes" if omitted else ""
+    noun = "error" if len(errors) == 1 else "errors"
+    return f"{len(errors)} validation {noun}; safe codes: {', '.join(shown)}{suffix}"
 
 
 @dataclass(frozen=True)

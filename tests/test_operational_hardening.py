@@ -354,7 +354,7 @@ def test_decision_append_failure_stops_after_contract_before_implementation(
         workspace=workspace,
         dev_branch="develop",
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         repo_root=str(tmp_path),
         decision_log=_FailingDecisionLog(),
         run_id="run-7",
@@ -398,7 +398,7 @@ def test_decision_replay_failure_after_commit_stops_before_push(tmp_path, monkey
         workspace=workspace,
         dev_branch="develop",
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         repo_root=str(tmp_path),
         approval_store=ApprovalStore(tmp_path / "controller-approvals"),
         decision_log=FailFinalReplay(),
@@ -445,7 +445,7 @@ def test_pre_push_replay_rejects_a_valid_but_truncated_current_history(
         workspace=workspace,
         dev_branch="develop",
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         repo_root=str(tmp_path),
         approval_store=ApprovalStore(tmp_path / "controller-approvals"),
         decision_log=StaleFinalReplay(),
@@ -476,7 +476,7 @@ def test_pre_push_replay_rejects_a_complete_older_authorizing_run(
         workspace=old_workspace,
         dev_branch="develop",
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         repo_root=str(tmp_path),
         approval_store=ApprovalStore(tmp_path / "controller-approvals"),
         decision_log=delegate,
@@ -485,7 +485,7 @@ def test_pre_push_replay_rejects_a_complete_older_authorizing_run(
     )
     older = tuple(
         event
-        for event in delegate.read_verified(repository="example-repo", issue="7")
+        for event in delegate.read_verified(repository="example/repo", issue="7")
         if event.run_id == "older-run"
     )
     assert old_outcome.status is BuildStatus.SHIPPED
@@ -531,7 +531,7 @@ def test_pre_push_replay_rejects_a_complete_older_authorizing_run(
         workspace=current_workspace,
         dev_branch="develop",
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         repo_root=str(tmp_path),
         approval_store=ApprovalStore(tmp_path / "controller-approvals"),
         decision_log=ReplayOlderAuthorityAtCurrentPush(),
@@ -542,7 +542,7 @@ def test_pre_push_replay_rejects_a_complete_older_authorizing_run(
     assert outcome.status is BuildStatus.BLOCKED
     assert "decision" in outcome.reason.lower() and "push" in outcome.reason.lower()
     assert not current_workspace.pushed
-    complete = delegate.read_verified(repository="example-repo", issue="7")
+    complete = delegate.read_verified(repository="example/repo", issue="7")
     current_final = next(
         event
         for event in complete
@@ -574,7 +574,7 @@ def test_unknown_review_protocol_refuses_before_any_agent_dispatch(tmp_path):
         workspace=workspace,
         dev_branch="develop",
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         repo_root=str(tmp_path),
         decision_log=decision_log,
         review_protocol="findings_v3",
@@ -584,7 +584,7 @@ def test_unknown_review_protocol_refuses_before_any_agent_dispatch(tmp_path):
     assert "review protocol" in outcome.reason.lower()
     assert runner.calls == []
     assert not workspace.pushed
-    terminal = decision_log.read_verified(repository="example-repo", issue="7")[-1]
+    terminal = decision_log.read_verified(repository="example/repo", issue="7")[-1]
     assert terminal.stage == "terminal-disposition"
     assert terminal.disposition == "BLOCKED"
 
@@ -601,7 +601,7 @@ def test_contract_preflight_budget_halt_records_terminal_disposition(tmp_path):
         workspace=workspace,
         dev_branch="develop",
         require_contract=True,
-        repository="example-repo",
+        repository="example/repo",
         repo_root=str(tmp_path),
         decision_log=decision_log,
         budget=BudgetGuard(per_task_usd=0.0),
@@ -611,6 +611,6 @@ def test_contract_preflight_budget_halt_records_terminal_disposition(tmp_path):
 
     assert outcome.status is BuildStatus.HALTED
     assert not workspace.created
-    terminal = decision_log.read_verified(repository="example-repo", issue="7")[-1]
+    terminal = decision_log.read_verified(repository="example/repo", issue="7")[-1]
     assert terminal.stage == "terminal-disposition"
     assert terminal.disposition == "HALTED"

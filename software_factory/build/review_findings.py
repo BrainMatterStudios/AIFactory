@@ -79,7 +79,30 @@ class FindingsReport:
 
 
 def findings_file(workspace_path: str | Path) -> Path:
-    return Path(workspace_path, FINDINGS_PATH)
+    root = _legacy_workspace_path(workspace_path)
+    return Path(root, FINDINGS_PATH)
+
+
+def _legacy_workspace_path(workspace_path):
+    if not isinstance(workspace_path, (str, Path)):
+        if not (
+            isinstance(getattr(workspace_path, "base", None), str)
+            and callable(getattr(workspace_path, "changed_files", None))
+        ):
+            raise FindingsUnreadable(
+                "findings host fallback requires a local workspace"
+            )
+        workspace_path = getattr(workspace_path, "path", None)
+        if not isinstance(workspace_path, (str, Path)):
+            raise FindingsUnreadable(
+                "findings host fallback requires a local workspace"
+            )
+    root = Path(workspace_path)
+    if not root.is_absolute() or not root.is_dir():
+        raise FindingsUnreadable(
+            "findings host fallback requires an absolute existing directory"
+        )
+    return workspace_path
 
 
 def _require_secure_primitives() -> None:
@@ -107,6 +130,7 @@ def _open_factory_directory(
     workspace_path: str | Path, *, absent_ok: bool
 ) -> tuple[int, int | None]:
     _require_secure_primitives()
+    workspace_path = _legacy_workspace_path(workspace_path)
     root: int | None = None
     try:
         root = os.open(os.fspath(workspace_path), os.O_RDONLY | _DIRECTORY | _NOFOLLOW)
@@ -150,6 +174,15 @@ def _require_current_factory(root: int, factory: int) -> None:
 
 def clear_findings(workspace_path: str | Path) -> None:
     """Remove only the v2 scratch report, never a v1 verdict or sibling file."""
+    remove = getattr(workspace_path, "remove_file", None)
+    if callable(remove):
+        try:
+            remove(FINDINGS_PATH, missing_ok=True)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            raise FindingsUnreadable(
+                f"could not clear the previous findings at {FINDINGS_PATH}"
+            ) from error
+        return
     root, factory = _open_factory_directory(workspace_path, absent_ok=True)
     if factory is None:
         _close(root)
@@ -360,8 +393,20 @@ def read_findings(
 ) -> FindingsReport:
     """Read one strict report and authenticate its controller-configured sensor."""
     try:
-        raw = _read_bytes(workspace_path).decode("utf-8")
-    except UnicodeError as error:
+        read = getattr(workspace_path, "read_file", None)
+        content = (
+            read(FINDINGS_PATH, max_bytes=_MAX_REPORT_BYTES)
+            if callable(read)
+            else _read_bytes(workspace_path)
+        )
+        raw = content.decode("utf-8")
+    except FileNotFoundError as error:
+        raise FindingsUnreadable(
+            f"the sensor wrote no findings at {FINDINGS_PATH}"
+        ) from error
+    except FindingsUnreadable:
+        raise
+    except (OSError, RuntimeError, TypeError, ValueError, UnicodeError) as error:
         raise FindingsUnreadable(f"{FINDINGS_PATH} is not valid UTF-8") from error
     try:
         document = json.loads(raw, object_pairs_hook=_reject_duplicate_keys)

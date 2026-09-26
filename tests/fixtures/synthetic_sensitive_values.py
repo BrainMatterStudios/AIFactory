@@ -20,6 +20,8 @@ PASSWORD_ASSIGNMENT = 'password = "hunter2isnotgreat"'
 REDACT_PASSWORD_ASSIGNMENT = "PASSWORD=hunter2hunter2hunter2"
 UTF16_PASSWORD_ASSIGNMENT = 'password = "correcthorsebattery"\n'
 SYMLINK_PASSWORD_ASSIGNMENT = 'DATABASE_PASSWORD="hunter2seven99"'
+JUDGE_SECRET_MARKER = "JUDGE-PRIVATE-OUTPUT-secret-token-123"
+MALFORMED_SECRET_JSON = b'{"SECRET":"unterminated"'
 QUOTED_CREDENTIAL_ASSIGNMENTS = (
     'STRIPE_SECRET_KEY = "sk_' + "live_" + ("A" * 24) + '"',
     'DATABASE_PASSWORD = "Pr0dPassw0rd"',
@@ -42,6 +44,12 @@ PRIVATE_HOSTNAME_BOUNDARY_CASES = (
     "database.internal:5432",
     "https://database.internal/path",
     "database.internal.example",
+)
+PRIVATE_IPV4_PUNCTUATION_CASES = (
+    "10.0.0.1.",
+    "10.0.0.1,",
+    "(10.0.0.1)",
+    "[10.0.0.1]",
 )
 INTERNAL_URL = "https://10.0.0.1/admin"
 PRIVATE_URL_172 = "http://172.20.1.2/path"
