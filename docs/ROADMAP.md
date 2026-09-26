@@ -1,6 +1,6 @@
 # AIFactory roadmap
 
-**Last updated:** 2026-09-25
+**Last updated:** 2026-09-26
 
 This roadmap records the intended sequence after the public 0.3.0 release. It
 is an ordering and dependency document, not a promise of dates. A release enters
@@ -14,6 +14,9 @@ the relevant exit criteria, and an implementation plan is reviewed.
   projections; none may create approval.
 - Required evidence that is missing, stale, malformed, or unavailable fails
   closed.
+- Required quality evidence must prove that the asserted check executed and was
+  capable of observing failure. Agent-authored or agent-reported test results
+  are context, not authority.
 - Each release must preserve replay, migration, rollback, public-boundary, and
   zero-hard-dependency expectations unless a later design explicitly changes
   them.
@@ -27,16 +30,24 @@ the relevant exit criteria, and an implementation plan is reviewed.
 |---|---|---|---|---|
 | 0.2.0 | Architecture before code | Contract v2, exact approvals, findings-only sensors, deterministic routing | — | Released |
 | 0.3.0 | Design authority and capability honesty | Design IR v1, deterministic design gate, runner capability contracts, analyzer adapters, status projection | 0.2.0 | Released 2026-08-29; operational validation active |
-| 0.4.0 | Human review and evidence UX | Digest-bound Review Canvas, anchored feedback, evidence views, approval handoff, notifications | Stable 0.3 schemas and recorded operational evidence | Roadmap brief |
-| 0.5.0 | Managed adoption and harness posture | Plan/apply lifecycle, ownership, drift, repair/uninstall, harness analyzers, context/tool budgets | 0.3 contracts and 0.4 review UX | Roadmap brief |
-| 0.6.0 | Governed evolution | Code-to-design sensing, design-drift detection, improvement proposals, replay evaluation, human admission | 0.3 authority and 0.5 ownership | Roadmap brief |
-| 0.7.0 | Portable knowledge and ecosystem | Provenance-bearing handoffs, cross-runner context, curated capability packs, optional read-only dashboard | 0.4 review, 0.5 lifecycle, 0.6 promotion controls | Roadmap brief |
+| 0.4.0 | Quality evidence and independent verification | Quality obligations, non-vacuous run records, independent testing sensors, provider-neutral quality routing, post-delivery observations | Stable 0.3 schemas and recorded operational evidence | Roadmap brief |
+| 0.5.0 | Human review and evidence UX | Digest-bound Review Canvas, anchored feedback, quality-evidence views, approval handoff, notifications | Stable 0.4 quality artifacts and recorded review needs | Roadmap brief |
+| 0.6.0 | Managed adoption and harness posture | Plan/apply lifecycle, ownership, drift, repair/uninstall, harness analyzers, context/tool budgets | 0.3 contracts and 0.5 review UX | Roadmap brief |
+| 0.7.0 | Governed evolution | Code-to-design sensing, design-drift detection, improvement proposals, replay evaluation, human admission | 0.3 authority and 0.6 ownership | Roadmap brief |
+| 0.8.0 | Portable knowledge and ecosystem | Provenance-bearing handoffs, cross-runner context, curated capability packs, optional read-only dashboard | 0.5 review, 0.6 lifecycle, 0.7 promotion controls | Roadmap brief |
+
+The 0.4.0 quality release was inserted after field work showed that presenting
+evidence and governing configuration both depend on first distinguishing an
+executed check from a vacuous, untested, or unavailable one. This does not make
+an agent a test authority. The core owns quality obligations, evidence schemas,
+and deterministic routing; optional providers supply browser, API,
+accessibility, visual, mobile, or live-observation capabilities.
 
 ## Current operational validation gate
 
 The provider-aware role obligations, local-only publication ceiling,
 controller-bound contract revision path, and optional validation-cell lifecycle
-are implemented on the Stage 1 candidate branch. They are reusable factory
+are implemented on the 0.3 code line in `main`. They are reusable factory
 mechanisms: no repository-specific canary, target patch, target credential, or
 operator evidence belongs in the AIFactory product repository.
 
@@ -56,9 +67,9 @@ admitted locally, but the digest-bound one-shot synthetic containment evidence
 is still pending. Upstream v1.1.7 remains available only for historical replay;
 it cannot satisfy this gate.
 
-This work does not promote 0.3.0, change the numbered release sequence, or make
-0.4.0 eligible for detailed design. Before 0.4.0 enters detailed design,
-recorded evidence must establish all of the following:
+The containment correction does not promote 0.3.0 or make 0.4.0 eligible for
+detailed design. Before 0.4.0 enters detailed design, recorded evidence must
+establish all of the following:
 
 1. Representative real work exercises the complete Contract -> Design IR ->
    gate -> exact approval -> implementation path.
@@ -73,12 +84,13 @@ recorded evidence must establish all of the following:
    must be resolved, isolated behind a supported execution environment, or
    documented as requiring the legacy workflow.
 4. The evaluation records capability gaps and failed observations, analyzer
-   unavailable states and confirmed false positives or negatives, design
-   revisions, review time, task outcome, latency, and cost under the existing
-   data-minimization and public-boundary rules.
-5. The evidence identifies the minimum useful 0.4.0 review views and any
-   threat-model-driven capability vocabulary changes. It must not be used to
-   justify a second approval language or parallel authority system.
+   unavailable states, vacuous or unexecuted checks, confirmed false positives
+   or negatives, design revisions, review time, task outcome, latency, and cost
+   under the existing data-minimization and public-boundary rules.
+5. The evidence identifies the minimum useful 0.4.0 quality obligations,
+   evidence states, and provider capabilities; the minimum useful 0.5.0 review
+   views; and any threat-model-driven capability vocabulary changes. It must not
+   be used to justify a second approval language or parallel authority system.
 
 Repository-specific field trials are deliberately outside this roadmap's
 implementation deliverables. An operator may run one only as a separately
@@ -94,13 +106,14 @@ dependencies or independent approval authorities.
 ## Canonical release documents
 
 - [0.3.0 design authority design](superpowers/specs/2026-08-10-aifactory-0.3.0-design-authority-design.md)
-- [0.4.0 human review and evidence brief](superpowers/specs/2026-08-10-aifactory-0.4.0-human-review-brief.md)
-- [0.5.0 managed adoption and harness posture brief](superpowers/specs/2026-08-10-aifactory-0.5.0-managed-adoption-brief.md)
-- [0.6.0 governed evolution brief](superpowers/specs/2026-08-10-aifactory-0.6.0-governed-evolution-brief.md)
-- [0.7.0 portable knowledge and ecosystem brief](superpowers/specs/2026-08-10-aifactory-0.7.0-portable-knowledge-brief.md)
+- [0.4.0 quality evidence and independent verification brief](superpowers/specs/2026-09-26-aifactory-0.4.0-quality-verification-brief.md)
+- [0.5.0 human review and evidence brief](superpowers/specs/2026-08-10-aifactory-0.5.0-human-review-brief.md)
+- [0.6.0 managed adoption and harness posture brief](superpowers/specs/2026-08-10-aifactory-0.6.0-managed-adoption-brief.md)
+- [0.7.0 governed evolution brief](superpowers/specs/2026-08-10-aifactory-0.7.0-governed-evolution-brief.md)
+- [0.8.0 portable knowledge and ecosystem brief](superpowers/specs/2026-08-10-aifactory-0.8.0-portable-knowledge-brief.md)
 
 The 0.3.0 document records the approved design that shipped in the public
-release. The 0.4.0 through 0.7.0 documents are design-grade briefs: they
+release. The 0.4.0 through 0.8.0 documents are design-grade briefs: they
 preserve objectives, boundaries, dependencies, non-goals, risks, and promotion
 criteria without inventing file-level work against APIs that do not exist yet.
 
@@ -117,12 +130,15 @@ A release may begin detailed design when:
 5. When a release builds over an operational workflow, at least one supported
    end-to-end path has been exercised on representative real work; shipped
    schemas alone are insufficient evidence.
+6. When a release claims verification or quality evidence, at least one
+   intentionally failing, empty, skipped, or unavailable control demonstrates
+   that the relevant gate cannot pass vacuously.
 
 A release may ship only when its own adversarial exit criteria pass. Push, pull
 request, merge, tag, GitHub release, and registry publication remain separately
 approved shared-state actions.
 
-## Research horizon after 0.7.0
+## Research horizon after 0.8.0
 
 The following remain research candidates rather than numbered commitments:
 
