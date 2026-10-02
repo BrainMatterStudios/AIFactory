@@ -3737,6 +3737,17 @@ def _phase_writable_paths(
     return normalized
 
 
+def validate_bridge_authority_policy(manifest: Mapping[str, Any]) -> None:
+    """Validate controller-supplied policy before guest state is consumed."""
+    policy = _execution_policy(manifest.get("execution_policy"))
+    artifacts = _phase_artifacts(manifest.get("phase_artifacts"))
+    _phase_writable_paths(
+        manifest.get("phase_writable_paths"),
+        policy=policy,
+        artifacts=artifacts,
+    )
+
+
 def _model_auth_volume(config: BridgeConfig) -> str:
     """Return the only credential mount accepted by the bridge."""
     source = _private_automation_directory(
@@ -5331,41 +5342,46 @@ def _read_probe_log_suffix(baseline: _ProbeLogBaseline, path: Path) -> bytes:
     parent: int | None = None
     try:
         parent = os.open(os.fspath(path.parent), os.O_RDONLY | _DIRECTORY | _NOFOLLOW)
-        before = os.fstat(baseline.descriptor)
-        named = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
-        suffix_size = before.st_size - baseline.offset
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_uid != baseline.owner_uid
-            or before.st_nlink != 1
-            or stat.S_IMODE(before.st_mode) != baseline.mode
-            or (before.st_dev, before.st_ino) != (baseline.device, baseline.inode)
-            or not _same_inode(before, named)
-            or named.st_uid != baseline.owner_uid
-            or named.st_nlink != 1
-            or stat.S_IMODE(named.st_mode) != baseline.mode
-            or suffix_size < 0
-            or suffix_size > _MAX_PROBE_LOG_BYTES
-        ):
-            raise BridgeFailure("probe-events-invalid")
-        suffix = os.pread(baseline.descriptor, suffix_size, baseline.offset)
-        after = os.fstat(baseline.descriptor)
-        current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
-        if (
-            len(suffix) != suffix_size
-            or (after.st_dev, after.st_ino, after.st_size)
-            != (before.st_dev, before.st_ino, before.st_size)
-            or after.st_uid != baseline.owner_uid
-            or after.st_nlink != 1
-            or stat.S_IMODE(after.st_mode) != baseline.mode
-            or not _same_inode(after, current)
-            or current.st_uid != baseline.owner_uid
-            or current.st_nlink != 1
-            or stat.S_IMODE(current.st_mode) != baseline.mode
-            or (suffix and not suffix.endswith(b"\n"))
-        ):
-            raise BridgeFailure("probe-events-invalid")
-        return suffix
+        deadline = time.monotonic() + 1.0
+        while True:
+            before = os.fstat(baseline.descriptor)
+            named = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            suffix_size = before.st_size - baseline.offset
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != baseline.owner_uid
+                or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) != baseline.mode
+                or (before.st_dev, before.st_ino) != (baseline.device, baseline.inode)
+                or not _same_inode(before, named)
+                or named.st_uid != baseline.owner_uid
+                or named.st_nlink != 1
+                or stat.S_IMODE(named.st_mode) != baseline.mode
+                or suffix_size < 0
+                or suffix_size > _MAX_PROBE_LOG_BYTES
+            ):
+                raise BridgeFailure("probe-events-invalid")
+            suffix = os.pread(baseline.descriptor, suffix_size, baseline.offset)
+            after = os.fstat(baseline.descriptor)
+            current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            if (
+                len(suffix) != suffix_size
+                or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+                or after.st_size < before.st_size
+                or after.st_uid != baseline.owner_uid
+                or after.st_nlink != 1
+                or stat.S_IMODE(after.st_mode) != baseline.mode
+                or not _same_inode(after, current)
+                or current.st_uid != baseline.owner_uid
+                or current.st_nlink != 1
+                or stat.S_IMODE(current.st_mode) != baseline.mode
+            ):
+                raise BridgeFailure("probe-events-invalid")
+            if not suffix or suffix.endswith(b"\n"):
+                return suffix
+            if time.monotonic() >= deadline:
+                raise BridgeFailure("probe-events-invalid")
+            time.sleep(0.01)
     except BridgeFailure:
         raise
     except OSError as error:

@@ -4,7 +4,7 @@
 vmType: vz
 arch: aarch64
 images:
-  - location: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img
+  - location: https://cloud-images.ubuntu.com/noble/20260826/noble-server-cloudimg-arm64.img
     arch: aarch64
     digest: sha256:afa139bac6f2629c1e1f2f8f34215f3a9ad9779801bcb945521ba1a45016743f
 cpus: 4

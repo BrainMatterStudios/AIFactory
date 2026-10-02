@@ -5463,6 +5463,75 @@ def test_manager_log_baseline_reads_only_same_inode_complete_append_suffix(
         baseline.close()
 
 
+def test_manager_log_suffix_accepts_append_after_complete_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log = tmp_path / "events.log"
+    log.write_bytes(b"startup\n")
+    log.chmod(0o644)
+    baseline = execution_bridge._open_probe_log_baseline(
+        log, expected_uid=os.getuid(), deadline=time.monotonic() + 1
+    )
+    first = (
+        b'time=2026-08-31T10:00:01Z event=net.send pid=1234 cgroup=22 exe="node" '
+        b'protocol=tcp addr="192.0.2.1:443" decision=allowed\n'
+    )
+    later = (
+        b'time=2026-08-31T10:00:02Z event=file.open:ro pid=1234 cgroup=22 '
+        b'exe="node" path="/workspace/next" decision=allowed\n'
+    )
+    with log.open("ab") as stream:
+        stream.write(first)
+    original_pread = os.pread
+
+    def append_after_snapshot(descriptor: int, size: int, offset: int) -> bytes:
+        snapshot = original_pread(descriptor, size, offset)
+        with log.open("ab") as stream:
+            stream.write(later)
+        return snapshot
+
+    monkeypatch.setattr(os, "pread", append_after_snapshot)
+    try:
+        assert execution_bridge._read_probe_log_suffix(baseline, log) == first
+    finally:
+        baseline.close()
+
+
+def test_manager_log_suffix_accepts_line_completed_after_partial_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log = tmp_path / "events.log"
+    log.write_bytes(b"startup\n")
+    log.chmod(0o644)
+    baseline = execution_bridge._open_probe_log_baseline(
+        log, expected_uid=os.getuid(), deadline=time.monotonic() + 1
+    )
+    event = (
+        b'time=2026-08-31T10:00:01Z event=net.send pid=1234 cgroup=22 exe="node" '
+        b'protocol=tcp addr="192.0.2.1:443" decision=allowed\n'
+    )
+    split = len(event) - 12
+    with log.open("ab") as stream:
+        stream.write(event[:split])
+    original_pread = os.pread
+    completed = False
+
+    def complete_after_partial_snapshot(descriptor: int, size: int, offset: int) -> bytes:
+        nonlocal completed
+        snapshot = original_pread(descriptor, size, offset)
+        if not completed:
+            with log.open("ab") as stream:
+                stream.write(event[split:])
+            completed = True
+        return snapshot
+
+    monkeypatch.setattr(os, "pread", complete_after_partial_snapshot)
+    try:
+        assert execution_bridge._read_probe_log_suffix(baseline, log) == event
+    finally:
+        baseline.close()
+
+
 def test_complete_unknown_manager_log_suffix_is_rejected() -> None:
     with pytest.raises(execution_bridge.BridgeFailure, match="probe-events-invalid"):
         execution_bridge._authenticate_probe_log_suffix(b"malformed-but-complete\n")

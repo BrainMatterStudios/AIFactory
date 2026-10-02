@@ -134,6 +134,7 @@ factory design gate <file>
 factory analyze <adapter>
 factory capabilities
 factory evidence show --issue <id> [--digest <sha256>]
+factory release readiness 0.4.0 --evidence <public-safe-summary.json>
 factory status [issue]
 ```
 
@@ -143,6 +144,29 @@ runtime/authority unavailability, a non-passing gate, drifted local evidence, or
 another non-ready status; exit `2` means invalid invocation, input, or
 configuration. All except `doctor` accept `--json`; `doctor` is also read-only
 and never invokes a model or analyzer.
+
+The 0.4.0 readiness command is a roadmap-entry preflight, not a release
+approval and not a substitute for the later detailed design review:
+
+```bash
+factory release readiness 0.4.0 --json
+factory release readiness 0.4.0 --evidence <public-safe-summary.json> --json
+```
+
+With no evidence file, the command deliberately reports every 0.4.0 entry
+criterion as blocked. The optional evidence file is a redacted, public-safe
+summary of private retained evidence: criterion ids, satisfied or blocking
+states, exact digests, bounded summaries, and relative references only. Do not
+store raw browser pages, HAR files, videos, console logs, private repository
+names, credentials, absolute paths, target accounts, local controller paths, or
+field-trial transcripts in this repository. Keep those records in the private
+operator evidence store and feed only the redacted summary to the preflight.
+
+Future browser, accessibility, visual, mobile, Review Canvas, or other UI-facing
+quality providers must include user-like end-to-end verification with Playwright
+where Playwright can exercise the relevant surface. The current 0.4.0 readiness
+preflight has no browser UI; its user-facing path is this CLI command, so the
+user-like check is a real command invocation with synthetic evidence.
 
 Status reports `ready`, `approval_pending`, `blocked`, `degraded`, `unavailable`,
 `complete`, or `completed-not-promoted`. The last state means the exact local
