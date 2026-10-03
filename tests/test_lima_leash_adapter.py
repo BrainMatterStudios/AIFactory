@@ -544,6 +544,35 @@ def test_scoped_runner_resets_to_pre_turn_revision_when_changed_paths_escape_sco
     assert client.reset_to == revision
 
 
+def test_scoped_runner_preserves_authenticated_failure_reason_after_reset() -> None:
+    from software_factory.adapters.optional.lima_leash import LimaLeashRunner
+
+    context = "a" * 64
+    revision = "b" * 40
+    client = _FailedRunnerClient(context=context, revision=revision)
+    scope = ExecutionScope(
+        context,
+        "contract-author",
+        revision,
+        revision,
+        ("factory/contracts/42.json",),
+        60,
+        "model-only-v1",
+        "c" * 64,
+    )
+
+    result = LimaLeashRunner(_role_options("runner"), client=client).run_scoped_agent(
+        "author contract",
+        model="opus",
+        cwd=f"lima://aifactory-stage1/{context}",
+        scope=scope,
+    )
+
+    assert result.ok is False
+    assert result.meta["executor_failure_reason"] == "timeout"
+    assert client.reset_to == revision
+
+
 def test_scoped_runner_is_distinguished_from_legacy_runner_protocol() -> None:
     """Calling run_agent when executor authority is required must not be a fallback."""
     from software_factory.adapters.base import ScopedRunnerAdapter
@@ -1052,6 +1081,14 @@ class _RunnerClient:
         assert context_digest == self.context
         assert payload["scope"]["input_revision"] == self.revision
         return _response(result={"output": "{}", "model": "sonnet", "cost_usd": 0.0})
+
+
+class _FailedRunnerClient(_RunnerClient):
+    def run_agent(self, *, context_digest: str, request_id: str, payload: dict[str, object]):
+        del request_id
+        assert context_digest == self.context
+        assert payload["scope"]["input_revision"] == self.revision
+        return _response(status="failed", result={"reason": "timeout"})
 
 
 class _CompleteWorkspaceClient:
