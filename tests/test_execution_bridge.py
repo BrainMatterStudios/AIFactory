@@ -3400,6 +3400,40 @@ def test_denial_is_normalized_without_raw_policy_log(
     assert "secret" not in json.dumps(response.result)
 
 
+def test_nonzero_agent_exit_is_not_fabricated_as_a_process_denial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = _bridge(tmp_path, monkeypatch)
+    workspace = bridge.config.workspace_root / CONTEXT
+    workspace.mkdir(parents=True)
+    _authority(bridge)
+
+    def failed(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["git", "config", "--local"]:
+            return _completed(argv)
+        if argv[:2] == ["git", "rev-parse"]:
+            return _completed(argv, stdout=BASE + "\n")
+        if argv[:3] == ["git", "merge-base", "--is-ancestor"]:
+            return _completed(argv)
+        return _completed(argv, returncode=1, stdout="provider detail token=secret\n")
+
+    monkeypatch.setattr("software_factory.execution.bridge._run_bounded_process", failed)
+    scope = {
+        "context_digest": CONTEXT,
+        "turn_kind": "implementation",
+        "base_revision": BASE,
+        "input_revision": BASE,
+        "writable_paths": ["src/x.py"],
+        "timeout_seconds": 10,
+        "network_profile": "model-only-v1",
+    }
+    response = bridge.handle(_request("run-agent", {"prompt": "never echo", "scope": scope}))
+
+    assert response.status == "failed"
+    assert response.result == {"reason": "agent-exit-nonzero"}
+    assert "secret" not in json.dumps(response.result)
+
+
 def test_export_rejects_uncommitted_or_non_head_revision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

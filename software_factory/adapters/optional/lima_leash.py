@@ -1784,20 +1784,27 @@ class LimaLeashRunner:
                 raise RuntimeError("reset was not confirmed")
         except Exception:
             category = "process"
-        meta = {
-            "executor_action": {
-                "schema_version": "executor-action-v1",
-                "disposition": "denied",
-                "category": category,
-            }
-        }
-        if failure_reason in {
+        safe_failure_reasons = {
+            "agent-exit-nonzero",
             "agent-timeout-cleanup-failed",
             "claude-result-invalid",
             "guest-operation-failed",
             "timeout",
-        }:
-            meta["executor_failure_reason"] = failure_reason
+        }
+        if failure_reason is not None:
+            meta = (
+                {"executor_failure_reason": failure_reason}
+                if failure_reason in safe_failure_reasons
+                else {}
+            )
+        else:
+            meta = {
+                "executor_action": {
+                    "schema_version": "executor-action-v1",
+                    "disposition": "denied",
+                    "category": category,
+                }
+            }
         return RunResult(
             ok=False,
             output="scoped execution denied",

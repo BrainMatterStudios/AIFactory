@@ -2414,12 +2414,14 @@ class ExecutionBridge:
                     raise
         except subprocess.TimeoutExpired:
             raise BridgeFailure("timeout") from None
-        if completed.returncode != 0 or _is_denial(completed.stdout):
+        if _is_denial(completed.stdout):
             return "denied", _normalized_denial(
                 completed.stdout,
                 workspace=workspace,
                 state_root=self.config.state_root,
             )
+        if completed.returncode != 0:
+            raise BridgeFailure("agent-exit-nonzero")
         try:
             parsed = _terminal_json_record(completed.stdout)
             if not isinstance(parsed, dict) or type(parsed.get("result")) is not str:

@@ -71,6 +71,7 @@ _CONTRACT_APPROVAL_PENDING = "contract-approval-pending"
 _CONTRACT_EXTERNAL_FAILURE = "contract-external-failure"
 _CONTRACT_SPEC_PENDING = "contract-spec-pending"
 _RUNNER_FAILURE_REASONS = {
+    "agent-exit-nonzero": "contract-runner-exit-nonzero",
     "agent-timeout-cleanup-failed": "contract-runner-timeout-cleanup-failed",
     "claude-result-invalid": "contract-runner-result-invalid",
     "guest-operation-failed": "contract-runner-guest-operation-failed",

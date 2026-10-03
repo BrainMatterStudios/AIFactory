@@ -373,6 +373,10 @@ def test_missing_contract_is_blocked_without_workspace_preservation(tmp_path):
     [
         ({"executor_failure_reason": "timeout"}, "contract-runner-timeout"),
         (
+            {"executor_failure_reason": "agent-exit-nonzero"},
+            "contract-runner-exit-nonzero",
+        ),
+        (
             {
                 "executor_action": {
                     "schema_version": "executor-action-v1",
