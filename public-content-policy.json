@@ -38,6 +38,18 @@
       "path": "software_factory/execution/bridge.py",
       "git_mode": "100644",
       "object_type": "blob",
+      "sha256": "68cec1390cfce3963e203c48395d143405c59af5dc3192dc0729eae66cc0cf37",
+      "license": "Apache-2.0",
+      "source": "project-original:validation-cell-security-controls-v1",
+      "rule_ids": [
+        "private.absolute-path",
+        "private.hostname"
+      ]
+    },
+    {
+      "path": "software_factory/execution/bridge.py",
+      "git_mode": "100644",
+      "object_type": "blob",
       "sha256": "ee237ecfb6c9eb50a57561edd554c2d498da08fe58fc5cb70b9f2435a09b7bb9",
       "license": "Apache-2.0",
       "source": "project-original:validation-cell-security-controls-v1",
@@ -61,6 +73,17 @@
         "secret.credential",
         "secret.credentialed-dsn",
         "secret.private-key"
+      ]
+    },
+    {
+      "path": "tests/test_execution_bridge.py",
+      "git_mode": "100644",
+      "object_type": "blob",
+      "sha256": "3c7278ec677d51ecde76c10d2a6c53a350959b3cee00c0331ba15593d0ef425f",
+      "license": "Apache-2.0",
+      "source": "project-original:validation-cell-security-controls-v1",
+      "rule_ids": [
+        "private.hostname"
       ]
     },
     {
