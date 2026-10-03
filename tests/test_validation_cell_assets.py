@@ -1550,7 +1550,10 @@ def test_lima_template_provisions_private_model_auth_outside_workspace_and_expor
 
     assert "install -d -o root -g root -m 0700 /var/lib/aifactory/model-auth" in provision
     assert "install -d -o root -g root -m 0700 /var/lib/aifactory/model-auth/.claude" in provision
-    assert "install -o root -g root -m 0600 /dev/null /var/lib/aifactory/model-auth/.claude.json" in provision
+    assert (
+        "install -o root -g root -m 0600 /dev/stdin "
+        "/var/lib/aifactory/model-auth/.claude.json <<'JSON'\n{}\nJSON"
+    ) in provision
     assert "install -d -o root -g root -m 0700 /var/lib/aifactory/automated-leash-home" in provision
     for surface in (
         Path("/srv/aifactory/workspaces"),

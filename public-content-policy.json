@@ -154,6 +154,18 @@
         "private.hostname",
         "private.internal-url"
       ]
+    },
+    {
+      "path": "tests/test_validation_cell_assets.py",
+      "git_mode": "100644",
+      "object_type": "blob",
+      "sha256": "4d28b2dc3e36b48d14ed7a8ee5f614cbd60c0b5a7ea4635f0e3d439f660b8c67",
+      "license": "Apache-2.0",
+      "source": "project-original:validation-cell-security-controls-v1",
+      "rule_ids": [
+        "private.hostname",
+        "private.internal-url"
+      ]
     }
   ]
 }

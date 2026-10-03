@@ -85,7 +85,9 @@ provision:
       install -d -o root -g root -m 0700 /var/lib/aifactory/model-auth
       install -d -o root -g root -m 0700 /var/lib/aifactory/model-auth/.claude
       if [ ! -e /var/lib/aifactory/model-auth/.claude.json ] && [ ! -L /var/lib/aifactory/model-auth/.claude.json ]; then
-        install -o root -g root -m 0600 /dev/null /var/lib/aifactory/model-auth/.claude.json
+        install -o root -g root -m 0600 /dev/stdin /var/lib/aifactory/model-auth/.claude.json <<'JSON'
+      {}
+      JSON
       fi
       test "$(stat -c '%F:%U:%G:%a' /var/lib/aifactory/model-auth/.claude.json)" = "regular empty file:root:root:600" ||
         test "$(stat -c '%F:%U:%G:%a' /var/lib/aifactory/model-auth/.claude.json)" = "regular file:root:root:600"
