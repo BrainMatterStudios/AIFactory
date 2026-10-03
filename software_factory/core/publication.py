@@ -191,6 +191,7 @@ def _load_provenance(value: Any, where: str) -> tuple[_Provenance, ...]:
         raise PublicationPolicyError(f"{where} must be a list")
     result: list[_Provenance] = []
     paths: set[str] = set()
+    identities: set[tuple[str, str]] = set()
     for index, item in enumerate(value):
         item_where = f"{where}[{index}]"
         if not isinstance(item, dict):
@@ -200,7 +201,11 @@ def _load_provenance(value: Any, where: str) -> tuple[_Provenance, ...]:
         digest = _require_nonempty_string(item["sha256"], f"{item_where}.sha256")
         if _LOWER_SHA256.fullmatch(digest) is None:
             raise PublicationPolicyError(f"{item_where}.sha256 must be lowercase SHA-256")
-        if path in paths:
+        if (path, digest) in identities:
+            raise PublicationPolicyError(
+                f"duplicate path and digest in {where}: {path}"
+            )
+        if where != "content_allowlist" and path in paths:
             raise PublicationPolicyError(f"duplicate path in {where}: {path}")
         git_mode = _require_nonempty_string(item["git_mode"], f"{item_where}.git_mode")
         if git_mode not in {"100644", "100755", "120000"}:
@@ -235,6 +240,7 @@ def _load_provenance(value: Any, where: str) -> tuple[_Provenance, ...]:
         ):
             raise PublicationPolicyError(f"{item_where}.rule_ids must be canonical and sorted")
         paths.add(path)
+        identities.add((path, digest))
         result.append(
             _Provenance(
                 path=path,
@@ -260,14 +266,16 @@ def _load_provenance(value: Any, where: str) -> tuple[_Provenance, ...]:
             "third_party_allowlist approvals must name only the provenance rule"
         )
     if where == "content_allowlist":
-        if tuple(entry.path for entry in loaded) != tuple(
-            sorted(entry.path for entry in loaded)
+        if tuple((entry.path, entry.sha256) for entry in loaded) != tuple(
+            sorted((entry.path, entry.sha256) for entry in loaded)
         ):
             raise PublicationPolicyError(
-                "content_allowlist must be in canonical path order"
+                "content_allowlist must be in canonical path and digest order"
             )
-        approvals = {entry.path: entry for entry in loaded}
-        approval = approvals.get(_SYNTHETIC_FIXTURE_PATH)
+        fixture_approvals = [
+            entry for entry in loaded if entry.path == _SYNTHETIC_FIXTURE_PATH
+        ]
+        approval = fixture_approvals[0] if len(fixture_approvals) == 1 else None
         if (
             approval is None
             or approval.path != _SYNTHETIC_FIXTURE_PATH

@@ -96,6 +96,8 @@ _LEASH_NODE = Path("/usr/bin/node")
 _NFT_PATH = Path("/usr/sbin/nft")
 _MODEL_AUTH_DIR = Path("/var/lib/aifactory/model-auth/.claude")
 _MODEL_AUTH_TARGET = "/root/.claude"
+_MODEL_AUTH_FILE = Path("/var/lib/aifactory/model-auth/.claude.json")
+_MODEL_AUTH_FILE_TARGET = "/root/.claude.json"
 _LEASH_HOME = Path("/var/lib/aifactory/automated-leash-home")
 _PNPM_IDENTITY_FIELDS = (
     "pnpm_version",
@@ -2365,7 +2367,7 @@ class ExecutionBridge:
         self._verify_scope_revisions(workspace, scope, authority)
         if fingerprint_repository_surface(workspace) != scope.input_fingerprint:
             raise BridgeFailure("input-fingerprint-mismatch")
-        auth_volume = _model_auth_volume(self.config)
+        auth_volumes = _model_auth_volumes(self.config)
         effective_policy = _write_effective_policy(
             self.config, request.request_id, workspace, scope, authority
         )
@@ -2387,8 +2389,7 @@ class ExecutionBridge:
                             self._sealed_runtime()["image_reference"],
                             "--env",
                             "LEASH_DISABLE_TELEMETRY=1",
-                            "--volume",
-                            auth_volume,
+                            *(argument for volume in auth_volumes for argument in ("--volume", volume)),
                             "claude",
                             "-p",
                             prompt,
@@ -2414,12 +2415,14 @@ class ExecutionBridge:
                     raise
         except subprocess.TimeoutExpired:
             raise BridgeFailure("timeout") from None
-        if completed.returncode != 0 or _is_denial(completed.stdout):
+        if _is_denial(completed.stdout):
             return "denied", _normalized_denial(
                 completed.stdout,
                 workspace=workspace,
                 state_root=self.config.state_root,
             )
+        if completed.returncode != 0:
+            raise BridgeFailure("agent-exit-nonzero")
         try:
             parsed = _terminal_json_record(completed.stdout)
             if not isinstance(parsed, dict) or type(parsed.get("result")) is not str:
@@ -3737,12 +3740,36 @@ def _phase_writable_paths(
     return normalized
 
 
+def validate_bridge_authority_policy(manifest: Mapping[str, Any]) -> None:
+    """Validate controller-supplied policy before guest state is consumed."""
+    policy = _execution_policy(manifest.get("execution_policy"))
+    artifacts = _phase_artifacts(manifest.get("phase_artifacts"))
+    _phase_writable_paths(
+        manifest.get("phase_writable_paths"),
+        policy=policy,
+        artifacts=artifacts,
+    )
+
+
 def _model_auth_volume(config: BridgeConfig) -> str:
-    """Return the only credential mount accepted by the bridge."""
+    """Return the fixed Claude credential-directory mount."""
     source = _private_automation_directory(
         config, _MODEL_AUTH_DIR, reason="model-auth-invalid", require_empty=False
     )
     return f"{source}:{_MODEL_AUTH_TARGET}"
+
+
+def _model_auth_volumes(config: BridgeConfig) -> tuple[str, str]:
+    """Return the complete fixed Claude credential mounts."""
+    directory = _model_auth_volume(config)
+    _read_regular_path(
+        _MODEL_AUTH_FILE,
+        max_bytes=1024 * 1024,
+        expected_uid=config.root_uid,
+        exact_mode=0o600,
+        reason="model-auth-invalid",
+    )
+    return directory, f"{_MODEL_AUTH_FILE}:{_MODEL_AUTH_FILE_TARGET}"
 
 
 def _automated_leash_environment(config: BridgeConfig) -> dict[str, str]:
@@ -5331,41 +5358,46 @@ def _read_probe_log_suffix(baseline: _ProbeLogBaseline, path: Path) -> bytes:
     parent: int | None = None
     try:
         parent = os.open(os.fspath(path.parent), os.O_RDONLY | _DIRECTORY | _NOFOLLOW)
-        before = os.fstat(baseline.descriptor)
-        named = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
-        suffix_size = before.st_size - baseline.offset
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_uid != baseline.owner_uid
-            or before.st_nlink != 1
-            or stat.S_IMODE(before.st_mode) != baseline.mode
-            or (before.st_dev, before.st_ino) != (baseline.device, baseline.inode)
-            or not _same_inode(before, named)
-            or named.st_uid != baseline.owner_uid
-            or named.st_nlink != 1
-            or stat.S_IMODE(named.st_mode) != baseline.mode
-            or suffix_size < 0
-            or suffix_size > _MAX_PROBE_LOG_BYTES
-        ):
-            raise BridgeFailure("probe-events-invalid")
-        suffix = os.pread(baseline.descriptor, suffix_size, baseline.offset)
-        after = os.fstat(baseline.descriptor)
-        current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
-        if (
-            len(suffix) != suffix_size
-            or (after.st_dev, after.st_ino, after.st_size)
-            != (before.st_dev, before.st_ino, before.st_size)
-            or after.st_uid != baseline.owner_uid
-            or after.st_nlink != 1
-            or stat.S_IMODE(after.st_mode) != baseline.mode
-            or not _same_inode(after, current)
-            or current.st_uid != baseline.owner_uid
-            or current.st_nlink != 1
-            or stat.S_IMODE(current.st_mode) != baseline.mode
-            or (suffix and not suffix.endswith(b"\n"))
-        ):
-            raise BridgeFailure("probe-events-invalid")
-        return suffix
+        deadline = time.monotonic() + 1.0
+        while True:
+            before = os.fstat(baseline.descriptor)
+            named = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            suffix_size = before.st_size - baseline.offset
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != baseline.owner_uid
+                or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) != baseline.mode
+                or (before.st_dev, before.st_ino) != (baseline.device, baseline.inode)
+                or not _same_inode(before, named)
+                or named.st_uid != baseline.owner_uid
+                or named.st_nlink != 1
+                or stat.S_IMODE(named.st_mode) != baseline.mode
+                or suffix_size < 0
+                or suffix_size > _MAX_PROBE_LOG_BYTES
+            ):
+                raise BridgeFailure("probe-events-invalid")
+            suffix = os.pread(baseline.descriptor, suffix_size, baseline.offset)
+            after = os.fstat(baseline.descriptor)
+            current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            if (
+                len(suffix) != suffix_size
+                or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+                or after.st_size < before.st_size
+                or after.st_uid != baseline.owner_uid
+                or after.st_nlink != 1
+                or stat.S_IMODE(after.st_mode) != baseline.mode
+                or not _same_inode(after, current)
+                or current.st_uid != baseline.owner_uid
+                or current.st_nlink != 1
+                or stat.S_IMODE(current.st_mode) != baseline.mode
+            ):
+                raise BridgeFailure("probe-events-invalid")
+            if not suffix or suffix.endswith(b"\n"):
+                return suffix
+            if time.monotonic() >= deadline:
+                raise BridgeFailure("probe-events-invalid")
+            time.sleep(0.01)
     except BridgeFailure:
         raise
     except OSError as error:

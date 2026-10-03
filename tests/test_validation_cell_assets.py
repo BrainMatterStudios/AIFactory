@@ -1546,16 +1546,18 @@ def test_lima_template_provisions_private_model_auth_outside_workspace_and_expor
     provision = yaml.safe_load(asset_bytes("lima.yaml"))["provision"][0]["script"]
     auth_root = Path("/var/lib/aifactory/model-auth")
     auth_directory = auth_root / ".claude"
+    auth_file = auth_root / ".claude.json"
 
     assert "install -d -o root -g root -m 0700 /var/lib/aifactory/model-auth" in provision
     assert "install -d -o root -g root -m 0700 /var/lib/aifactory/model-auth/.claude" in provision
+    assert "install -o root -g root -m 0600 /dev/null /var/lib/aifactory/model-auth/.claude.json" in provision
     assert "install -d -o root -g root -m 0700 /var/lib/aifactory/automated-leash-home" in provision
     for surface in (
         Path("/srv/aifactory/workspaces"),
         Path("/srv/aifactory/exports"),
         Path("/srv/aifactory/imports"),
     ):
-        assert surface not in (auth_directory, *auth_directory.parents)
+        assert surface not in (auth_directory, auth_file, *auth_directory.parents)
 
 
 def test_lima_template_parses_when_yaml_extra_is_available() -> None:
@@ -1566,6 +1568,19 @@ def test_lima_template_parses_when_yaml_extra_is_available() -> None:
     assert document["vmType"] == "vz"
     assert document["arch"] == "aarch64"
     assert document["mounts"] == []
+    assert document["images"] == [
+        {
+            "location": (
+                "https://cloud-images.ubuntu.com/noble/20260826/"
+                "noble-server-cloudimg-arm64.img"
+            ),
+            "arch": "aarch64",
+            "digest": (
+                "sha256:"
+                "afa139bac6f2629c1e1f2f8f34215f3a9ad9779801bcb945521ba1a45016743f"
+            ),
+        }
+    ]
     assert document["portForwards"] == [
         {
             "guestIP": "0.0.0.0",
@@ -2940,6 +2955,7 @@ def test_cedar_policy_preserves_leash_117_vocabulary_and_default_denies() -> Non
         'Action::"ProcessExec"',
         'Action::"NetworkConnect"',
         'File::"/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"',
+        'File::"/root/.claude.json"',
         'Dir::"/srv/aifactory/workspaces/__CONTEXT_DIGEST__/"',
         'Host::"api.anthropic.com:443"',
         'Host::"claude.ai:443"',
@@ -3140,6 +3156,437 @@ def test_import_rejects_bridge_indirect_verification_before_guest_mutation(
 
     assert runtime.calls == []
     assert client.calls == []
+
+
+def test_import_rejects_overlapping_phase_authority_before_guest_mutation(
+    tmp_path: Path,
+) -> None:
+    from software_factory.execution.cell import CellError
+
+    controller, runtime, client = _controller(tmp_path)
+    _created(controller, tmp_path)
+    runtime.calls.clear()
+    client.calls.clear()
+    bundle = tmp_path / "repository.bundle"
+    bundle.write_bytes(b"bundle")
+    document = _import_manifest(bundle_digest=hashlib.sha256(b"bundle").hexdigest())
+    contract_path = document["bridge_manifest"]["phase_artifacts"][
+        "issue_contract_path"
+    ]
+    document["bridge_manifest"]["execution_policy"][
+        "implementation_writable_paths"
+    ].append(contract_path)
+    document["bridge_manifest"]["phase_writable_paths"]["implementation"].append(
+        contract_path
+    )
+    manifest = tmp_path / "request.json"
+    manifest.write_bytes(_canonical(document))
+
+    with pytest.raises(CellError, match="import-manifest-invalid"):
+        controller.import_request(
+            instance="aifactory-stage1",
+            bundle=bundle.resolve(),
+            manifest=manifest.resolve(),
+        )
+
+    assert runtime.calls == []
+    assert client.calls == []
+
+
+def test_import_prepare_failure_persists_bounded_authenticated_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from software_factory.execution.cell import CellError
+
+    controller, runtime, client = _controller(tmp_path)
+    _created(controller, tmp_path)
+    created = controller._load("aifactory-stage1")
+    created_digest = hashlib.sha256(_canonical(created)).hexdigest()
+    prior_stops = [argv[:2] for argv, _input in runtime.calls].count(
+        ["limactl", "stop"]
+    )
+    raw_secret = "SECRET guest prepare output must not persist"
+
+    def fail_prepare(**_kwargs: object) -> BridgeResponse:
+        raise RuntimeError(raw_secret)
+
+    monkeypatch.setattr(client, "prepare", fail_prepare)
+    bundle = tmp_path / "repository.bundle"
+    bundle.write_bytes(b"bundle")
+    manifest = tmp_path / "request.json"
+    manifest.write_bytes(_canonical(_import_manifest()))
+
+    with pytest.raises(CellError, match="import-operation-failed") as failure:
+        controller.import_request(
+            instance="aifactory-stage1",
+            bundle=bundle.resolve(),
+            manifest=manifest.resolve(),
+        )
+
+    state_bytes = (tmp_path / "controller/aifactory-stage1/state.json").read_bytes()
+    state = json.loads(state_bytes)
+    assert state["import_failure"] == {
+        "pre_import_state_digest": created_digest,
+        "reason": "import-operation-failed",
+        "stage": "prepare",
+        "stop": {"attempted": True, "result": "stopped"},
+    }
+    assert state["lifecycle"] == "stopped"
+    assert state["retained_lifecycle"] == "created"
+    assert [argv[:2] for argv, _input in runtime.calls].count(
+        ["limactl", "stop"]
+    ) == prior_stops + 1
+    assert raw_secret not in str(failure.value)
+    assert raw_secret.encode() not in state_bytes
+    assert controller._load("aifactory-stage1") == state
+    assert controller.stop(instance="aifactory-stage1") == {
+        "destroyed": False,
+        "import_failure": state["import_failure"],
+        "instance": "aifactory-stage1",
+        "lifecycle": "stopped",
+        "retained_lifecycle": "created",
+        "runnable": False,
+    }
+    calls_before_start = list(runtime.calls)
+    with pytest.raises(CellError, match="start-transition-invalid"):
+        controller.start(instance="aifactory-stage1")
+    assert runtime.calls == calls_before_start
+
+
+@pytest.mark.parametrize(
+    "reason",
+    sorted(
+        {
+            "authority-invalid",
+            "base-revision-mismatch",
+            "command-failed",
+            "command-output-invalid",
+            "command-output-too-large",
+            "git-environment-invalid",
+            "guest-file-unsafe",
+            "guest-operation-failed",
+            "guest-path-unsafe",
+            "guest-state-unsafe",
+            "import-authority-mismatch",
+            "import-digest-mismatch",
+            "import-missing",
+            "invalid-command",
+            "invalid-digest",
+            "invalid-path",
+            "invalid-payload",
+            "invalid-revision",
+            "manifest-identity-mismatch",
+            "manifest-invalid",
+            "policy-invalid",
+            "prepare-identity-mismatch",
+            "response-encoding-failed",
+            "scope-not-representable",
+            "timeout",
+            "workspace-dirty",
+            "workspace-root-unsafe",
+            "workspace-unsafe",
+        }
+    ),
+)
+def test_import_prepare_failure_preserves_bounded_bridge_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason: str
+) -> None:
+    from software_factory.execution.cell import CellError
+    from software_factory.execution.protocol import PREPARE_FAILURE_REASONS
+
+    assert reason in PREPARE_FAILURE_REASONS
+
+    controller, _runtime, client = _controller(tmp_path)
+    _created(controller, tmp_path)
+    monkeypatch.setattr(
+        client,
+        "prepare",
+        lambda **_kwargs: BridgeResponse(
+            schema_version="execution-bridge-v1",
+            request_id="prepare-request",
+            status="failed",
+            result={"reason": reason},
+            evidence=(),
+        ),
+    )
+    bundle = tmp_path / "repository.bundle"
+    bundle.write_bytes(b"bundle")
+    manifest = tmp_path / "request.json"
+    manifest.write_bytes(_canonical(_import_manifest()))
+
+    with pytest.raises(CellError, match="import-operation-failed"):
+        controller.import_request(
+            instance="aifactory-stage1",
+            bundle=bundle.resolve(),
+            manifest=manifest.resolve(),
+        )
+
+    state = controller._load("aifactory-stage1")
+    assert state["import_failure"]["stage"] == "prepare"
+    assert state["import_failure"]["reason"] == reason
+
+
+def test_import_prepare_failure_rejects_unknown_bridge_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from software_factory.execution.cell import CellError
+
+    controller, _runtime, client = _controller(tmp_path)
+    _created(controller, tmp_path)
+    raw_secret = "SECRET unknown bridge reason"
+    monkeypatch.setattr(
+        client,
+        "prepare",
+        lambda **_kwargs: BridgeResponse(
+            schema_version="execution-bridge-v1",
+            request_id="prepare-request",
+            status="failed",
+            result={"reason": raw_secret},
+            evidence=(),
+        ),
+    )
+    bundle = tmp_path / "repository.bundle"
+    bundle.write_bytes(b"bundle")
+    manifest = tmp_path / "request.json"
+    manifest.write_bytes(_canonical(_import_manifest()))
+
+    with pytest.raises(CellError, match="import-operation-failed"):
+        controller.import_request(
+            instance="aifactory-stage1",
+            bundle=bundle.resolve(),
+            manifest=manifest.resolve(),
+        )
+
+    state_bytes = (
+        tmp_path / "controller/aifactory-stage1/state.json"
+    ).read_bytes()
+    state = json.loads(state_bytes)
+    assert state["import_failure"]["reason"] == "prepare-failed"
+    assert raw_secret.encode() not in state_bytes
+
+
+def test_import_retry_failure_binds_prior_imported_authority(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from software_factory.execution.cell import CellError
+
+    controller, _runtime, client = _controller(tmp_path)
+    _created(controller, tmp_path)
+    bundle, manifest = _imported(controller, tmp_path)
+    imported = controller._load("aifactory-stage1")
+    imported_digest = hashlib.sha256(_canonical(imported)).hexdigest()
+    monkeypatch.setattr(
+        client,
+        "prepare",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("SECRET retry output")),
+    )
+
+    with pytest.raises(CellError, match="import-operation-failed"):
+        controller.import_request(
+            instance="aifactory-stage1",
+            bundle=bundle.resolve(),
+            manifest=manifest.resolve(),
+        )
+
+    state = controller._load("aifactory-stage1")
+    assert state["retained_lifecycle"] == "imported"
+    assert state["import_failure"]["pre_import_state_digest"] == imported_digest
+    assert "SECRET" not in json.dumps(state)
+
+
+def test_import_failure_cell_remains_destroyable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from software_factory.execution.cell import CellError
+
+    controller, _runtime, client = _controller(tmp_path)
+    _created(controller, tmp_path)
+    monkeypatch.setattr(
+        client,
+        "prepare",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("SECRET destroy output")),
+    )
+    bundle = tmp_path / "repository.bundle"
+    bundle.write_bytes(b"bundle")
+    manifest = tmp_path / "request.json"
+    manifest.write_bytes(_canonical(_import_manifest()))
+    with pytest.raises(CellError, match="import-operation-failed"):
+        controller.import_request(
+            instance="aifactory-stage1",
+            bundle=bundle.resolve(),
+            manifest=manifest.resolve(),
+        )
+
+    assert controller.destroy(
+        instance="aifactory-stage1", confirm_instance="aifactory-stage1"
+    ) == {"destroyed": True, "instance": "aifactory-stage1"}
+    with (
+        controller._instance_transition_lock("aifactory-stage1"),
+        pytest.raises(CellError, match="cell-unowned"),
+    ):
+            controller._load("aifactory-stage1")
+
+
+def test_import_failure_stop_can_be_recovered_by_operator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from software_factory.execution.cell import CellError
+
+    controller, _runtime, client = _controller(tmp_path)
+    _created(controller, tmp_path)
+    monkeypatch.setattr(
+        client,
+        "prepare",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("SECRET stop failure")),
+    )
+    original_run = controller._run
+    fail_stop_once = True
+
+    def run_with_one_stop_failure(argv: list[str], **kwargs: object) -> bytes:
+        nonlocal fail_stop_once
+        if argv[:2] == ["limactl", "stop"] and fail_stop_once:
+            fail_stop_once = False
+            raise RuntimeError("SECRET stop output")
+        return original_run(argv, **kwargs)
+
+    monkeypatch.setattr(controller, "_run", run_with_one_stop_failure)
+    bundle = tmp_path / "repository.bundle"
+    bundle.write_bytes(b"bundle")
+    manifest = tmp_path / "request.json"
+    manifest.write_bytes(_canonical(_import_manifest()))
+
+    with pytest.raises(CellError, match="import-stop-failed"):
+        controller.import_request(
+            instance="aifactory-stage1",
+            bundle=bundle.resolve(),
+            manifest=manifest.resolve(),
+        )
+    failed = controller._load("aifactory-stage1")
+    assert failed["import_failure"]["stop"]["result"] == "failed"
+    assert "SECRET" not in json.dumps(failed)
+
+    report = controller.stop(instance="aifactory-stage1")
+    assert report["import_failure"]["stop"]["result"] == "stopped"
+    assert report["lifecycle"] == "stopped"
+
+
+def test_import_failure_preserves_allowlisted_guest_stage_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from software_factory.execution.cell import CellError
+
+    controller, _runtime, _client = _controller(tmp_path)
+    _created(controller, tmp_path)
+    original_guest = controller._guest
+
+    def guest_with_lock_refusal(
+        instance: str, action: str, payload: dict[str, object]
+    ) -> dict[str, object]:
+        if action == "import" and payload.get("transition") == "lock":
+            return {"locked": False, "detail": "SECRET guest refusal"}
+        return original_guest(instance, action, payload)
+
+    monkeypatch.setattr(controller, "_guest", guest_with_lock_refusal)
+    bundle = tmp_path / "repository.bundle"
+    bundle.write_bytes(b"bundle")
+    manifest = tmp_path / "request.json"
+    manifest.write_bytes(_canonical(_import_manifest()))
+
+    with pytest.raises(CellError, match="import-operation-failed"):
+        controller.import_request(
+            instance="aifactory-stage1",
+            bundle=bundle.resolve(),
+            manifest=manifest.resolve(),
+        )
+
+    state = controller._load("aifactory-stage1")
+    assert state["import_failure"]["stage"] == "lock"
+    assert state["import_failure"]["reason"] == "import-lock-failed"
+    assert "SECRET" not in json.dumps(state)
+
+
+def test_import_failure_state_rejects_unallowlisted_diagnostic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from software_factory.execution.cell import CellError
+
+    controller, _runtime, client = _controller(tmp_path)
+    _created(controller, tmp_path)
+    monkeypatch.setattr(
+        client,
+        "prepare",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("SECRET raw error")),
+    )
+    bundle = tmp_path / "repository.bundle"
+    bundle.write_bytes(b"bundle")
+    manifest = tmp_path / "request.json"
+    manifest.write_bytes(_canonical(_import_manifest()))
+    with pytest.raises(CellError, match="import-operation-failed"):
+        controller.import_request(
+            instance="aifactory-stage1",
+            bundle=bundle.resolve(),
+            manifest=manifest.resolve(),
+        )
+
+    state_path = tmp_path / "controller/aifactory-stage1/state.json"
+    state = json.loads(state_path.read_bytes())
+    state["import_failure"]["reason"] = "SECRET arbitrary diagnostic"
+    state_path.write_bytes(_canonical(state))
+
+    with (
+        controller._instance_transition_lock("aifactory-stage1"),
+        pytest.raises(CellError, match="controller-state-invalid"),
+    ):
+        controller._load("aifactory-stage1")
+
+
+def test_import_failure_cli_keeps_refusal_generic_and_stop_reports_diagnostic(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import software_factory.execution.cell as cell
+
+    controller, _runtime, client = _controller(tmp_path)
+    _created(controller, tmp_path)
+    raw_secret = "SECRET CLI guest output"
+    monkeypatch.setattr(
+        client,
+        "prepare",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError(raw_secret)),
+    )
+    monkeypatch.setattr(cell, "ValidationCell", lambda **_kwargs: controller)
+    bundle = tmp_path / "repository.bundle"
+    bundle.write_bytes(b"bundle")
+    manifest = tmp_path / "request.json"
+    manifest.write_bytes(_canonical(_import_manifest()))
+    common = {
+        "instance": "aifactory-stage1",
+        "state_root": tmp_path / "ignored",
+    }
+
+    assert cell.cmd_validation_cell(
+        SimpleNamespace(
+            **common,
+            validation_cell_command="import",
+            bundle=bundle.resolve(),
+            manifest=manifest.resolve(),
+        )
+    ) == 2
+    refused = capsys.readouterr()
+    assert refused.out == ""
+    assert refused.err == "validation-cell: operation refused\n"
+
+    assert cell.cmd_validation_cell(
+        SimpleNamespace(**common, validation_cell_command="stop")
+    ) == 0
+    reported = capsys.readouterr()
+    assert reported.err == ""
+    report = json.loads(reported.out)
+    assert report["import_failure"]["stage"] == "prepare"
+    assert report["import_failure"]["reason"] == "import-operation-failed"
+    assert report["runnable"] is False
+    assert raw_secret not in reported.out
 
 
 def test_controller_reuses_command_policy_from_authenticated_bridge_module() -> None:
@@ -5355,6 +5802,204 @@ def test_interrupted_bootstrap_leaves_no_failure_or_detail(
     assert state["create_stage"] == "bootstrap-install"
     assert "failure_stage" not in state
     assert "failure_detail" not in state
+
+
+def _interrupted_bootstrap_cell(tmp_path: Path):
+    from software_factory.execution.cell import ValidationCell
+
+    client = FakeClient()
+
+    class InterruptedBootstrapRuntime(FakeRuntime):
+        def __call__(
+            self, argv: list[str], **kwargs: object
+        ) -> subprocess.CompletedProcess[bytes]:
+            if any(item.endswith("/aifactory-bootstrap-stage") for item in argv):
+                raise KeyboardInterrupt
+            return super().__call__(argv, **kwargs)
+
+    runtime = InterruptedBootstrapRuntime(client)
+    controller = ValidationCell(
+        state_root=tmp_path / "controller",
+        runner=runtime,
+        client_factory=lambda _instance: client,
+        creation_nonce_factory=lambda: "7" * 64,
+    )
+    wheel = tmp_path / "software_factory-0.3.0-py3-none-any.whl"
+    wheel.write_bytes(b"wheel")
+    with pytest.raises(KeyboardInterrupt):
+        controller.create(instance="aifactory-stage1", wheel=wheel.resolve())
+    return controller, runtime, tmp_path / "controller/aifactory-stage1/state.json"
+
+
+def test_stop_retires_an_interrupted_post_hydration_creation(tmp_path: Path) -> None:
+    controller, runtime, state_path = _interrupted_bootstrap_cell(tmp_path)
+    stop_calls_before = sum(
+        argv[:2] == ["limactl", "stop"] for argv, _input in runtime.calls
+    )
+
+    assert controller.stop(instance="aifactory-stage1") == {
+        "instance": "aifactory-stage1",
+        "retained": True,
+    }
+
+    state = json.loads(state_path.read_bytes())
+    assert state["lifecycle"] == "stopped"
+    assert state["retained_lifecycle"] == "pending"
+    assert state["create_stage"] == "bootstrap-install"
+    assert state["failure_stage"] == "bootstrap-install"
+    assert state["creation_failure_stop"] == {
+        "attempted": True,
+        "result": "stopped",
+    }
+    assert "failure_detail" not in state
+    assert sum(
+        argv[:2] == ["limactl", "stop"] for argv, _input in runtime.calls
+    ) == stop_calls_before + 1
+
+
+def test_validation_cell_stop_cli_retires_an_interrupted_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from software_factory import execution
+    from software_factory.cli import main
+
+    controller, _runtime, state_path = _interrupted_bootstrap_cell(tmp_path)
+    monkeypatch.setattr(execution.cell, "ValidationCell", lambda **_kwargs: controller)
+
+    assert (
+        main(
+            [
+                "validation-cell",
+                "stop",
+                "--instance",
+                "aifactory-stage1",
+                "--state-root",
+                str(tmp_path / "controller"),
+            ]
+        )
+        == 0
+    )
+
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert json.loads(output.out) == {
+        "instance": "aifactory-stage1",
+        "retained": True,
+    }
+    state = json.loads(state_path.read_bytes())
+    assert state["lifecycle"] == "stopped"
+    assert state["creation_failure_stop"]["result"] == "stopped"
+
+
+def test_stop_reconciles_an_already_stopped_interrupted_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    controller, runtime, state_path = _interrupted_bootstrap_cell(tmp_path)
+    stop_calls_before = sum(
+        argv[:2] == ["limactl", "stop"] for argv, _input in runtime.calls
+    )
+    monkeypatch.setattr(
+        controller, "_lima_instance_status", lambda _instance: "Stopped"
+    )
+
+    assert controller.stop(instance="aifactory-stage1")["retained"] is True
+    assert controller.stop(instance="aifactory-stage1")["retained"] is True
+
+    state = json.loads(state_path.read_bytes())
+    assert state["lifecycle"] == "stopped"
+    assert state["creation_failure_stop"]["result"] == "stopped"
+    assert sum(
+        argv[:2] == ["limactl", "stop"] for argv, _input in runtime.calls
+    ) == stop_calls_before
+
+
+def test_interrupted_creation_stop_failure_is_retained(
+    tmp_path: Path,
+) -> None:
+    from software_factory.execution.cell import CellError
+
+    controller, _runtime, state_path = _interrupted_bootstrap_cell(tmp_path)
+
+    def fail_stop(
+        argv: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(argv, 19, b"SECRET stdout", b"SECRET stderr")
+
+    controller._runner = fail_stop
+    with pytest.raises(CellError, match="creation-failure-stop-failed"):
+        controller.stop(instance="aifactory-stage1")
+
+    state = json.loads(state_path.read_bytes())
+    assert state["lifecycle"] == "pending"
+    assert state["failure_stage"] == "bootstrap-install"
+    assert state["failure_detail"] == "controller-stop-failed"
+    assert state["creation_failure_stop"] == {
+        "attempted": True,
+        "result": "failed",
+    }
+    assert "SECRET" not in json.dumps(state)
+
+
+def test_interrupted_creation_stop_rejects_stale_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from software_factory.execution.cell import CellError
+
+    controller, _runtime, state_path = _interrupted_bootstrap_cell(tmp_path)
+
+    def drift_state(_instance: str) -> str:
+        state = json.loads(state_path.read_bytes())
+        state["concurrent_observation"] = True
+        state_path.write_bytes(_canonical(state))
+        return "Stopped"
+
+    monkeypatch.setattr(controller, "_lima_instance_status", drift_state)
+    with pytest.raises(CellError, match="creation-failure-stop-failed"):
+        controller.stop(instance="aifactory-stage1")
+
+    state = json.loads(state_path.read_bytes())
+    assert state["concurrent_observation"] is True
+    assert "creation_failure_stop" not in state
+
+
+def test_interrupted_creation_recovery_requires_controller_authority(
+    tmp_path: Path,
+) -> None:
+    from software_factory.execution.cell import CellError
+
+    controller, runtime, state_path = _interrupted_bootstrap_cell(tmp_path)
+    state = json.loads(state_path.read_bytes())
+    state["created_by_controller"] = False
+    state_path.write_bytes(_canonical(state))
+    runtime.calls.clear()
+
+    with pytest.raises(CellError, match="stop-transition-invalid"):
+        controller.stop(instance="aifactory-stage1")
+    assert runtime.calls == []
+
+
+def test_retired_interrupted_creation_cannot_resume_or_accept_work(
+    tmp_path: Path,
+) -> None:
+    from software_factory.execution.cell import CellError
+
+    controller, runtime, _state_path = _interrupted_bootstrap_cell(tmp_path)
+    controller.stop(instance="aifactory-stage1")
+    runtime.calls.clear()
+
+    with pytest.raises(CellError, match="start-transition-invalid"):
+        controller.start(instance="aifactory-stage1")
+    with pytest.raises(CellError, match="import-transition-invalid"):
+        controller.import_request(
+            instance="aifactory-stage1",
+            bundle=tmp_path / "unused-bundle",
+            manifest=tmp_path / "unused-manifest",
+        )
+    with pytest.raises(CellError, match="cell-not-sealed"):
+        controller.probe(instance="aifactory-stage1")
+    assert runtime.calls == []
 
 
 @pytest.mark.parametrize(
@@ -9793,6 +10438,14 @@ def test_guest_dependencies_installs_one_nested_project_without_root_mutation(
     monkeypatch.setattr(cell, "_measure_pnpm_toolchain", lambda _root: dict(PNPM_IDENTITY))
     monkeypatch.setattr(cell.os, "chown", lambda *_args: None)
     _mock_dependency_identity(monkeypatch)
+    exclude_calls: list[tuple[Path, Path]] = []
+    monkeypatch.setattr(
+        cell,
+        "_exclude_managed_dependency_tree",
+        lambda repository, dependency_project: exclude_calls.append(
+            (repository, dependency_project)
+        ),
+    )
     monkeypatch.setattr(
         cell,
         "_remove_dependency_control_tree",
@@ -9820,11 +10473,76 @@ def test_guest_dependencies_installs_one_nested_project_without_root_mutation(
     assert project.joinpath("node_modules").is_dir()
     assert not workspace.joinpath("node_modules").exists()
     assert not workspace.joinpath(".aifactory-dependencies").exists()
+    assert exclude_calls == [(workspace, project)]
     assert result["installed"] is True
     persisted = captured[str(cell._GUEST_STATE)]
     assert persisted["dependency"]["request"]["lockfile"] == (
         "prototype/pnpm-lock.yaml"
     )
+
+
+@pytest.mark.parametrize("project_relative", [Path("."), Path("prototype")])
+def test_managed_dependency_tree_is_privately_excluded_without_hiding_other_changes(
+    tmp_path: Path, project_relative: Path
+) -> None:
+    import software_factory.execution.cell as cell
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    subprocess.run(["git", "init", "-q", workspace], check=True)
+    subprocess.run(
+        ["git", "-C", workspace, "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", workspace, "config", "user.name", "AIFactory Test"],
+        check=True,
+    )
+    (workspace / "tracked.txt").write_text("accepted\n", encoding="utf-8")
+    subprocess.run(["git", "-C", workspace, "add", "tracked.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", workspace, "commit", "-q", "-m", "fixture"], check=True
+    )
+    project = (workspace / project_relative).resolve()
+    project.mkdir(parents=True, exist_ok=True)
+
+    cell._exclude_managed_dependency_tree(workspace, project)
+    cell._exclude_managed_dependency_tree(workspace, project)
+
+    dependency_file = project / "node_modules" / "fixture" / "index.js"
+    dependency_file.parent.mkdir(parents=True)
+    dependency_file.write_text("module.exports = true;\n", encoding="utf-8")
+    (workspace / "unrelated.txt").write_text("must remain visible\n", encoding="utf-8")
+    status = subprocess.run(
+        ["git", "-C", workspace, "status", "--porcelain=v1", "--untracked-files=all"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    expected = "/node_modules/" if project_relative == Path(".") else "/prototype/node_modules/"
+    exclude = (workspace / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+    assert exclude.splitlines().count(expected) == 1
+    assert status == "?? unrelated.txt\n"
+
+
+def test_managed_dependency_exclusion_rejects_a_symlinked_git_target(tmp_path: Path) -> None:
+    import software_factory.execution.cell as cell
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    subprocess.run(["git", "init", "-q", workspace], check=True)
+    exclude = workspace / ".git" / "info" / "exclude"
+    original = exclude.read_bytes()
+    outside = tmp_path / "outside"
+    outside.write_bytes(original)
+    exclude.unlink()
+    exclude.symlink_to(outside)
+
+    with pytest.raises(cell.CellError, match="dependency-exclude-invalid"):
+        cell._exclude_managed_dependency_tree(workspace, workspace)
+
+    assert outside.read_bytes() == original
 
 
 def test_guest_dependencies_rejects_a_symlink_in_nested_project_ancestry(
@@ -9972,6 +10690,14 @@ def test_guest_dependencies_executes_exact_pinned_unprivileged_recipe(
 
     monkeypatch.setattr(cell, "_write_private", write_private)
     monkeypatch.setattr(cell.os, "chown", chown)
+    exclude_calls: list[tuple[Path, Path]] = []
+    monkeypatch.setattr(
+        cell,
+        "_exclude_managed_dependency_tree",
+        lambda repository, dependency_project: exclude_calls.append(
+            (repository, dependency_project)
+        ),
+    )
     cleanup_calls: list[tuple[Path, int]] = []
 
     def cleanup(path: Path, *, expected_uid: int) -> None:
@@ -10137,6 +10863,7 @@ def test_guest_dependencies_executes_exact_pinned_unprivileged_recipe(
     )
     assert chowns
     assert all((uid, gid) == (DEPENDENCY_UID, DEPENDENCY_GID) for _path, uid, gid in chowns)
+    assert exclude_calls == [(workspace, workspace)]
     assert cleanup_calls == [(workspace, DEPENDENCY_UID)]
     assert not control.exists()
     assert result == {

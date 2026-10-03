@@ -1769,24 +1769,47 @@ class LimaLeashRunner:
             for allowed in allowed_paths
         )
 
-    def _reset_denied(self, context: str, revision: str, *, category: str, model: str) -> RunResult:
+    def _reset_denied(
+        self,
+        context: str,
+        revision: str,
+        *,
+        category: str,
+        model: str,
+        failure_reason: str | None = None,
+    ) -> RunResult:
         try:
             result = self._workspace_result(context, "reset_to", {"revision": revision})
             if result != {"reset": True}:
                 raise RuntimeError("reset was not confirmed")
         except Exception:
             category = "process"
-        return RunResult(
-            ok=False,
-            output="scoped execution denied",
-            model=model,
-            meta={
+        safe_failure_reasons = {
+            "agent-exit-nonzero",
+            "agent-timeout-cleanup-failed",
+            "claude-result-invalid",
+            "guest-operation-failed",
+            "timeout",
+        }
+        if failure_reason is not None:
+            meta = (
+                {"executor_failure_reason": failure_reason}
+                if failure_reason in safe_failure_reasons
+                else {}
+            )
+        else:
+            meta = {
                 "executor_action": {
                     "schema_version": "executor-action-v1",
                     "disposition": "denied",
                     "category": category,
                 }
-            },
+            }
+        return RunResult(
+            ok=False,
+            output="scoped execution denied",
+            model=model,
+            meta=meta,
         )
 
     def run_scoped_agent(
@@ -1839,6 +1862,7 @@ class LimaLeashRunner:
             )
             if type(response) is not BridgeResponse or response.status != "ok":
                 category = "process"
+                failure_reason = None
                 if type(response) is BridgeResponse and response.status == "denied":
                     action = response.result.get("action")
                     category = (
@@ -1848,8 +1872,16 @@ class LimaLeashRunner:
                         if action in {"file.read", "file.write"}
                         else "process"
                     )
+                elif type(response) is BridgeResponse and response.status == "failed":
+                    reason = response.result.get("reason")
+                    if type(reason) is str:
+                        failure_reason = reason
                 return self._reset_denied(
-                    scope.context_digest, scope.input_revision, category=category, model=model
+                    scope.context_digest,
+                    scope.input_revision,
+                    category=category,
+                    model=model,
+                    failure_reason=failure_reason,
                 )
             result = dict(response.result)
             if (

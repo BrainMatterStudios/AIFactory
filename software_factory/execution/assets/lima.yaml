@@ -4,7 +4,7 @@
 vmType: vz
 arch: aarch64
 images:
-  - location: https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-arm64.img
+  - location: https://cloud-images.ubuntu.com/noble/20260826/noble-server-cloudimg-arm64.img
     arch: aarch64
     digest: sha256:afa139bac6f2629c1e1f2f8f34215f3a9ad9779801bcb945521ba1a45016743f
 cpus: 4
@@ -84,6 +84,11 @@ provision:
       # the Leash agent container at /root/.claude.
       install -d -o root -g root -m 0700 /var/lib/aifactory/model-auth
       install -d -o root -g root -m 0700 /var/lib/aifactory/model-auth/.claude
+      if [ ! -e /var/lib/aifactory/model-auth/.claude.json ] && [ ! -L /var/lib/aifactory/model-auth/.claude.json ]; then
+        install -o root -g root -m 0600 /dev/null /var/lib/aifactory/model-auth/.claude.json
+      fi
+      test "$(stat -c '%F:%U:%G:%a' /var/lib/aifactory/model-auth/.claude.json)" = "regular empty file:root:root:600" ||
+        test "$(stat -c '%F:%U:%G:%a' /var/lib/aifactory/model-auth/.claude.json)" = "regular file:root:root:600"
       # Automated bridge runs never consult interactive or persisted Leash
       # settings. This empty root-private directory is its fixed LEASH_HOME.
       install -d -o root -g root -m 0700 /var/lib/aifactory/automated-leash-home

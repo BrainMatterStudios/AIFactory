@@ -92,6 +92,13 @@ establish all of the following:
    views; and any threat-model-driven capability vocabulary changes. It must not
    be used to justify a second approval language or parallel authority system.
 
+`factory release readiness 0.4.0` projects this entry gate into a deterministic
+operator preflight. It accepts only a redacted public-safe evidence summary and
+fails closed when that summary is absent, incomplete, vacuous, unavailable, or
+unsafe. A ready preflight authorizes only the next design activity; it is not a
+version bump, release approval, publication approval, or substitute for the
+later detailed design and implementation reviews.
+
 Repository-specific field trials are deliberately outside this roadmap's
 implementation deliverables. An operator may run one only as a separately
 approved, rollbackable activity using controller-owned inputs and private
