@@ -517,6 +517,7 @@ directory or API key:
 ```bash
 CODER_REFERENCE="$("$AIFACTORY_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["guest"]["coder_image_reference"])' "$DOCTOR_RECORD")"
 LEASH_REFERENCE="$("$AIFACTORY_PYTHON" -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["guest"]["leash_image_reference"])' "$DOCTOR_RECORD")"
+MODEL_AUTH_FILE=/var/lib/aifactory/model-auth/.claude.json
 
 limactl --tty=true shell "$INSTANCE" -- \
   /usr/bin/sudo -n -- /usr/bin/env LEASH_DISABLE_TELEMETRY=1 \
@@ -528,6 +529,7 @@ limactl --tty=true shell "$INSTANCE" -- \
   --image "$CODER_REFERENCE" \
   --env LEASH_DISABLE_TELEMETRY=1 \
   --volume /var/lib/aifactory/model-auth/.claude:/root/.claude \
+  --volume "$MODEL_AUTH_FILE:/root/.claude.json" \
   claude auth login --claudeai
 ```
 

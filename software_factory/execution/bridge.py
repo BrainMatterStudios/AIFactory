@@ -96,6 +96,8 @@ _LEASH_NODE = Path("/usr/bin/node")
 _NFT_PATH = Path("/usr/sbin/nft")
 _MODEL_AUTH_DIR = Path("/var/lib/aifactory/model-auth/.claude")
 _MODEL_AUTH_TARGET = "/root/.claude"
+_MODEL_AUTH_FILE = Path("/var/lib/aifactory/model-auth/.claude.json")
+_MODEL_AUTH_FILE_TARGET = "/root/.claude.json"
 _LEASH_HOME = Path("/var/lib/aifactory/automated-leash-home")
 _PNPM_IDENTITY_FIELDS = (
     "pnpm_version",
@@ -2365,7 +2367,7 @@ class ExecutionBridge:
         self._verify_scope_revisions(workspace, scope, authority)
         if fingerprint_repository_surface(workspace) != scope.input_fingerprint:
             raise BridgeFailure("input-fingerprint-mismatch")
-        auth_volume = _model_auth_volume(self.config)
+        auth_volumes = _model_auth_volumes(self.config)
         effective_policy = _write_effective_policy(
             self.config, request.request_id, workspace, scope, authority
         )
@@ -2387,8 +2389,7 @@ class ExecutionBridge:
                             self._sealed_runtime()["image_reference"],
                             "--env",
                             "LEASH_DISABLE_TELEMETRY=1",
-                            "--volume",
-                            auth_volume,
+                            *(argument for volume in auth_volumes for argument in ("--volume", volume)),
                             "claude",
                             "-p",
                             prompt,
@@ -3751,11 +3752,24 @@ def validate_bridge_authority_policy(manifest: Mapping[str, Any]) -> None:
 
 
 def _model_auth_volume(config: BridgeConfig) -> str:
-    """Return the only credential mount accepted by the bridge."""
+    """Return the fixed Claude credential-directory mount."""
     source = _private_automation_directory(
         config, _MODEL_AUTH_DIR, reason="model-auth-invalid", require_empty=False
     )
     return f"{source}:{_MODEL_AUTH_TARGET}"
+
+
+def _model_auth_volumes(config: BridgeConfig) -> tuple[str, str]:
+    """Return the complete fixed Claude credential mounts."""
+    directory = _model_auth_volume(config)
+    _read_regular_path(
+        _MODEL_AUTH_FILE,
+        max_bytes=1024 * 1024,
+        expected_uid=config.root_uid,
+        exact_mode=0o600,
+        reason="model-auth-invalid",
+    )
+    return directory, f"{_MODEL_AUTH_FILE}:{_MODEL_AUTH_FILE_TARGET}"
 
 
 def _automated_leash_environment(config: BridgeConfig) -> dict[str, str]:

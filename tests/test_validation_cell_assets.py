@@ -1546,16 +1546,18 @@ def test_lima_template_provisions_private_model_auth_outside_workspace_and_expor
     provision = yaml.safe_load(asset_bytes("lima.yaml"))["provision"][0]["script"]
     auth_root = Path("/var/lib/aifactory/model-auth")
     auth_directory = auth_root / ".claude"
+    auth_file = auth_root / ".claude.json"
 
     assert "install -d -o root -g root -m 0700 /var/lib/aifactory/model-auth" in provision
     assert "install -d -o root -g root -m 0700 /var/lib/aifactory/model-auth/.claude" in provision
+    assert "install -o root -g root -m 0600 /dev/null /var/lib/aifactory/model-auth/.claude.json" in provision
     assert "install -d -o root -g root -m 0700 /var/lib/aifactory/automated-leash-home" in provision
     for surface in (
         Path("/srv/aifactory/workspaces"),
         Path("/srv/aifactory/exports"),
         Path("/srv/aifactory/imports"),
     ):
-        assert surface not in (auth_directory, *auth_directory.parents)
+        assert surface not in (auth_directory, auth_file, *auth_directory.parents)
 
 
 def test_lima_template_parses_when_yaml_extra_is_available() -> None:
@@ -2953,6 +2955,7 @@ def test_cedar_policy_preserves_leash_117_vocabulary_and_default_denies() -> Non
         'Action::"ProcessExec"',
         'Action::"NetworkConnect"',
         'File::"/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"',
+        'File::"/root/.claude.json"',
         'Dir::"/srv/aifactory/workspaces/__CONTEXT_DIGEST__/"',
         'Host::"api.anthropic.com:443"',
         'Host::"claude.ai:443"',

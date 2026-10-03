@@ -225,12 +225,16 @@ def _bridge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ExecutionBridge:
     seal = tmp_path / "sealed.json"
     cell_state = tmp_path / "cell-state.json"
     model_auth = tmp_path / "model-auth" / ".claude"
+    model_auth_file = tmp_path / "model-auth" / ".claude.json"
     leash_home = tmp_path / "automated-leash-home"
     model_auth.mkdir(parents=True, mode=0o700)
     model_auth.chmod(0o700)
+    model_auth_file.write_text("{}\n", encoding="ascii")
+    model_auth_file.chmod(0o600)
     leash_home.mkdir(mode=0o700)
     leash_home.chmod(0o700)
     monkeypatch.setattr(execution_bridge, "_MODEL_AUTH_DIR", model_auth)
+    monkeypatch.setattr(execution_bridge, "_MODEL_AUTH_FILE", model_auth_file, raising=False)
     monkeypatch.setattr(execution_bridge, "_LEASH_HOME", leash_home, raising=False)
     identity.write_text("sha256:" + "0" * 64 + "\n", encoding="ascii")
     policy.write_bytes(b"permit();\n")
@@ -3910,8 +3914,10 @@ def test_run_agent_mounts_only_the_fixed_guest_model_auth_directory(
             "public.ecr.aws/s5i7k8t3/strongdm/coder@sha256:" + "9" * 64,
             "--env",
             "LEASH_DISABLE_TELEMETRY=1",
-            "--volume",
+        "--volume",
         str(tmp_path / "model-auth" / ".claude") + ":/root/.claude",
+        "--volume",
+        str(tmp_path / "model-auth" / ".claude.json") + ":/root/.claude.json",
         "claude",
         "-p",
         "secret",
@@ -3988,6 +3994,41 @@ def test_run_agent_exposes_only_the_exact_authorized_tools(
 def test_bridge_config_cannot_select_model_auth_authority() -> None:
     """A caller-selected auth source would defeat the fixed guest credential boundary."""
     assert "model_auth_dir" not in BridgeConfig.__dataclass_fields__
+
+
+def test_model_auth_volumes_include_fixed_claude_config_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude Code must persist its sibling config instead of recreating it denied."""
+    bridge = _bridge(tmp_path, monkeypatch)
+
+    assert execution_bridge._model_auth_volumes(bridge.config) == (
+        str(tmp_path / "model-auth" / ".claude") + ":/root/.claude",
+        str(tmp_path / "model-auth" / ".claude.json") + ":/root/.claude.json",
+    )
+
+
+@pytest.mark.parametrize("kind", ("missing", "symlink", "wrong-mode", "wrong-owner"))
+def test_model_auth_refuses_missing_or_unsafe_fixed_config_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """The sibling config mount must remain a fixed owner-private regular file."""
+    bridge = _bridge(tmp_path, monkeypatch)
+    source = tmp_path / "model-auth" / ".claude.json"
+    source.unlink()
+    config = bridge.config
+    if kind == "symlink":
+        target = tmp_path / "config-target"
+        target.write_text("{}\n", encoding="ascii")
+        source.symlink_to(target)
+    elif kind != "missing":
+        source.write_text("{}\n", encoding="ascii")
+        source.chmod(0o644 if kind == "wrong-mode" else 0o600)
+        if kind == "wrong-owner":
+            config = replace(config, root_uid=os.getuid() + 1)
+
+    with pytest.raises(execution_bridge.BridgeFailure, match="model-auth-invalid"):
+        execution_bridge._model_auth_volumes(config)
 
 
 @pytest.mark.parametrize("kind", ("missing", "symlink", "wrong-mode", "wrong-owner"))
