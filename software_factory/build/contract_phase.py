@@ -76,6 +76,11 @@ _RUNNER_FAILURE_REASONS = {
     "guest-operation-failed": "contract-runner-guest-operation-failed",
     "timeout": "contract-runner-timeout",
 }
+_RUNNER_DENIAL_REASONS = {
+    "filesystem": "contract-runner-filesystem-denied",
+    "network": "contract-runner-network-denied",
+    "process": "contract-runner-process-denied",
+}
 
 
 @dataclass(frozen=True)
@@ -160,7 +165,21 @@ def _runner_failure_reason(turn: Any) -> str:
     if not isinstance(meta, Mapping):
         return _CONTRACT_EXTERNAL_FAILURE
     reason = meta.get("executor_failure_reason")
-    return _RUNNER_FAILURE_REASONS.get(reason, _CONTRACT_EXTERNAL_FAILURE)
+    if reason in _RUNNER_FAILURE_REASONS:
+        return _RUNNER_FAILURE_REASONS[reason]
+    action = meta.get("executor_action")
+    if not isinstance(action, Mapping) or set(action) != {
+        "schema_version",
+        "disposition",
+        "category",
+    }:
+        return _CONTRACT_EXTERNAL_FAILURE
+    if (
+        action["schema_version"] != "executor-action-v1"
+        or action["disposition"] != "denied"
+    ):
+        return _CONTRACT_EXTERNAL_FAILURE
+    return _RUNNER_DENIAL_REASONS.get(action["category"], _CONTRACT_EXTERNAL_FAILURE)
 
 
 def _clear_stale_contract_draft(workspace: Workspace, contract_path: str) -> None:

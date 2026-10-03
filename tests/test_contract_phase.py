@@ -372,7 +372,27 @@ def test_missing_contract_is_blocked_without_workspace_preservation(tmp_path):
     ("meta", "reason"),
     [
         ({"executor_failure_reason": "timeout"}, "contract-runner-timeout"),
+        (
+            {
+                "executor_action": {
+                    "schema_version": "executor-action-v1",
+                    "disposition": "denied",
+                    "category": "process",
+                }
+            },
+            "contract-runner-process-denied",
+        ),
         ({"executor_failure_reason": "secret provider detail"}, "contract-external-failure"),
+        (
+            {
+                "executor_action": {
+                    "schema_version": "executor-action-v1",
+                    "disposition": "denied",
+                    "category": "secret provider detail",
+                }
+            },
+            "contract-external-failure",
+        ),
     ],
 )
 def test_failed_contract_runner_exposes_only_bounded_authenticated_reason(
