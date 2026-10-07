@@ -3925,6 +3925,7 @@ def test_run_agent_mounts_only_the_fixed_guest_model_auth_directory(
         "sonnet",
         "--output-format",
         "json",
+        "--no-session-persistence",
         "--strict-mcp-config",
         "--tools",
         "",

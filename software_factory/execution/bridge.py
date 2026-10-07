@@ -2397,6 +2397,7 @@ class ExecutionBridge:
                             model,
                             "--output-format",
                             "json",
+                            "--no-session-persistence",
                             *(["--append-system-prompt", system] if system is not None else []),
                             "--strict-mcp-config",
                             "--tools",
