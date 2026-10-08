@@ -377,6 +377,10 @@ def test_missing_contract_is_blocked_without_workspace_preservation(tmp_path):
             "contract-runner-exit-nonzero",
         ),
         (
+            {"executor_failure_reason": "claude-error-during-execution"},
+            "contract-runner-claude-error-during-execution",
+        ),
+        (
             {
                 "executor_action": {
                     "schema_version": "executor-action-v1",

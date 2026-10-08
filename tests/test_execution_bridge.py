@@ -3438,6 +3438,57 @@ def test_nonzero_agent_exit_is_not_fabricated_as_a_process_denial(
     assert "secret" not in json.dumps(response.result)
 
 
+@pytest.mark.parametrize(
+    ("subtype", "reason"),
+    [
+        ("error_during_execution", "claude-error-during-execution"),
+        ("error_max_turns", "claude-error-max-turns"),
+        ("error_max_budget_usd", "claude-error-max-budget"),
+    ],
+)
+def test_nonzero_agent_exit_preserves_only_allowlisted_claude_result_subtype(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    subtype: str,
+    reason: str,
+) -> None:
+    bridge = _bridge(tmp_path, monkeypatch)
+    workspace = bridge.config.workspace_root / CONTEXT
+    workspace.mkdir(parents=True)
+    _authority(bridge)
+
+    def failed(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["git", "config", "--local"]:
+            return _completed(argv)
+        if argv[:2] == ["git", "rev-parse"]:
+            return _completed(argv, stdout=BASE + "\n")
+        if argv[:3] == ["git", "merge-base", "--is-ancestor"]:
+            return _completed(argv)
+        payload = {
+            "type": "result",
+            "subtype": subtype,
+            "is_error": True,
+            "result": "provider detail token=secret",
+        }
+        return _completed(argv, returncode=1, stdout=json.dumps(payload))
+
+    monkeypatch.setattr("software_factory.execution.bridge._run_bounded_process", failed)
+    scope = {
+        "context_digest": CONTEXT,
+        "turn_kind": "implementation",
+        "base_revision": BASE,
+        "input_revision": BASE,
+        "writable_paths": ["src/x.py"],
+        "timeout_seconds": 10,
+        "network_profile": "model-only-v1",
+    }
+    response = bridge.handle(_request("run-agent", {"prompt": "never echo", "scope": scope}))
+
+    assert response.status == "failed"
+    assert response.result == {"reason": reason}
+    assert "secret" not in json.dumps(response.result)
+
+
 def test_export_rejects_uncommitted_or_non_head_revision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1787,6 +1787,9 @@ class LimaLeashRunner:
         safe_failure_reasons = {
             "agent-exit-nonzero",
             "agent-timeout-cleanup-failed",
+            "claude-error-during-execution",
+            "claude-error-max-budget",
+            "claude-error-max-turns",
             "claude-result-invalid",
             "guest-operation-failed",
             "timeout",

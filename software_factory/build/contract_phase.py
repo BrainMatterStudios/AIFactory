@@ -73,6 +73,9 @@ _CONTRACT_SPEC_PENDING = "contract-spec-pending"
 _RUNNER_FAILURE_REASONS = {
     "agent-exit-nonzero": "contract-runner-exit-nonzero",
     "agent-timeout-cleanup-failed": "contract-runner-timeout-cleanup-failed",
+    "claude-error-during-execution": "contract-runner-claude-error-during-execution",
+    "claude-error-max-budget": "contract-runner-claude-error-max-budget",
+    "claude-error-max-turns": "contract-runner-claude-error-max-turns",
     "claude-result-invalid": "contract-runner-result-invalid",
     "guest-operation-failed": "contract-runner-guest-operation-failed",
     "timeout": "contract-runner-timeout",

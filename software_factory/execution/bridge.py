@@ -2423,7 +2423,7 @@ class ExecutionBridge:
                 state_root=self.config.state_root,
             )
         if completed.returncode != 0:
-            raise BridgeFailure("agent-exit-nonzero")
+            raise BridgeFailure(_claude_nonzero_reason(completed.stdout))
         try:
             parsed = _terminal_json_record(completed.stdout)
             if not isinstance(parsed, dict) or type(parsed.get("result")) is not str:
@@ -7018,6 +7018,26 @@ def _terminal_json_record(output: str) -> Any:
     if not stripped:
         raise json.JSONDecodeError("empty command output", output, 0)
     return json.loads(stripped.rsplit("\n", 1)[-1].strip())
+
+
+def _claude_nonzero_reason(output: str) -> str:
+    """Preserve only fixed Claude result subtypes from a failed author turn."""
+    reasons = {
+        "error_during_execution": "claude-error-during-execution",
+        "error_max_turns": "claude-error-max-turns",
+        "error_max_budget_usd": "claude-error-max-budget",
+    }
+    try:
+        record = _terminal_json_record(output)
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return "agent-exit-nonzero"
+    if (
+        not isinstance(record, dict)
+        or record.get("type") != "result"
+        or record.get("is_error") is not True
+    ):
+        return "agent-exit-nonzero"
+    return reasons.get(record.get("subtype"), "agent-exit-nonzero")
 
 
 def _verifier_launch_status(
