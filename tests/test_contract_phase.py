@@ -368,6 +368,56 @@ def test_missing_contract_is_blocked_without_workspace_preservation(tmp_path):
     assert result.revision_request_digest is None
 
 
+@pytest.mark.parametrize(
+    ("meta", "reason"),
+    [
+        ({"executor_failure_reason": "timeout"}, "contract-runner-timeout"),
+        (
+            {"executor_failure_reason": "agent-exit-nonzero"},
+            "contract-runner-exit-nonzero",
+        ),
+        (
+            {"executor_failure_reason": "claude-error-during-execution"},
+            "contract-runner-claude-error-during-execution",
+        ),
+        (
+            {
+                "executor_action": {
+                    "schema_version": "executor-action-v1",
+                    "disposition": "denied",
+                    "category": "process",
+                }
+            },
+            "contract-runner-process-denied",
+        ),
+        ({"executor_failure_reason": "secret provider detail"}, "contract-external-failure"),
+        (
+            {
+                "executor_action": {
+                    "schema_version": "executor-action-v1",
+                    "disposition": "denied",
+                    "category": "secret provider detail",
+                }
+            },
+            "contract-external-failure",
+        ),
+    ],
+)
+def test_failed_contract_runner_exposes_only_bounded_authenticated_reason(
+    tmp_path, meta, reason
+):
+    class FailedRunner:
+        def run_agent(self, prompt, *, model, system=None, tools=None, cwd=None):
+            del prompt, system, tools, cwd
+            return RunResult(False, "must remain private", model, meta=meta)
+
+    result = _run(tmp_path, FailedRunner())
+
+    assert result.disposition is IntentDisposition.BLOCKED
+    assert result.reason == reason
+    assert "private" not in result.reason
+
+
 def test_missing_contract_reason_scrubs_secret_shaped_issue_identity(tmp_path):
     secret = "b" * 40
 

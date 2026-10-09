@@ -27,6 +27,38 @@ SCHEMA_VERSION = "execution-bridge-v1"
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_EVIDENCE_ITEMS = 256
+PREPARE_FAILURE_REASONS = frozenset(
+    {
+        "authority-invalid",
+        "base-revision-mismatch",
+        "command-failed",
+        "command-output-invalid",
+        "command-output-too-large",
+        "git-environment-invalid",
+        "guest-file-unsafe",
+        "guest-operation-failed",
+        "guest-path-unsafe",
+        "guest-state-unsafe",
+        "import-authority-mismatch",
+        "import-digest-mismatch",
+        "import-missing",
+        "invalid-command",
+        "invalid-digest",
+        "invalid-path",
+        "invalid-payload",
+        "invalid-revision",
+        "manifest-identity-mismatch",
+        "manifest-invalid",
+        "policy-invalid",
+        "prepare-identity-mismatch",
+        "response-encoding-failed",
+        "scope-not-representable",
+        "timeout",
+        "workspace-dirty",
+        "workspace-root-unsafe",
+        "workspace-unsafe",
+    }
+)
 CONTAINMENT_FAILURE_REASONS = frozenset(
     {
         "cell-not-sealed",
@@ -287,6 +319,7 @@ __all__ = [
     "MAX_EVIDENCE_ITEMS",
     "MAX_REQUEST_BYTES",
     "MAX_RESPONSE_BYTES",
+    "PREPARE_FAILURE_REASONS",
     "SCHEMA_VERSION",
     "BridgeProtocolError",
     "BridgeRequest",

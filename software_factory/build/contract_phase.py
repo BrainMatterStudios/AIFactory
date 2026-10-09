@@ -70,6 +70,21 @@ _CONTRACT_ACCEPTED = "contract-accepted"
 _CONTRACT_APPROVAL_PENDING = "contract-approval-pending"
 _CONTRACT_EXTERNAL_FAILURE = "contract-external-failure"
 _CONTRACT_SPEC_PENDING = "contract-spec-pending"
+_RUNNER_FAILURE_REASONS = {
+    "agent-exit-nonzero": "contract-runner-exit-nonzero",
+    "agent-timeout-cleanup-failed": "contract-runner-timeout-cleanup-failed",
+    "claude-error-during-execution": "contract-runner-claude-error-during-execution",
+    "claude-error-max-budget": "contract-runner-claude-error-max-budget",
+    "claude-error-max-turns": "contract-runner-claude-error-max-turns",
+    "claude-result-invalid": "contract-runner-result-invalid",
+    "guest-operation-failed": "contract-runner-guest-operation-failed",
+    "timeout": "contract-runner-timeout",
+}
+_RUNNER_DENIAL_REASONS = {
+    "filesystem": "contract-runner-filesystem-denied",
+    "network": "contract-runner-network-denied",
+    "process": "contract-runner-process-denied",
+}
 
 
 @dataclass(frozen=True)
@@ -147,6 +162,28 @@ def _contract_path(contracts_dir: str, issue_id: str) -> str:
     if directory.is_absolute() or ".." in directory.parts or "." in directory.parts:
         raise ValueError("contracts directory is invalid")
     return str(directory / f"{issue_id}.json")
+
+
+def _runner_failure_reason(turn: Any) -> str:
+    meta = getattr(turn, "meta", None)
+    if not isinstance(meta, Mapping):
+        return _CONTRACT_EXTERNAL_FAILURE
+    reason = meta.get("executor_failure_reason")
+    if reason in _RUNNER_FAILURE_REASONS:
+        return _RUNNER_FAILURE_REASONS[reason]
+    action = meta.get("executor_action")
+    if not isinstance(action, Mapping) or set(action) != {
+        "schema_version",
+        "disposition",
+        "category",
+    }:
+        return _CONTRACT_EXTERNAL_FAILURE
+    if (
+        action["schema_version"] != "executor-action-v1"
+        or action["disposition"] != "denied"
+    ):
+        return _CONTRACT_EXTERNAL_FAILURE
+    return _RUNNER_DENIAL_REASONS.get(action["category"], _CONTRACT_EXTERNAL_FAILURE)
 
 
 def _clear_stale_contract_draft(workspace: Workspace, contract_path: str) -> None:
@@ -620,7 +657,7 @@ def run_contract_phase(
     if not resuming and (turn is None or not turn.ok):
         return phase_result(
             IntentDisposition.BLOCKED,
-            _CONTRACT_EXTERNAL_FAILURE,
+            _runner_failure_reason(turn),
             keep_workspace=True,
         )
 
