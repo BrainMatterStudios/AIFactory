@@ -381,6 +381,22 @@ def test_missing_contract_is_blocked_without_workspace_preservation(tmp_path):
             "contract-runner-claude-error-during-execution",
         ),
         (
+            {"executor_failure_reason": "filesystem-repository-denied"},
+            "contract-runner-filesystem-repository-denied",
+        ),
+        (
+            {"executor_failure_reason": "filesystem-system-denied"},
+            "contract-runner-filesystem-system-denied",
+        ),
+        (
+            {"executor_failure_reason": "filesystem-controller-state-denied"},
+            "contract-runner-filesystem-controller-state-denied",
+        ),
+        (
+            {"executor_failure_reason": "filesystem-unknown-denied"},
+            "contract-runner-filesystem-unknown-denied",
+        ),
+        (
             {
                 "executor_action": {
                     "schema_version": "executor-action-v1",

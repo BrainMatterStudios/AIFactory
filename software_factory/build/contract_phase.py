@@ -77,6 +77,10 @@ _RUNNER_FAILURE_REASONS = {
     "claude-error-max-budget": "contract-runner-claude-error-max-budget",
     "claude-error-max-turns": "contract-runner-claude-error-max-turns",
     "claude-result-invalid": "contract-runner-result-invalid",
+    "filesystem-controller-state-denied": "contract-runner-filesystem-controller-state-denied",
+    "filesystem-repository-denied": "contract-runner-filesystem-repository-denied",
+    "filesystem-system-denied": "contract-runner-filesystem-system-denied",
+    "filesystem-unknown-denied": "contract-runner-filesystem-unknown-denied",
     "guest-operation-failed": "contract-runner-guest-operation-failed",
     "timeout": "contract-runner-timeout",
 }

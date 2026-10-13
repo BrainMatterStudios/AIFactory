@@ -1791,6 +1791,10 @@ class LimaLeashRunner:
             "claude-error-max-budget",
             "claude-error-max-turns",
             "claude-result-invalid",
+            "filesystem-controller-state-denied",
+            "filesystem-repository-denied",
+            "filesystem-system-denied",
+            "filesystem-unknown-denied",
             "guest-operation-failed",
             "timeout",
         }
@@ -1875,6 +1879,14 @@ class LimaLeashRunner:
                         if action in {"file.read", "file.write"}
                         else "process"
                     )
+                    resource = response.result.get("resource")
+                    if category == "filesystem" and resource in {
+                        "controller-state",
+                        "repository-path",
+                        "system-path",
+                        "unknown",
+                    }:
+                        failure_reason = "filesystem-" + resource.removesuffix("-path") + "-denied"
                 elif type(response) is BridgeResponse and response.status == "failed":
                     reason = response.result.get("reason")
                     if type(reason) is str:
