@@ -3489,6 +3489,97 @@ def test_nonzero_agent_exit_preserves_only_allowlisted_claude_result_subtype(
     assert "secret" not in json.dumps(response.result)
 
 
+def test_nonzero_agent_exit_reads_allowlisted_claude_result_from_stderr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge = _bridge(tmp_path, monkeypatch)
+    workspace = bridge.config.workspace_root / CONTEXT
+    workspace.mkdir(parents=True)
+    _authority(bridge)
+
+    def failed(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["git", "config", "--local"]:
+            return _completed(argv)
+        if argv[:2] == ["git", "rev-parse"]:
+            return _completed(argv, stdout=BASE + "\n")
+        if argv[:3] == ["git", "merge-base", "--is-ancestor"]:
+            return _completed(argv)
+        payload = {
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": True,
+            "result": "provider detail token=secret",
+        }
+        return subprocess.CompletedProcess(
+            argv, 1, stdout="", stderr=json.dumps(payload)
+        )
+
+    monkeypatch.setattr("software_factory.execution.bridge._run_bounded_process", failed)
+    scope = {
+        "context_digest": CONTEXT,
+        "turn_kind": "implementation",
+        "base_revision": BASE,
+        "input_revision": BASE,
+        "writable_paths": ["src/x.py"],
+        "timeout_seconds": 10,
+        "network_profile": "model-only-v1",
+    }
+    response = bridge.handle(_request("run-agent", {"prompt": "never echo", "scope": scope}))
+
+    assert response.status == "failed"
+    assert response.result == {"reason": "claude-error-during-execution"}
+    assert "secret" not in json.dumps(response.result)
+
+
+@pytest.mark.parametrize(
+    ("stderr", "reason"),
+    [
+        ("Authentication failed. Please run /login. token=secret", "claude-authentication-failed"),
+        ("Error: rate limit exceeded token=secret", "claude-rate-limited"),
+        ("Error connecting to API: ECONNRESET token=secret", "claude-network-failed"),
+        ("Requested model is unavailable token=secret", "claude-model-unavailable"),
+        ("Permission denied while starting runtime token=secret", "claude-runtime-permission-denied"),
+        ("Invalid MCP configuration token=secret", "claude-configuration-invalid"),
+        ("unclassified provider detail token=secret", "agent-stderr-nonzero"),
+    ],
+)
+def test_nonzero_agent_exit_preserves_only_bounded_stderr_family(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stderr: str,
+    reason: str,
+) -> None:
+    bridge = _bridge(tmp_path, monkeypatch)
+    workspace = bridge.config.workspace_root / CONTEXT
+    workspace.mkdir(parents=True)
+    _authority(bridge)
+
+    def failed(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if argv[:3] == ["git", "config", "--local"]:
+            return _completed(argv)
+        if argv[:2] == ["git", "rev-parse"]:
+            return _completed(argv, stdout=BASE + "\n")
+        if argv[:3] == ["git", "merge-base", "--is-ancestor"]:
+            return _completed(argv)
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr=stderr)
+
+    monkeypatch.setattr("software_factory.execution.bridge._run_bounded_process", failed)
+    scope = {
+        "context_digest": CONTEXT,
+        "turn_kind": "implementation",
+        "base_revision": BASE,
+        "input_revision": BASE,
+        "writable_paths": ["src/x.py"],
+        "timeout_seconds": 10,
+        "network_profile": "model-only-v1",
+    }
+    response = bridge.handle(_request("run-agent", {"prompt": "never echo", "scope": scope}))
+
+    assert response.status == "failed"
+    assert response.result == {"reason": reason}
+    assert "secret" not in json.dumps(response.result)
+
+
 def test_export_rejects_uncommitted_or_non_head_revision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

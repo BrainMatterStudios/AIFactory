@@ -381,6 +381,14 @@ def test_missing_contract_is_blocked_without_workspace_preservation(tmp_path):
             "contract-runner-claude-error-during-execution",
         ),
         (
+            {"executor_failure_reason": "claude-authentication-failed"},
+            "contract-runner-claude-authentication-failed",
+        ),
+        (
+            {"executor_failure_reason": "agent-stderr-nonzero"},
+            "contract-runner-stderr-nonzero",
+        ),
+        (
             {"executor_failure_reason": "filesystem-repository-denied"},
             "contract-runner-filesystem-repository-denied",
         ),

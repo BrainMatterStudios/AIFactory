@@ -2423,7 +2423,9 @@ class ExecutionBridge:
                 state_root=self.config.state_root,
             )
         if completed.returncode != 0:
-            raise BridgeFailure(_claude_nonzero_reason(completed.stdout))
+            raise BridgeFailure(
+                _claude_nonzero_reason(completed.stdout, completed.stderr)
+            )
         try:
             parsed = _terminal_json_record(completed.stdout)
             if not isinstance(parsed, dict) or type(parsed.get("result")) is not str:
@@ -7020,24 +7022,37 @@ def _terminal_json_record(output: str) -> Any:
     return json.loads(stripped.rsplit("\n", 1)[-1].strip())
 
 
-def _claude_nonzero_reason(output: str) -> str:
+def _claude_nonzero_reason(output: str, stderr: str = "") -> str:
     """Preserve only fixed Claude result subtypes from a failed author turn."""
     reasons = {
         "error_during_execution": "claude-error-during-execution",
         "error_max_turns": "claude-error-max-turns",
         "error_max_budget_usd": "claude-error-max-budget",
     }
-    try:
-        record = _terminal_json_record(output)
-    except (ValueError, TypeError, json.JSONDecodeError):
-        return "agent-exit-nonzero"
-    if (
-        not isinstance(record, dict)
-        or record.get("type") != "result"
-        or record.get("is_error") is not True
-    ):
-        return "agent-exit-nonzero"
-    return reasons.get(record.get("subtype"), "agent-exit-nonzero")
+    for stream in (output, stderr):
+        try:
+            record = _terminal_json_record(stream)
+        except (ValueError, TypeError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(record, dict)
+            and record.get("type") == "result"
+            and record.get("is_error") is True
+        ):
+            return reasons.get(record.get("subtype"), "agent-exit-nonzero")
+    normalized = stderr.casefold()
+    families = (
+        (("authentication failed", "please run /login", "not logged in"), "claude-authentication-failed"),
+        (("rate limit", "too many requests"), "claude-rate-limited"),
+        (("econnreset", "connection refused", "connecting to api"), "claude-network-failed"),
+        (("model is unavailable", "model not found"), "claude-model-unavailable"),
+        (("permission denied",), "claude-runtime-permission-denied"),
+        (("invalid mcp", "mcp configuration"), "claude-configuration-invalid"),
+    )
+    for markers, reason in families:
+        if any(marker in normalized for marker in markers):
+            return reason
+    return "agent-stderr-nonzero" if stderr else "agent-exit-nonzero"
 
 
 def _verifier_launch_status(
