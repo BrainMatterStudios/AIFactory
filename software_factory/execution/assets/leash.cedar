@@ -65,7 +65,10 @@ permit (
   action in [Action::"FileOpen", Action::"FileOpenReadOnly", Action::"FileOpenReadWrite"],
   resource
 ) when {
-  resource in [Dir::"/tmp/", Dir::"/leash/", Dir::"/root/.cache/", Dir::"/root/.claude/"]
+  resource in [
+    File::"/root/.claude.json",
+    Dir::"/tmp/", Dir::"/leash/", Dir::"/root/.cache/", Dir::"/root/.claude/"
+  ]
 };
 
 // Exact request root marker. The effective policy generator replaces this

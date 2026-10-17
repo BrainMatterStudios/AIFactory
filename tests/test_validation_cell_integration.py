@@ -598,6 +598,7 @@ def test_operating_runbook_binds_reviewed_commit_and_checkout_interpreter() -> N
     post_auth_doctor = section.index('POST_AUTH_DOCTOR_RECORD="$OPERATOR_EVIDENCE/')
     import_cell = section.index("software_factory.cli validation-cell import")
     assert login < post_auth_doctor < import_cell
+    assert "$MODEL_AUTH_FILE:/root/.claude.json" in section
     assert "post-auth doctor record differs from the pre-auth authority" in section
     assert "factory validation-cell" not in section
     assert "\npython " not in section

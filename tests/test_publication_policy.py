@@ -992,6 +992,32 @@ def test_reviewed_security_control_content_approval_is_accepted(tmp_path: Path) 
     }
 
 
+def test_reviewed_security_control_accepts_multiple_exact_historical_blobs(
+    tmp_path: Path,
+) -> None:
+    document = _policy_document()
+    approvals = _retain_only_synthetic_fixture_approval(document)
+    current = _security_control_approval(
+        "software_factory/execution/bridge.py",
+        ["private.absolute-path", "private.hostname"],
+    )
+    historical = {**current, "sha256": "0" * 64}
+    approvals.extend((current, historical))
+    approvals.sort(key=lambda item: (str(item["path"]), str(item["sha256"])))
+
+    policy = load_publication_policy(_write_policy(tmp_path, document))
+
+    bridge_approvals = [
+        approval
+        for approval in policy.content_allowlist
+        if approval.path == "software_factory/execution/bridge.py"
+    ]
+    assert {approval.sha256 for approval in bridge_approvals} == {
+        current["sha256"],
+        historical["sha256"],
+    }
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
