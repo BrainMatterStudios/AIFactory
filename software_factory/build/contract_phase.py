@@ -90,6 +90,8 @@ _RUNNER_FAILURE_REASONS = {
     "guest-operation-failed": "contract-runner-guest-operation-failed",
     "agent-stderr-nonzero": "contract-runner-stderr-nonzero",
     "timeout": "contract-runner-timeout",
+    "workspace-output-identity-invalid": "contract-runner-workspace-output-identity-invalid",
+    "workspace-output-paths-denied": "contract-runner-workspace-output-paths-denied",
 }
 _RUNNER_DENIAL_REASONS = {
     "filesystem": "contract-runner-filesystem-denied",

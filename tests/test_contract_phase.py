@@ -405,6 +405,14 @@ def test_missing_contract_is_blocked_without_workspace_preservation(tmp_path):
             "contract-runner-filesystem-unknown-denied",
         ),
         (
+            {"executor_failure_reason": "workspace-output-identity-invalid"},
+            "contract-runner-workspace-output-identity-invalid",
+        ),
+        (
+            {"executor_failure_reason": "workspace-output-paths-denied"},
+            "contract-runner-workspace-output-paths-denied",
+        ),
+        (
             {
                 "executor_action": {
                     "schema_version": "executor-action-v1",

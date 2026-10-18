@@ -1804,6 +1804,8 @@ class LimaLeashRunner:
             "guest-operation-failed",
             "agent-stderr-nonzero",
             "timeout",
+            "workspace-output-identity-invalid",
+            "workspace-output-paths-denied",
         }
         if failure_reason is not None:
             meta = (
@@ -1941,13 +1943,22 @@ class LimaLeashRunner:
                 or set(changed) != {"output_revision", "paths"}
                 or changed["output_revision"] != after_head["revision"]
                 or type(paths) is not list
-                or any(
-                    type(path) is not str or not self._allowed(path, scope.writable_paths)
-                    for path in paths
-                )
+                or any(type(path) is not str for path in paths)
             ):
                 return self._reset_denied(
-                    scope.context_digest, scope.input_revision, category="filesystem", model=model
+                    scope.context_digest,
+                    scope.input_revision,
+                    category="filesystem",
+                    model=model,
+                    failure_reason="workspace-output-identity-invalid",
+                )
+            if any(not self._allowed(path, scope.writable_paths) for path in paths):
+                return self._reset_denied(
+                    scope.context_digest,
+                    scope.input_revision,
+                    category="filesystem",
+                    model=model,
+                    failure_reason="workspace-output-paths-denied",
                 )
         except Exception:
             return self._reset_denied(

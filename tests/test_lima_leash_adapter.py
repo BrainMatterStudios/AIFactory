@@ -536,11 +536,53 @@ def test_scoped_runner_resets_to_pre_turn_revision_when_changed_paths_escape_sco
     result = runner.run_scoped_agent("make change", model="sonnet", cwd=f"lima://aifactory-stage1/{context}", scope=scope)
 
     assert result.ok is False
-    assert result.meta["executor_action"] == {
-        "schema_version": "executor-action-v1",
-        "disposition": "denied",
-        "category": "filesystem",
-    }
+    assert result.meta == {"executor_failure_reason": "workspace-output-paths-denied"}
+    assert "outside.txt" not in json.dumps(result.meta)
+    assert client.reset_to == revision
+
+
+def test_scoped_runner_reports_invalid_post_turn_workspace_identity_without_detail() -> None:
+    """Malformed revision evidence must be distinguishable without exposing bridge data."""
+    from software_factory.adapters.optional.lima_leash import LimaLeashRunner
+
+    context = "a" * 64
+    revision = "b" * 40
+
+    class InvalidIdentityClient(_RunnerClient):
+        def workspace(self, *, context_digest: str, request_id: str, payload: dict[str, object]):
+            response = super().workspace(
+                context_digest=context_digest,
+                request_id=request_id,
+                payload=payload,
+            )
+            if payload["action"] == "turn_delta":
+                return _response(
+                    result={"output_revision": "invalid-revision", "paths": ["src/a.py"]}
+                )
+            return response
+
+    client = InvalidIdentityClient(context=context, revision=revision)
+    scope = ExecutionScope(
+        context,
+        "implementation",
+        revision,
+        revision,
+        ("src/**",),
+        60,
+        "model-only-v1",
+        "c" * 64,
+    )
+
+    result = LimaLeashRunner(_role_options("runner"), client=client).run_scoped_agent(
+        "make change",
+        model="sonnet",
+        cwd=f"lima://aifactory-stage1/{context}",
+        scope=scope,
+    )
+
+    assert result.ok is False
+    assert result.meta == {"executor_failure_reason": "workspace-output-identity-invalid"}
+    assert "invalid-revision" not in json.dumps(result.meta)
     assert client.reset_to == revision
 
 
