@@ -200,6 +200,50 @@ def _role_options(role: str, **extra: object) -> dict[str, object]:
     return {key: value for key, value in options.items() if key in allowed[role]}
 
 
+def _configured_authority(tmp_path: Path) -> Path:
+    root = tmp_path / "controller"
+    root.mkdir(mode=0o700)
+    instance = root / "aifactory-stage1"
+    instance.mkdir(mode=0o700)
+    (instance / "controller-authority").mkdir(mode=0o755)
+    (root / ("transition-" + b"aifactory-stage1".hex() + ".lock")).touch(
+        mode=0o600
+    )
+    manifest = instance / "factory.config.json"
+    manifest_bytes = (
+        json.dumps(
+            {"factory": {"name": "adapter-authority-test"}},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    manifest.write_text(manifest_bytes, encoding="utf-8")
+    manifest.chmod(0o600)
+    state = instance / "state.json"
+    state.write_text(
+        json.dumps(
+            {
+                "configuration_digest": hashlib.sha256(
+                    manifest_bytes[:-1].encode("utf-8")
+                ).hexdigest(),
+                "destroyed": False,
+                "instance": "aifactory-stage1",
+                "instance_id": "sha256:" + "a" * 64,
+                "lifecycle": "configured",
+                "manifest_path": str(manifest),
+                "schema_version": "validation-cell-state-v2",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    state.chmod(0o600)
+    return state
+
+
 def _observed(**extra: object) -> dict[str, object]:
     values: dict[str, object] = {
         "bridge_version": "execution-bridge-v1",
@@ -514,14 +558,19 @@ class _WorkspaceClient:
         return _response(result={"base_revision": payload["base_revision"], "workspace": "/srv/aifactory/workspaces/" + context_digest})
 
 
-def test_scoped_runner_resets_to_pre_turn_revision_when_changed_paths_escape_scope() -> None:
+def test_scoped_runner_resets_to_pre_turn_revision_when_changed_paths_escape_scope(
+    tmp_path: Path,
+) -> None:
     """Accepting a successful run with an out-of-scope file would bypass Leash evidence."""
     from software_factory.adapters.optional.lima_leash import LimaLeashRunner
 
     context = "a" * 64
     revision = "b" * 40
     client = _RunnerClient(context=context, revision=revision)
-    runner = LimaLeashRunner(_role_options("runner"), client=client)
+    state = _configured_authority(tmp_path)
+    runner = LimaLeashRunner(
+        _role_options("runner", controller_state_path=str(state)), client=client
+    )
     scope = ExecutionScope(
         context_digest=context,
         turn_kind="implementation",
@@ -539,6 +588,21 @@ def test_scoped_runner_resets_to_pre_turn_revision_when_changed_paths_escape_sco
     assert result.meta == {"executor_failure_reason": "workspace-output-paths-denied"}
     assert "outside.txt" not in json.dumps(result.meta)
     assert client.reset_to == revision
+    records = list(
+        (state.parent / "controller-authority" / "private-diagnostics").glob(
+            "workspace-output-paths-denied-*.json"
+        )
+    )
+    assert len(records) == 1
+    assert records[0].stat().st_mode & 0o777 == 0o600
+    assert json.loads(records[0].read_text(encoding="utf-8")) == {
+        "context_digest": context,
+        "denied_paths": ["outside.txt"],
+        "failure_reason": "workspace-output-paths-denied",
+        "input_revision": revision,
+        "schema_version": "runner-private-diagnostic-v1",
+        "turn_kind": "implementation",
+    }
 
 
 def test_scoped_runner_reports_invalid_post_turn_workspace_identity_without_detail() -> None:

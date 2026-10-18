@@ -226,7 +226,7 @@ class _ControllerAuthority:
     instance_id: str
 
     @contextmanager
-    def dispatch(self) -> Iterator[None]:
+    def dispatch(self) -> Iterator[int]:
         root_fd = instance_fd = lock_fd = state_fd = manifest_fd = -1
         body_failed = False
         authorized = False
@@ -373,7 +373,7 @@ class _ControllerAuthority:
             ):
                 raise RuntimeError("Lima controller authority is unavailable")
             authorized = True
-            yield
+            yield instance_fd
         except OSError as error:
             body_failed = True
             if authorized:
@@ -393,6 +393,84 @@ class _ControllerAuthority:
                 except BaseException:
                     if not body_failed:
                         raise RuntimeError("Lima controller authority is unavailable") from None
+
+    def write_private_diagnostic(self, document: Mapping[str, Any]) -> None:
+        content = _canonical_json_bytes(document)
+        if len(content) > 2 * 1024 * 1024:
+            raise RuntimeError("Lima controller diagnostic is unavailable")
+        controller_fd = diagnostics_fd = output_fd = -1
+        temporary_name = "." + uuid4().hex + ".tmp"
+        output_name = "workspace-output-paths-denied-" + uuid4().hex + ".json"
+        try:
+            with self.dispatch() as instance_fd:
+                controller_fd = os.open(
+                    "controller-authority",
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=instance_fd,
+                )
+                controller_info = os.fstat(controller_fd)
+                controller_named = os.stat(
+                    "controller-authority", dir_fd=instance_fd, follow_symlinks=False
+                )
+                if (
+                    not stat.S_ISDIR(controller_info.st_mode)
+                    or controller_info.st_uid != os.geteuid()
+                    or controller_info.st_mode & 0o022
+                    or (controller_info.st_dev, controller_info.st_ino)
+                    != (controller_named.st_dev, controller_named.st_ino)
+                ):
+                    raise RuntimeError("Lima controller diagnostic is unavailable")
+                try:
+                    os.mkdir("private-diagnostics", mode=0o700, dir_fd=controller_fd)
+                except FileExistsError:
+                    pass
+                diagnostics_fd = os.open(
+                    "private-diagnostics",
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=controller_fd,
+                )
+                diagnostics_info = os.fstat(diagnostics_fd)
+                if (
+                    not stat.S_ISDIR(diagnostics_info.st_mode)
+                    or diagnostics_info.st_uid != os.geteuid()
+                    or stat.S_IMODE(diagnostics_info.st_mode) != 0o700
+                ):
+                    raise RuntimeError("Lima controller diagnostic is unavailable")
+                output_fd = os.open(
+                    temporary_name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                    dir_fd=diagnostics_fd,
+                )
+                view = memoryview(content)
+                while view:
+                    written = os.write(output_fd, view)
+                    if written <= 0:
+                        raise RuntimeError("Lima controller diagnostic is unavailable")
+                    view = view[written:]
+                os.fsync(output_fd)
+                os.close(output_fd)
+                output_fd = -1
+                os.rename(
+                    temporary_name,
+                    output_name,
+                    src_dir_fd=diagnostics_fd,
+                    dst_dir_fd=diagnostics_fd,
+                )
+                os.fsync(diagnostics_fd)
+        except OSError as error:
+            raise RuntimeError("Lima controller diagnostic is unavailable") from error
+        finally:
+            for descriptor in (output_fd, diagnostics_fd, controller_fd):
+                if descriptor >= 0:
+                    os.close(descriptor)
 
 
 class _ControllerAuthorizedTransport:
@@ -428,6 +506,9 @@ class _ControllerAuthorizedTransport:
 
     def copy_out(self, guest_source: str, destination: Path) -> Mapping[str, str]:
         return self._call("copy_out", guest_source, destination)
+
+    def write_private_diagnostic(self, document: Mapping[str, Any]) -> None:
+        self._authority.write_private_diagnostic(document)
 
 
 @dataclass(frozen=True)
@@ -1953,6 +2034,23 @@ class LimaLeashRunner:
                     failure_reason="workspace-output-identity-invalid",
                 )
             if any(not self._allowed(path, scope.writable_paths) for path in paths):
+                denied_paths = sorted(
+                    path for path in paths if not self._allowed(path, scope.writable_paths)
+                )
+                try:
+                    self._client.write_private_diagnostic(
+                        {
+                            "context_digest": scope.context_digest,
+                            "denied_paths": denied_paths,
+                            "failure_reason": "workspace-output-paths-denied",
+                            "input_revision": scope.input_revision,
+                            "schema_version": "runner-private-diagnostic-v1",
+                            "turn_kind": scope.turn_kind,
+                        }
+                    )
+                except RuntimeError:
+                    # Diagnostics never weaken the mandatory fail-closed reset.
+                    pass
                 return self._reset_denied(
                     scope.context_digest,
                     scope.input_revision,
