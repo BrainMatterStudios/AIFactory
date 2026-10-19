@@ -3580,6 +3580,25 @@ def test_nonzero_agent_exit_preserves_only_bounded_stderr_family(
     assert "secret" not in json.dumps(response.result)
 
 
+@pytest.mark.parametrize(
+    ("output", "reason"),
+    [
+        ("Not logged in. Please run /login. token=secret", "claude-authentication-failed"),
+        ("Error connecting to API: ECONNRESET token=secret", "claude-network-failed"),
+        ("Permission denied token=secret", "claude-runtime-permission-denied"),
+        ("unclassified token=secret", "agent-exit-nonzero"),
+        (
+            "Running non-interactive command: claude -p 'Not logged in'\nunknown error",
+            "agent-exit-nonzero",
+        ),
+    ],
+)
+def test_nonzero_agent_stdout_terminal_error_is_bounded(output: str, reason: str) -> None:
+    from software_factory.execution.bridge import _claude_nonzero_reason
+
+    assert _claude_nonzero_reason(output) == reason
+
+
 def test_export_rejects_uncommitted_or_non_head_revision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

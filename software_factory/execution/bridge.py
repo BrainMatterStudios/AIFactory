@@ -7040,6 +7040,8 @@ def _claude_nonzero_reason(output: str, stderr: str = "") -> str:
             and record.get("is_error") is True
         ):
             return reasons.get(record.get("subtype"), "agent-exit-nonzero")
+    # Leash writes its command prelude to stdout; classify only the terminal line.
+    terminal_output = output.rstrip().rsplit("\n", 1)[-1].casefold()
     normalized = stderr.casefold()
     families = (
         (("authentication failed", "please run /login", "not logged in"), "claude-authentication-failed"),
@@ -7051,6 +7053,9 @@ def _claude_nonzero_reason(output: str, stderr: str = "") -> str:
     )
     for markers, reason in families:
         if any(marker in normalized for marker in markers):
+            return reason
+    for markers, reason in families:
+        if any(marker in terminal_output for marker in markers):
             return reason
     return "agent-stderr-nonzero" if stderr else "agent-exit-nonzero"
 
