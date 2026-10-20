@@ -335,6 +335,68 @@ def test_contract_author_brief_and_turn_expose_only_the_contract_path(tmp_path):
     assert runner.calls[0]["cwd"] is not None
 
 
+def test_contract_authoring_and_checkpoint_use_workspace_contract_path(tmp_path):
+    from software_factory.build.orchestrator import (
+        _contract_is_unchanged,
+        _local_artifact_controller_roots,
+        _publication_revision_is_authorized,
+    )
+
+    _, workspace, root = _workspace(tmp_path)
+    relative = "runbooks/contracts/custom-score.contract.json"
+    workspace.contract_artifact_path = lambda: relative
+
+    def write(worktree):
+        path = worktree / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_phase_v2()) + "\n", encoding="utf-8")
+
+    runner = FakeRunner(write)
+    result = _run(tmp_path, runner, workspace=workspace)
+    assert result.disposition is IntentDisposition.PASS
+    assert f"`{relative}`" in runner.calls[0]["prompt"]
+    assert not (root / "contracts/7.json").exists()
+    assert relative in _local_artifact_controller_roots("contracts", contract_path=relative)
+    assert _publication_revision_is_authorized(
+        workspace,
+        revision=result.checkpoint_sha,
+        checkpoint=result.checkpoint_sha,
+        contracts_dir="contracts",
+        issue_id="7",
+        repository="acme/widgets",
+        expected_text=result.contract_text,
+        expected_digest=result.contract_digest,
+        expected_surface_digest=workspace.publication_fingerprint(result.checkpoint_sha),
+    )[0]
+    assert _contract_is_unchanged(
+        workspace,
+        contracts_dir="contracts",
+        issue_id="7",
+        expected_text=result.contract_text,
+        expected_digest=result.contract_digest,
+        checkpoint=result.checkpoint_sha,
+    )[0]
+    (root / relative).write_text("{}", encoding="utf-8")
+    assert not _contract_is_unchanged(
+        workspace,
+        contracts_dir="contracts",
+        issue_id="7",
+        expected_text=result.contract_text,
+        expected_digest=result.contract_digest,
+        checkpoint=result.checkpoint_sha,
+    )[0]
+
+
+@pytest.mark.parametrize("path", ["../contract.json", "/contract.json", "a//b.json", "", None])
+def test_invalid_workspace_contract_path_blocks_without_default_fallback(tmp_path, path):
+    _, workspace, _ = _workspace(tmp_path)
+    workspace.contract_artifact_path = lambda: path
+    runner = FakeRunner(_write_contract(_phase_v2()))
+    result = _run(tmp_path, runner, workspace=workspace)
+    assert result.disposition is IntentDisposition.BLOCKED
+    assert not runner.calls
+
+
 def test_contract_authoring_uses_opaque_workspace_transport(tmp_path):
     workspace = OpaqueMemoryWorkspace()
     document = _phase_v2()

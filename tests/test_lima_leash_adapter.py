@@ -393,6 +393,7 @@ def test_lima_roles_share_normalized_configuration_and_reject_phase_drift() -> N
             "implementation": ("src/**",),
         },
     )
+    assert workspace.contract_artifact_path() == "factory/contracts/42.json"
     executor = LimaLeashExecutorProvider(
         _role_options("executor"), client=FakeLimaClient(observed=_observed())
     )

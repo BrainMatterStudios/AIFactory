@@ -12,7 +12,6 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from enum import Enum
-from pathlib import PurePosixPath
 from typing import Any
 
 from software_factory.adapters.base import Issue, RunnerAdapter
@@ -34,6 +33,7 @@ from software_factory.build.contract_store import (
 )
 from software_factory.build.workspace import (
     Workspace,
+    workspace_contract_path,
     workspace_file_state,
     workspace_read_file,
     workspace_read_file_at,
@@ -156,25 +156,6 @@ def _result(
         keep_workspace=keep_workspace,
         approval_record=approval_record,
     )
-
-
-def _contract_path(contracts_dir: str, issue_id: str) -> str:
-    """Return a safe Git-relative path without normalizing provider identity."""
-    if (
-        not isinstance(issue_id, str)
-        or not issue_id
-        or issue_id in {".", ".."}
-        or "/" in issue_id
-        or "\\" in issue_id
-        or "\0" in issue_id
-    ):
-        raise ValueError("issue identity cannot name a contract path")
-    if not isinstance(contracts_dir, str) or not contracts_dir.strip():
-        raise ValueError("contracts directory is invalid")
-    directory = PurePosixPath(contracts_dir)
-    if directory.is_absolute() or ".." in directory.parts or "." in directory.parts:
-        raise ValueError("contracts directory is invalid")
-    return str(directory / f"{issue_id}.json")
 
 
 def _runner_failure_reason(turn: Any) -> str:
@@ -546,7 +527,7 @@ def run_contract_phase(
             _CONTRACT_EXTERNAL_FAILURE,
         )
     try:
-        contract_path = _contract_path(contracts_dir, issue.id)
+        contract_path = workspace_contract_path(workspace, contracts_dir, issue.id)
     except (TypeError, ValueError):
         return phase_result(IntentDisposition.BLOCKED, _CONTRACT_EXTERNAL_FAILURE)
 

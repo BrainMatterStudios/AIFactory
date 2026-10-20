@@ -1250,6 +1250,12 @@ class LimaWorkspace:
         if result["base_revision"] != self.base or result["workspace"] != expected_workspace:
             raise RuntimeError("Lima workspace preparation identity mismatch")
 
+    def contract_artifact_path(self) -> str:
+        paths = self._phase_writable_paths.get("contract-author")
+        if paths is None or len(paths) != 1:
+            raise ValueError("Lima workspace lacks exact Contract artifact authority")
+        return paths[0]
+
     def execution_scope(
         self, turn_kind: str, *, expected_input_fingerprint: str | None = None
     ) -> ExecutionScope:

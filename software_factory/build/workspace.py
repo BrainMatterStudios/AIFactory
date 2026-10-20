@@ -184,6 +184,28 @@ def _normalized_relative_path(relative_path: str) -> tuple[str, ...]:
     return parsed.parts
 
 
+def workspace_contract_path(workspace: Workspace, contracts_dir: str, issue_id: str) -> str:
+    """Resolve a provider-bound Contract artifact or the conventional local path."""
+    provider = getattr(workspace, "contract_artifact_path", None)
+    if provider is not None:
+        if not callable(provider):
+            raise ValueError("workspace Contract artifact provider is invalid")
+        path = provider()
+    else:
+        if (
+            not isinstance(issue_id, str)
+            or not issue_id
+            or issue_id in {".", ".."}
+            or any(character in issue_id for character in ("/", "\\", "\0"))
+            or not isinstance(contracts_dir, str)
+            or not contracts_dir.strip()
+        ):
+            raise ValueError("Contract path identity is invalid")
+        path = f"{contracts_dir.rstrip('/')}/{issue_id}.json"
+    _normalized_relative_path(path)
+    return path
+
+
 def _byte_bound(max_bytes: int) -> int:
     if type(max_bytes) is not int or max_bytes < 0:
         raise ValueError("max_bytes must be a nonnegative integer")
