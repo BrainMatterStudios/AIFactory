@@ -435,6 +435,18 @@ def test_missing_contract_is_blocked_without_workspace_preservation(tmp_path):
     [
         ({"executor_failure_reason": "timeout"}, "contract-runner-timeout"),
         (
+            {"executor_failure_reason": "claude-api-invalid-request"},
+            "contract-runner-claude-api-invalid-request",
+        ),
+        (
+            {"executor_failure_reason": "claude-api-billing-failed"},
+            "contract-runner-claude-api-billing-failed",
+        ),
+        (
+            {"executor_failure_reason": "claude-api-forbidden"},
+            "contract-runner-claude-api-forbidden",
+        ),
+        (
             {"executor_failure_reason": "agent-exit-nonzero"},
             "contract-runner-exit-nonzero",
         ),

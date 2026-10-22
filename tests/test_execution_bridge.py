@@ -3599,6 +3599,35 @@ def test_nonzero_agent_stdout_terminal_error_is_bounded(output: str, reason: str
     assert _claude_nonzero_reason(output) == reason
 
 
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+@pytest.mark.parametrize(
+    ("fields", "reason"),
+    [
+        ({"api_error_status": 400}, "claude-api-invalid-request"),
+        ({"api_error_status": 401}, "claude-authentication-failed"),
+        ({"api_error_status": 402}, "claude-api-billing-failed"),
+        ({"api_error_status": 403}, "claude-api-forbidden"),
+        ({"api_error_status": 429}, "claude-rate-limited"),
+        ({"api_error_status": 503}, "claude-network-failed"),
+        ({"result": "Not logged in token=secret"}, "claude-authentication-failed"),
+        ({"result": "API Error: 401 token=secret"}, "claude-authentication-failed"),
+        ({"errors": ["API Error: 402 token=secret"]}, "claude-api-billing-failed"),
+        ({"errors": ["ECONNRESET token=secret"]}, "claude-network-failed"),
+        ({"api_error_status": True}, "claude-error-during-execution"),
+        ({"errors": {"message": "Not logged in"}}, "claude-error-during-execution"),
+        ({"result": "unknown token=secret"}, "claude-error-during-execution"),
+    ],
+)
+def test_nonzero_structured_api_error_is_bounded(stream, fields, reason):
+    from software_factory.execution.bridge import _claude_nonzero_reason
+
+    record = {"type": "result", "subtype": "success", "is_error": True, **fields}
+    output = "Leash prelude\n" + json.dumps(record)
+    assert _claude_nonzero_reason(
+        output if stream == "stdout" else "", output if stream == "stderr" else ""
+    ) == reason
+
+
 def test_export_rejects_uncommitted_or_non_head_revision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

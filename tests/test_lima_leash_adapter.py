@@ -720,12 +720,17 @@ def test_scoped_runner_preserves_only_bounded_filesystem_denial_class(
     assert client.reset_to == revision
 
 
-def test_scoped_runner_preserves_bounded_nonzero_agent_exit_after_reset() -> None:
+@pytest.mark.parametrize(
+    "reason",
+    ["agent-exit-nonzero", "claude-api-invalid-request", "claude-api-billing-failed", "claude-api-forbidden"],
+)
+def test_scoped_runner_preserves_bounded_nonzero_agent_exit_after_reset(reason) -> None:
     from software_factory.adapters.optional.lima_leash import LimaLeashRunner
 
     context = "a" * 64
     revision = "b" * 40
     client = _AgentExitRunnerClient(context=context, revision=revision)
+    client.reason = reason
     scope = ExecutionScope(
         context,
         "contract-author",
@@ -745,7 +750,7 @@ def test_scoped_runner_preserves_bounded_nonzero_agent_exit_after_reset() -> Non
     )
 
     assert result.ok is False
-    assert result.meta == {"executor_failure_reason": "agent-exit-nonzero"}
+    assert result.meta == {"executor_failure_reason": reason}
     assert client.reset_to == revision
 
 
@@ -1283,11 +1288,13 @@ class _DeniedRunnerClient(_RunnerClient):
 
 
 class _AgentExitRunnerClient(_RunnerClient):
+    reason = "agent-exit-nonzero"
+
     def run_agent(self, *, context_digest: str, request_id: str, payload: dict[str, object]):
         del request_id
         assert context_digest == self.context
         assert payload["scope"]["input_revision"] == self.revision
-        return _response(status="failed", result={"reason": "agent-exit-nonzero"})
+        return _response(status="failed", result={"reason": self.reason})
 
 
 class _CompleteWorkspaceClient:

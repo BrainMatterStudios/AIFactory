@@ -7023,12 +7023,26 @@ def _terminal_json_record(output: str) -> Any:
 
 
 def _claude_nonzero_reason(output: str, stderr: str = "") -> str:
-    """Preserve only fixed Claude result subtypes from a failed author turn."""
+    """Classify failed turns without exporting provider text or identifiers."""
     reasons = {
         "error_during_execution": "claude-error-during-execution",
         "error_max_turns": "claude-error-max-turns",
         "error_max_budget_usd": "claude-error-max-budget",
     }
+    api_reasons = {
+        400: "claude-api-invalid-request",
+        401: "claude-authentication-failed",
+        402: "claude-api-billing-failed",
+        403: "claude-api-forbidden",
+        413: "claude-api-invalid-request",
+        429: "claude-rate-limited",
+        500: "claude-network-failed",
+        502: "claude-network-failed",
+        503: "claude-network-failed",
+        504: "claude-network-failed",
+    }
+    structured_reason = None
+    messages = []
     for stream in (output, stderr):
         try:
             record = _terminal_json_record(stream)
@@ -7039,10 +7053,23 @@ def _claude_nonzero_reason(output: str, stderr: str = "") -> str:
             and record.get("type") == "result"
             and record.get("is_error") is True
         ):
-            return reasons.get(record.get("subtype"), "agent-exit-nonzero")
+            status = record.get("api_error_status")
+            if type(status) is int and status in api_reasons:
+                return api_reasons[status]
+            subtype = record.get("subtype")
+            structured_reason = (
+                reasons.get(subtype, "claude-error-during-execution")
+                if type(subtype) is str
+                else "claude-error-during-execution"
+            )
+            if type(record.get("result")) is str:
+                messages.append(record["result"])
+            errors = record.get("errors")
+            if type(errors) is list:
+                messages.extend(error for error in errors if type(error) is str)
+            break
     # Leash writes its command prelude to stdout; classify only the terminal line.
     terminal_output = output.rstrip().rsplit("\n", 1)[-1].casefold()
-    normalized = stderr.casefold()
     families = (
         (("authentication failed", "please run /login", "not logged in"), "claude-authentication-failed"),
         (("rate limit", "too many requests"), "claude-rate-limited"),
@@ -7051,12 +7078,16 @@ def _claude_nonzero_reason(output: str, stderr: str = "") -> str:
         (("permission denied",), "claude-runtime-permission-denied"),
         (("invalid mcp", "mcp configuration"), "claude-configuration-invalid"),
     )
-    for markers, reason in families:
-        if any(marker in normalized for marker in markers):
-            return reason
-    for markers, reason in families:
-        if any(marker in terminal_output for marker in markers):
-            return reason
+    for message in messages if structured_reason else (stderr, terminal_output):
+        normalized = message.casefold()
+        api_error = re.match(r"api error: (\d{3})(?:\b)", normalized)
+        if api_error and int(api_error.group(1)) in api_reasons:
+            return api_reasons[int(api_error.group(1))]
+        for markers, reason in families:
+            if any(marker in normalized for marker in markers):
+                return reason
+    if structured_reason:
+        return structured_reason
     return "agent-stderr-nonzero" if stderr else "agent-exit-nonzero"
 
 
