@@ -5216,11 +5216,11 @@ def _authenticate_probe_log_suffix(
 ) -> tuple[tuple[dict[str, str], ...], tuple[dict[str, str], ...]]:
     """Require every complete post-baseline manager line to use pinned event grammar."""
     if type(raw) is not bytes or len(raw) > _MAX_PROBE_LOG_BYTES:
-        raise BridgeFailure("probe-events-invalid")
+        raise BridgeFailure("probe-log-grammar-invalid")
     try:
         lines = raw.decode("utf-8", "strict").splitlines()
     except UnicodeDecodeError:
-        raise BridgeFailure("probe-events-invalid") from None
+        raise BridgeFailure("probe-log-grammar-invalid") from None
     recognized = (
         "event=net.send",
         "event=proc.exec",
@@ -5230,9 +5230,20 @@ def _authenticate_probe_log_suffix(
         "event=http.request",
     )
     if any(not line or not any(token in line for token in recognized) for line in lines):
-        raise BridgeFailure("probe-events-invalid")
-    _authenticate_probe_http_events(raw)
-    return _parse_manager_network_events(raw), _parse_manager_boundary_events(raw)
+        raise BridgeFailure("probe-log-grammar-invalid")
+    try:
+        _authenticate_probe_http_events(raw)
+    except BridgeFailure:
+        raise BridgeFailure("probe-http-events-invalid") from None
+    try:
+        network = _parse_manager_network_events(raw)
+    except BridgeFailure:
+        raise BridgeFailure("probe-network-events-invalid") from None
+    try:
+        boundary = _parse_manager_boundary_events(raw)
+    except BridgeFailure:
+        raise BridgeFailure("probe-boundary-events-invalid") from None
+    return network, boundary
 
 
 def _network_events_for(

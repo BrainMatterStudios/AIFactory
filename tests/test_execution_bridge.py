@@ -5799,7 +5799,7 @@ def test_manager_log_suffix_accepts_line_completed_after_partial_snapshot(
 
 
 def test_complete_unknown_manager_log_suffix_is_rejected() -> None:
-    with pytest.raises(execution_bridge.BridgeFailure, match="probe-events-invalid"):
+    with pytest.raises(execution_bridge.BridgeFailure, match="probe-log-grammar-invalid"):
         execution_bridge._authenticate_probe_log_suffix(b"malformed-but-complete\n")
 
 
@@ -5815,14 +5815,41 @@ def test_probe_log_suffix_authenticates_model_http_responses() -> None:
     )
 
     assert execution_bridge._authenticate_probe_log_suffix(raw) == ((), ())
-    with pytest.raises(execution_bridge.BridgeFailure, match="probe-events-invalid"):
+    with pytest.raises(execution_bridge.BridgeFailure, match="probe-http-events-invalid"):
         execution_bridge._authenticate_probe_log_suffix(
             raw.replace(b"status=404", b"status=502", 1)
         )
-    with pytest.raises(execution_bridge.BridgeFailure, match="probe-events-invalid"):
+    with pytest.raises(execution_bridge.BridgeFailure, match="probe-http-events-invalid"):
         execution_bridge._authenticate_probe_log_suffix(
             raw.replace(b"status=404", b"status=100", 1)
         )
+
+
+@pytest.mark.parametrize(
+    ("parser", "reason"),
+    [
+        ("_authenticate_probe_http_events", "probe-http-events-invalid"),
+        ("_parse_manager_network_events", "probe-network-events-invalid"),
+        ("_parse_manager_boundary_events", "probe-boundary-events-invalid"),
+    ],
+)
+def test_probe_event_parser_failure_keeps_only_bounded_stage(monkeypatch, parser, reason):
+    parsers = (
+        "_authenticate_probe_http_events",
+        "_parse_manager_network_events",
+        "_parse_manager_boundary_events",
+    )
+    for name in parsers:
+        monkeypatch.setattr(execution_bridge, name, lambda _raw: ())
+
+    def fail(_raw):
+        raise execution_bridge.BridgeFailure("probe-events-invalid")
+
+    monkeypatch.setattr(execution_bridge, parser, fail)
+    with pytest.raises(execution_bridge.BridgeFailure) as caught:
+        execution_bridge._authenticate_probe_log_suffix(b"event=net.send token=synthetic\n")
+    assert caught.value.reason == reason
+    assert execution_bridge._containment_failure_reason(reason) == reason
 
 
 @pytest.mark.parametrize("drift", ("mode", "owner", "link"))
