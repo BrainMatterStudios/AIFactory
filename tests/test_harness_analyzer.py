@@ -5,6 +5,8 @@ import os
 import shlex
 import stat
 import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -591,6 +593,7 @@ def test_root_noatime_does_not_authorize_reading_target_on_atime_mount(
         raise AssertionError("target content must not be read")
 
     monkeypatch.setattr(harness_module, "_darwin_mount_flags", mount_flags)
+    monkeypatch.setattr(harness_module, "_darwin_fclonefileat", lambda: None)
     monkeypatch.setattr(harness_module.os, "read", forbidden_read)
 
     findings = _findings(tmp_path)
@@ -636,9 +639,9 @@ def _metadata(path: Path) -> tuple[int, int, int, int, int, int]:
     )
 
 
-def test_collection_is_read_only_for_tracked_untracked_metadata_and_controller_files(
+def _collect_and_assert_read_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+) -> list[dict[str, object]]:
     monkeypatch.setattr(harness_module, "_darwin_mount_flags", lambda _root: 0)
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     (tmp_path / "AGENTS.md").write_text("instructions\n", encoding="utf-8")
@@ -695,6 +698,16 @@ def test_collection_is_read_only_for_tracked_untracked_metadata_and_controller_f
     assert content_after == content_before
     assert metadata_after == metadata_before
     assert status_after == status_before
+    return findings
+
+
+def test_collection_is_read_only_for_tracked_untracked_metadata_and_controller_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(harness_module, "_darwin_fclonefileat", lambda: None)
+
+    findings = _collect_and_assert_read_only(tmp_path, monkeypatch)
+
     assert len(findings) == 4
     assert {_summary(finding) for finding in findings} == {
         ("security", "high", "AGENTS.md"),
@@ -703,6 +716,103 @@ def test_collection_is_read_only_for_tracked_untracked_metadata_and_controller_f
         ("security", "high", ".claude/settings.json"),
     }
     assert all("metadata mutation" in finding["message"] for finding in findings)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="APFS cloning is Darwin-only")
+def test_apfs_clone_reads_supported_files_without_metadata_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scratch_parent = tmp_path.parent / f"{tmp_path.name}-scratch"
+    scratch_parent.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", os.fspath(scratch_parent))
+
+    findings = _collect_and_assert_read_only(tmp_path, monkeypatch)
+
+    assert findings == []
+    assert list(scratch_parent.iterdir()) == []
+
+
+def _fake_clone(content: bytes, *, result: int = 0, on_clone=None):
+    def clone(source: int, directory: int, name: bytes, _flags: int) -> int:
+        if result != 0:
+            return result
+        target = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory)
+        try:
+            os.write(target, content)
+        finally:
+            os.close(target)
+        if on_clone is not None:
+            on_clone(source)
+        return 0
+
+    return clone
+
+
+def _force_clone_path(monkeypatch: pytest.MonkeyPatch, clone: object) -> None:
+    monkeypatch.setattr(harness_module, "_darwin_mount_flags", lambda _descriptor: 0)
+    monkeypatch.setattr(harness_module, "_darwin_fclonefileat", lambda: clone)
+
+
+def test_clone_read_inspects_clone_content_and_removes_scratch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    scratch_parent = tmp_path / "scratch"
+    scratch_parent.mkdir()
+    content = json.dumps({"env": {"FIRST_API_KEY": ANTHROPIC_KEY}}).encode()
+    (workspace / ".claude").mkdir()
+    (workspace / ".claude/settings.json").write_bytes(content)
+    monkeypatch.setattr(tempfile, "tempdir", os.fspath(scratch_parent))
+    _force_clone_path(monkeypatch, _fake_clone(content))
+
+    findings = _findings(workspace)
+
+    assert [_summary(finding) for finding in findings] == [
+        ("security", "high", ".claude/settings.json")
+    ]
+    assert "metadata mutation" not in findings[0]["message"]
+    assert list(scratch_parent.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "clone",
+    [
+        pytest.param(None, id="clone-unavailable"),
+        pytest.param(_fake_clone(b"instructions\n", result=-1), id="clone-refused"),
+        pytest.param(_fake_clone(b"different length\n"), id="clone-size-mismatch"),
+        pytest.param(
+            _fake_clone(
+                b"instructions\n",
+                on_clone=lambda source: os.utime(source, ns=(1, os.fstat(source).st_mtime_ns)),
+            ),
+            id="target-atime-changed",
+        ),
+    ],
+)
+def test_clone_read_failures_fail_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, clone: object
+) -> None:
+    (tmp_path / "AGENTS.md").write_text("instructions\n", encoding="utf-8")
+    _force_clone_path(monkeypatch, clone)
+
+    findings = _findings(tmp_path)
+
+    assert [_summary(finding) for finding in findings] == [("security", "high", "AGENTS.md")]
+    assert "metadata mutation" in findings[0]["message"]
+
+
+def test_clone_read_refuses_scratch_inside_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "AGENTS.md").write_text("instructions\n", encoding="utf-8")
+    monkeypatch.setattr(tempfile, "tempdir", os.fspath(tmp_path))
+    _force_clone_path(monkeypatch, _fake_clone(b"instructions\n"))
+
+    findings = _findings(tmp_path)
+
+    assert [_summary(finding) for finding in findings] == [("security", "high", "AGENTS.md")]
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["AGENTS.md"]
 
 
 def test_finding_ids_are_stable_and_distinguish_multiple_instances(tmp_path: Path) -> None:

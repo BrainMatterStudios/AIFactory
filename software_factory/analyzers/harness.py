@@ -30,6 +30,8 @@ _READ_FLAGS = os.O_RDONLY | _NOFOLLOW | _CLOEXEC
 _DIRECTORY_FLAGS = _READ_FLAGS | _DIRECTORY
 _FILE_FLAGS = _READ_FLAGS | _NONBLOCK
 _DARWIN_MNT_NOATIME = 0x10000000
+_CLONE_NOFOLLOW = 0x0001
+_CLONE_NOOWNERCOPY = 0x0002
 _MAX_JSON_NODES = 4096
 _MAX_SHELL_CHARS = 262_144
 _MAX_SHELL_PROGRAMS = 4096
@@ -339,6 +341,88 @@ def _target_read_is_atime_safe(descriptor: int) -> bool:
     return bool(mount_flags is not None and mount_flags & _DARWIN_MNT_NOATIME)
 
 
+def _read_bounded(descriptor: int, limit: int) -> bytes:
+    """Read at most limit + 1 bytes, so an oversized file is visible to the caller."""
+    chunks: list[bytes] = []
+    remaining = limit + 1
+    while remaining:
+        chunk = os.read(descriptor, min(64 * 1024, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _darwin_fclonefileat() -> Any:
+    """Return Darwin's fclonefileat, or None where APFS cloning is not offered."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+
+        function = ctypes.CDLL(None, use_errno=True).fclonefileat
+        function.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        function.restype = ctypes.c_int
+        return function
+    except (AttributeError, ImportError, OSError, TypeError, ValueError):
+        return None
+
+
+def _read_through_clone(
+    workspace: Path, descriptor: int, before: os.stat_result, limit: int
+) -> bytes | None:
+    """Read a copy-on-write clone of the pinned target, leaving its atime untouched.
+
+    Cloning copies extents, not bytes, so the target is never read. The clone
+    lives in a fresh controller scratch directory outside the workspace, is
+    taken from the already-pinned descriptor, and is removed afterwards. The
+    target's access time is re-observed after the read, so success is proven
+    per file rather than assumed per platform. Any failure returns None, which
+    the caller reports as the existing fail-closed metadata finding.
+    """
+    clone = _darwin_fclonefileat()
+    if clone is None:
+        return None
+    import tempfile
+
+    try:
+        scratch = tempfile.mkdtemp(prefix="factory-harness-")
+    except OSError:
+        return None
+    scratch_fd: int | None = None
+    clone_fd: int | None = None
+    try:
+        real_scratch = os.path.realpath(scratch)
+        real_workspace = os.path.realpath(workspace)
+        if os.path.commonpath([real_scratch, real_workspace]) == real_workspace:
+            return None
+        scratch_fd = os.open(scratch, _DIRECTORY_FLAGS)
+        if clone(descriptor, scratch_fd, b"clone", _CLONE_NOFOLLOW | _CLONE_NOOWNERCOPY) != 0:
+            return None
+        clone_fd = os.open("clone", _FILE_FLAGS, dir_fd=scratch_fd)
+        cloned = os.fstat(clone_fd)
+        if not stat.S_ISREG(cloned.st_mode) or cloned.st_size != before.st_size:
+            return None
+        content = _read_bounded(clone_fd, limit)
+        if os.fstat(descriptor).st_atime_ns != before.st_atime_ns:
+            return None
+        return content
+    except OSError:
+        return None
+    finally:
+        _close(clone_fd)
+        _close(scratch_fd)
+        try:
+            os.unlink(os.path.join(scratch, "clone"))
+        except OSError:
+            pass
+        try:
+            os.rmdir(scratch)
+        except OSError:
+            pass
+
+
 def _read_supported_file(workspace: Path, parts: tuple[str, ...], limit: int) -> _ReadResult:
     """Read one fixed supported path through pinned, no-follow descriptors."""
     if not _secure_primitives_available():
@@ -390,20 +474,18 @@ def _read_supported_file(workspace: Path, parts: tuple[str, ...], limit: int) ->
             entry.st_ino,
         ):
             return _ReadResult("unsafe")
-        if not _target_read_is_atime_safe(descriptor):
+        atime_safe = _target_read_is_atime_safe(descriptor)
+        if not atime_safe and before.st_size > limit:
             return _ReadResult("metadata-unsafe")
         if before.st_size > limit:
             return _ReadResult("oversized")
-
-        chunks: list[bytes] = []
-        remaining = limit + 1
-        while remaining:
-            chunk = os.read(descriptor, min(64 * 1024, remaining))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        content = b"".join(chunks)
+        if atime_safe:
+            content = _read_bounded(descriptor, limit)
+        else:
+            cloned = _read_through_clone(workspace, descriptor, before, limit)
+            if cloned is None:
+                return _ReadResult("metadata-unsafe")
+            content = cloned
         if len(content) > limit:
             return _ReadResult("oversized")
 
@@ -489,7 +571,10 @@ def _metadata_safe_read_finding(path: str) -> dict[str, Any]:
         category="security",
         severity="high",
         message="The supported harness file cannot be read without metadata mutation.",
-        required_change="Use O_NOATIME or a filesystem mounted with a verified noatime guarantee.",
+        required_change=(
+            "Use O_NOATIME, an APFS volume that supports cloning, or a filesystem "
+            "mounted with a verified noatime guarantee."
+        ),
     )
 
 

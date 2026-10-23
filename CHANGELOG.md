@@ -4,6 +4,17 @@ All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project uses semantic versioning.
 
+## [Unreleased]
+
+### Fixed
+
+- The harness analyzer no longer blocks the Design gate on ordinary macOS APFS
+  volumes. When a file cannot be opened without updating its access time, the
+  analyzer reads a copy-on-write clone taken from the pinned descriptor in
+  controller scratch space outside the workspace, removes the clone, and
+  re-verifies the original's access time. Every clone failure still produces
+  the existing high-security fail-closed finding.
+
 ## [0.3.0] - 2026-08-29
 
 ### Added
