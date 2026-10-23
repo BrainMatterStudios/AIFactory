@@ -49,7 +49,10 @@ digest; a report always names the exact suite digest it ran.
 **Arm.** One way of attempting tasks. The first release ships two:
 
 - `factory`: `factory build` with the operator's configuration and
-  `publication_mode: local_bundle`, so nothing is pushed;
+  `publication_mode: local_bundle`, so nothing is pushed. Local publication
+  currently completes only for T2 features, and a real model needs an
+  execution backend with a scoped executor, so this arm first covers T2 tasks
+  and depends on the standard sandbox backend (see the implementation plan);
 - `single-agent`: the same runner and model tier given the same request once, in
   an isolated worktree, with the project's `verify_cmd` available, and no
   Contract, Design, gate, personas, or judge.
