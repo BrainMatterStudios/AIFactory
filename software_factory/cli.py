@@ -1806,6 +1806,27 @@ _DANGEROUS_COMMAND_RE = re.compile(
 )
 _ANALYZER_FINDING_MESSAGE = "analyzer finding reported"
 _ANALYZER_REQUIRED_CHANGE = "analyzer change requested"
+_CREDENTIAL_FINDING_MESSAGE = "A credential-shaped literal is redacted."
+
+
+def _analyzer_text(value: object, fallback: str) -> str:
+    """Show analyzer text only when it is a fixed sentence the factory wrote.
+
+    Analyzer output can carry repository-derived text, so anything that is not
+    an exact member of the built-in catalog is replaced by the fallback.
+    """
+    from software_factory.analyzers.harness import (
+        CREDENTIAL_FINDING_PREFIX,
+        FIXED_FINDING_TEXT,
+    )
+
+    if type(value) is not str:
+        return fallback
+    if value in FIXED_FINDING_TEXT:
+        return value
+    if value.startswith(CREDENTIAL_FINDING_PREFIX):
+        return _CREDENTIAL_FINDING_MESSAGE
+    return fallback
 
 
 @contextmanager
@@ -1918,8 +1939,10 @@ def _analyzer_finding_output_document(finding) -> dict[str, object]:
         "evidence": [
             {"path": location["path"], "line": location["line"]} for location in finding["evidence"]
         ],
-        "message": _ANALYZER_FINDING_MESSAGE,
-        "required_change": _ANALYZER_REQUIRED_CHANGE,
+        "message": _analyzer_text(finding["message"], _ANALYZER_FINDING_MESSAGE),
+        "required_change": _analyzer_text(
+            finding["required_change"], _ANALYZER_REQUIRED_CHANGE
+        ),
     }
 
 
@@ -1999,7 +2022,7 @@ def _gate_output_document(document) -> dict[str, object]:
                 "category": finding["category"],
                 "source": finding["source"],
                 "message": (
-                    _ANALYZER_FINDING_MESSAGE
+                    _analyzer_text(finding["message"], _ANALYZER_FINDING_MESSAGE)
                     if finding["id"].startswith("analyzer:")
                     else _safe_output_text(finding["message"])
                 ),

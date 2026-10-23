@@ -527,6 +527,42 @@ def _path(parts: tuple[str, ...]) -> str:
     return PurePosixPath(*parts).as_posix()
 
 
+#: Every fixed sentence a harness finding can carry. Output that must not echo
+#: analyzer text may show a message only when it is an exact member, so
+#: repository content can never reach the terminal through this set.
+FIXED_FINDING_TEXT = frozenset(
+    {
+        "A hook command exceeds bounded inspection limits.",
+        "A hook command invokes a release operation.",
+        "A hook command uses unsupported executable shell syntax.",
+        "A supported harness path is unsafe and was not traversed.",
+        "An MCP server uses an absolute executable outside allowed prefixes.",
+        "An allowed tool permission contains a wildcard.",
+        "Configured MCP server count exceeds the configured limit.",
+        "Keep shared instructions in one root instruction file.",
+        "Reduce the configured MCP server count or raise the reviewed limit.",
+        "Reduce the hook command below the bounded inspection limits.",
+        "Reduce the root instruction file below the configured limit.",
+        "Reduce the supported JSON configuration below the inspection limits.",
+        "Remove release operations from harness hooks.",
+        "Replace the configuration with valid UTF-8 JSON without duplicate keys.",
+        "Replace the redacted literal with an environment reference.",
+        "Replace the supported path with a regular file contained in the workspace.",
+        "Replace the wildcard with explicit least-privilege permissions.",
+        "Rewrite the hook using directly inspectable command syntax.",
+        "Root instruction file exceeds the configured size limit.",
+        "Root instruction files contain duplicate non-empty content.",
+        "Supported harness configuration exceeds bounded inspection limits.",
+        "Supported harness configuration is not valid strict JSON.",
+        "The supported harness file cannot be read without metadata mutation.",
+        "Use O_NOATIME, an APFS volume that supports cloning, or a filesystem mounted with a verified noatime guarantee.",
+        "Use a relative executable or an executable under a reviewed prefix.",
+    }
+)
+#: The credential finding appends a repository-derived JSON path to this prefix.
+CREDENTIAL_FINDING_PREFIX = "A credential-shaped literal is redacted at JSON path "
+
+
 def _finding(
     *,
     rule: str,
@@ -1615,7 +1651,7 @@ def _credential_findings(document: dict[str, Any], path: str) -> list[dict[str, 
                 path=path,
                 category="security",
                 severity="high",
-                message=(f"A credential-shaped literal is redacted at JSON path {json_path}."),
+                message=f"{CREDENTIAL_FINDING_PREFIX}{json_path}.",
                 required_change="Replace the redacted literal with an environment reference.",
                 identity=json_path,
             )

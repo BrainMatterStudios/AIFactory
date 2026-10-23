@@ -14,6 +14,17 @@ project uses semantic versioning.
   controller scratch space outside the workspace, removes the clone, and
   re-verifies the original's access time. Every clone failure still produces
   the existing high-security fail-closed finding.
+- `factory analyze` and `factory capabilities` name the failed precondition
+  (an unloadable manifest, the scaffold placeholder repository, a missing
+  repository identity, or an analyzer that is not configured) instead of a
+  generic "inspection is invalid" message.
+- Harness findings show their own message and required change. Analyzer text is
+  shown only when it exactly matches a fixed sentence the harness analyzer
+  writes; all other analyzer text stays redacted.
+
+### Added
+
+- `factory --version`.
 
 ## [0.3.0] - 2026-08-29
 

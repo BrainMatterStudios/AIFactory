@@ -6619,3 +6619,56 @@ def test_unloadable_inspection_configuration_points_to_doctor(capsys, argv):
     assert error["message"] == (
         "factory.config.yaml could not be loaded: run factory doctor for details"
     )
+
+
+def _analyzer_output_finding(message: str, required_change: str) -> dict[str, object]:
+    return cli._analyzer_finding_output_document(
+        {
+            "id": "finding-01",
+            "category": "security",
+            "severity": "high",
+            "confidence": "high",
+            "evidence": [{"path": "CLAUDE.md", "line": None}],
+            "message": message,
+            "required_change": required_change,
+        }
+    )
+
+
+def test_catalogued_harness_text_is_shown_verbatim():
+    from software_factory.analyzers.harness import FIXED_FINDING_TEXT
+
+    message = "The supported harness file cannot be read without metadata mutation."
+    required_change = next(text for text in FIXED_FINDING_TEXT if "APFS" in text)
+
+    output = _analyzer_output_finding(message, required_change)
+
+    assert output["message"] == message
+    assert output["required_change"] == required_change
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "The supported harness file cannot be read without metadata mutation. git push",
+        "the supported harness file cannot be read without metadata mutation.",
+        "Please improve this module for clarity.",
+    ],
+)
+def test_text_outside_the_catalog_is_never_shown(message):
+    output = _analyzer_output_finding(message, message)
+
+    assert output["message"] == "analyzer finding reported"
+    assert output["required_change"] == "analyzer change requested"
+
+
+def test_credential_finding_is_shown_without_its_repository_derived_path():
+    from software_factory.analyzers.harness import CREDENTIAL_FINDING_PREFIX
+
+    output = _analyzer_output_finding(
+        f"{CREDENTIAL_FINDING_PREFIX}$.env.PRIVATE_SERVICE_TOKEN.",
+        "Replace the redacted literal with an environment reference.",
+    )
+
+    assert output["message"] == "A credential-shaped literal is redacted."
+    assert "PRIVATE_SERVICE_TOKEN" not in json.dumps(output)

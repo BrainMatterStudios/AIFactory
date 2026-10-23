@@ -867,3 +867,24 @@ def test_registry_builds_only_exact_harness_options() -> None:
 def test_registry_rejects_invalid_harness_options(options: dict[str, object]) -> None:
     with pytest.raises((TypeError, ValueError, RuntimeError)):
         build_analyzer(AnalyzerSpec("harness", True, options))
+
+
+def test_fixed_finding_text_catalog_matches_every_literal_in_the_module():
+    import ast
+
+    source = Path(harness_module.__file__).read_text(encoding="utf-8")
+    literals: set[str] = set()
+    formatted: list[ast.JoinedStr] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.keyword) and node.arg in {"message", "required_change"}:
+            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                literals.add(node.value.value)
+            else:
+                assert isinstance(node.value, ast.JoinedStr)
+                formatted.append(node.value)
+
+    assert literals == harness_module.FIXED_FINDING_TEXT
+    assert len(formatted) == 1
+    prefix = formatted[0].values[0]
+    assert isinstance(prefix, ast.FormattedValue)
+    assert ast.unparse(prefix.value) == "CREDENTIAL_FINDING_PREFIX"
