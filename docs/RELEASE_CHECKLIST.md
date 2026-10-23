@@ -15,6 +15,18 @@ authorizes any later shared-state action.
   each against the implementation rather than carrying forward a prior
   release's feature list.
 
+## Roadmap entry preflight
+
+- [ ] For a roadmap-gated release, run the release-specific entry preflight
+  before writing the detailed design. For 0.4.0, run
+  `factory release readiness 0.4.0 --json` first; if private retained evidence
+  exists, rerun with the redacted public-safe evidence summary described in the
+  operating guide.
+- [ ] Treat the preflight as an entry check, not a release approval. A ready
+  0.4.0 preflight means the detailed design may be written and reviewed; it does
+  not authorize a version bump, push, pull request, merge, tag, GitHub release,
+  registry publication, deployment, or any production write.
+
 ## Verification and packaging
 
 - [ ] Run selected authority, migration, adversarial, and end-to-end tests;

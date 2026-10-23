@@ -12,7 +12,6 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from enum import Enum
-from pathlib import PurePosixPath
 from typing import Any
 
 from software_factory.adapters.base import Issue, RunnerAdapter
@@ -34,6 +33,7 @@ from software_factory.build.contract_store import (
 )
 from software_factory.build.workspace import (
     Workspace,
+    workspace_contract_path,
     workspace_file_state,
     workspace_read_file,
     workspace_read_file_at,
@@ -70,6 +70,37 @@ _CONTRACT_ACCEPTED = "contract-accepted"
 _CONTRACT_APPROVAL_PENDING = "contract-approval-pending"
 _CONTRACT_EXTERNAL_FAILURE = "contract-external-failure"
 _CONTRACT_SPEC_PENDING = "contract-spec-pending"
+_RUNNER_FAILURE_REASONS = {
+    "agent-exit-nonzero": "contract-runner-exit-nonzero",
+    "agent-timeout-cleanup-failed": "contract-runner-timeout-cleanup-failed",
+    "claude-error-during-execution": "contract-runner-claude-error-during-execution",
+    "claude-error-max-budget": "contract-runner-claude-error-max-budget",
+    "claude-error-max-turns": "contract-runner-claude-error-max-turns",
+    "claude-authentication-failed": "contract-runner-claude-authentication-failed",
+    "claude-configuration-invalid": "contract-runner-claude-configuration-invalid",
+    "claude-api-invalid-request": "contract-runner-claude-api-invalid-request",
+    "claude-api-billing-failed": "contract-runner-claude-api-billing-failed",
+    "claude-api-forbidden": "contract-runner-claude-api-forbidden",
+    "claude-model-unavailable": "contract-runner-claude-model-unavailable",
+    "claude-network-failed": "contract-runner-claude-network-failed",
+    "claude-rate-limited": "contract-runner-claude-rate-limited",
+    "claude-result-invalid": "contract-runner-result-invalid",
+    "claude-runtime-permission-denied": "contract-runner-claude-runtime-permission-denied",
+    "filesystem-controller-state-denied": "contract-runner-filesystem-controller-state-denied",
+    "filesystem-repository-denied": "contract-runner-filesystem-repository-denied",
+    "filesystem-system-denied": "contract-runner-filesystem-system-denied",
+    "filesystem-unknown-denied": "contract-runner-filesystem-unknown-denied",
+    "guest-operation-failed": "contract-runner-guest-operation-failed",
+    "agent-stderr-nonzero": "contract-runner-stderr-nonzero",
+    "timeout": "contract-runner-timeout",
+    "workspace-output-identity-invalid": "contract-runner-workspace-output-identity-invalid",
+    "workspace-output-paths-denied": "contract-runner-workspace-output-paths-denied",
+}
+_RUNNER_DENIAL_REASONS = {
+    "filesystem": "contract-runner-filesystem-denied",
+    "network": "contract-runner-network-denied",
+    "process": "contract-runner-process-denied",
+}
 
 
 @dataclass(frozen=True)
@@ -130,23 +161,26 @@ def _result(
     )
 
 
-def _contract_path(contracts_dir: str, issue_id: str) -> str:
-    """Return a safe Git-relative path without normalizing provider identity."""
+def _runner_failure_reason(turn: Any) -> str:
+    meta = getattr(turn, "meta", None)
+    if not isinstance(meta, Mapping):
+        return _CONTRACT_EXTERNAL_FAILURE
+    reason = meta.get("executor_failure_reason")
+    if reason in _RUNNER_FAILURE_REASONS:
+        return _RUNNER_FAILURE_REASONS[reason]
+    action = meta.get("executor_action")
+    if not isinstance(action, Mapping) or set(action) != {
+        "schema_version",
+        "disposition",
+        "category",
+    }:
+        return _CONTRACT_EXTERNAL_FAILURE
     if (
-        not isinstance(issue_id, str)
-        or not issue_id
-        or issue_id in {".", ".."}
-        or "/" in issue_id
-        or "\\" in issue_id
-        or "\0" in issue_id
+        action["schema_version"] != "executor-action-v1"
+        or action["disposition"] != "denied"
     ):
-        raise ValueError("issue identity cannot name a contract path")
-    if not isinstance(contracts_dir, str) or not contracts_dir.strip():
-        raise ValueError("contracts directory is invalid")
-    directory = PurePosixPath(contracts_dir)
-    if directory.is_absolute() or ".." in directory.parts or "." in directory.parts:
-        raise ValueError("contracts directory is invalid")
-    return str(directory / f"{issue_id}.json")
+        return _CONTRACT_EXTERNAL_FAILURE
+    return _RUNNER_DENIAL_REASONS.get(action["category"], _CONTRACT_EXTERNAL_FAILURE)
 
 
 def _clear_stale_contract_draft(workspace: Workspace, contract_path: str) -> None:
@@ -496,7 +530,7 @@ def run_contract_phase(
             _CONTRACT_EXTERNAL_FAILURE,
         )
     try:
-        contract_path = _contract_path(contracts_dir, issue.id)
+        contract_path = workspace_contract_path(workspace, contracts_dir, issue.id)
     except (TypeError, ValueError):
         return phase_result(IntentDisposition.BLOCKED, _CONTRACT_EXTERNAL_FAILURE)
 
@@ -620,7 +654,7 @@ def run_contract_phase(
     if not resuming and (turn is None or not turn.ok):
         return phase_result(
             IntentDisposition.BLOCKED,
-            _CONTRACT_EXTERNAL_FAILURE,
+            _runner_failure_reason(turn),
             keep_workspace=True,
         )
 

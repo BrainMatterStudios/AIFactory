@@ -89,6 +89,7 @@ _LOADED_PLUGINS: list[str] = []
 
 _MAX_SOURCE_BUNDLE_BYTES = 512 * 1024 * 1024
 _GIT_BUNDLE_TIMEOUT_SECONDS = 30
+_MAX_RELEASE_READINESS_EVIDENCE_BYTES = 1024 * 1024
 
 
 def _detect_repo(directory) -> str | None:
@@ -2018,6 +2019,42 @@ def _status_output_document(document) -> dict[str, object]:
     }
 
 
+def _release_readiness_reference_output(document) -> dict[str, object]:
+    return {
+        "kind": _safe_output_text(document["kind"]),
+        "digest": document["digest"],
+        "relative_path": _safe_output_text(document["relative_path"]),
+    }
+
+
+def _release_readiness_criterion_output(document) -> dict[str, object]:
+    return {
+        "id": _safe_output_text(document["id"]),
+        "state": document["state"],
+        "summary": _safe_output_text(document["summary"]),
+        "evidence_digest": document["evidence_digest"],
+        "references": [
+            _release_readiness_reference_output(reference)
+            for reference in document["references"]
+        ],
+    }
+
+
+def _release_readiness_output_document(document) -> dict[str, object]:
+    return {
+        "schema_version": document["schema_version"],
+        "release": document["release"],
+        "predecessor_release": document["predecessor_release"],
+        "status": document["status"],
+        "criteria": [
+            _release_readiness_criterion_output(criterion)
+            for criterion in document["criteria"]
+        ],
+        "blocking_criteria": list(document["blocking_criteria"]),
+        "next_action": _safe_output_text(document["next_action"]),
+    }
+
+
 def _serialize_inspection_document(document: Mapping[str, object]) -> dict[str, object]:
     serializers = {
         "factory-design-validation-v1": _validation_output_document,
@@ -2026,6 +2063,7 @@ def _serialize_inspection_document(document: Mapping[str, object]) -> dict[str, 
         "factory-capabilities-inspection-v2": _provider_capability_output_document,
         "factory-design-gate-inspection-v1": _gate_output_document,
         "factory-status-v1": _status_output_document,
+        "factory-release-readiness-report-v1": _release_readiness_output_document,
     }
     schema = document.get("schema_version")
     try:
@@ -2119,6 +2157,18 @@ def _print_human_document(document: Mapping[str, object]) -> None:
         print(f"gate fresh         : {'yes' if document['gate_fresh'] else 'no'}")
         print(f"findings           : {document['finding_counts']['total']}")
         print(f"next action        : {document['next_action']}")
+    elif schema == "factory-release-readiness-report-v1":
+        print(f"release readiness : {document['status']}")
+        print(f"target release    : {document['release']}")
+        print(f"predecessor       : {document['predecessor_release'] or '—'}")
+        print(f"next action       : {document['next_action']}")
+        blocking = document["blocking_criteria"]
+        print("blocking criteria :")
+        if blocking:
+            for criterion in blocking:
+                print(f"  - {criterion}")
+        else:
+            print("  - —")
     else:
         raise ValueError("inspection output schema is unsupported")
 
@@ -3446,6 +3496,78 @@ def cmd_status(args) -> int:
     )
 
 
+def _read_release_readiness_evidence(path: str):
+    from software_factory.build.release_readiness import readiness_evidence_from_document
+
+    descriptor: int | None = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_size > _MAX_RELEASE_READINESS_EVIDENCE_BYTES
+        ):
+            raise ValueError("release readiness evidence is invalid")
+        chunks: list[bytes] = []
+        remaining = _MAX_RELEASE_READINESS_EVIDENCE_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > _MAX_RELEASE_READINESS_EVIDENCE_BYTES:
+            raise ValueError("release readiness evidence is invalid")
+        document = json.loads(payload)
+        return readiness_evidence_from_document(document)
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        MemoryError,
+        OverflowError,
+        RecursionError,
+        RuntimeError,
+        SystemError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise ValueError("release readiness evidence is invalid") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def cmd_release_readiness(args) -> int:
+    """Evaluate whether a roadmap-gated release may enter detailed design."""
+    from software_factory.build.release_readiness import (
+        SUPPORTED_READINESS_RELEASE,
+        ReadinessError,
+        ReleaseReadinessStatus,
+        evaluate_release_readiness,
+        release_readiness_report_document,
+    )
+
+    if args.release != SUPPORTED_READINESS_RELEASE:
+        print("unsupported release readiness target")
+        return 2
+    try:
+        evidence = (
+            None
+            if args.evidence is None
+            else _read_release_readiness_evidence(args.evidence)
+        )
+        report = evaluate_release_readiness(evidence, release=args.release)
+        document = release_readiness_report_document(report)
+        _print_or_json(document, as_json=args.json)
+    except (OSError, ReadinessError, RuntimeError, TypeError, ValueError):
+        print("release readiness evidence is invalid")
+        return 2
+    return 0 if report.status is ReleaseReadinessStatus.READY else 1
+
+
 def _design_gate_inspection_document(result) -> dict[str, object]:
     from software_factory.core.design.gate import design_gate_document
 
@@ -4280,6 +4402,16 @@ def build_parser() -> argparse.ArgumentParser:
     evidence_show.add_argument("--digest")
     evidence_show.add_argument("--json", action="store_true")
     evidence_show.set_defaults(func=cmd_evidence_show)
+
+    release = sub.add_parser("release", help="inspect release preparation gates")
+    release_command = release.add_subparsers(dest="release_command", required=True)
+    release_readiness = release_command.add_parser(
+        "readiness", help="evaluate a roadmap-gated release readiness preflight"
+    )
+    release_readiness.add_argument("release")
+    release_readiness.add_argument("--evidence", help="public-safe readiness evidence JSON")
+    release_readiness.add_argument("--json", action="store_true")
+    release_readiness.set_defaults(func=cmd_release_readiness)
 
     status = sub.add_parser("status", help="project read-only factory lifecycle status")
     status.add_argument("issue", nargs="?")

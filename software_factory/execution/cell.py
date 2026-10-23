@@ -37,7 +37,11 @@ from software_factory.core.design.configuration import (
     VerificationCommandSpec,
     execution_policy_document,
 )
-from software_factory.execution.bridge import is_indirect_verification_command
+from software_factory.execution.bridge import (
+    BridgeFailure,
+    is_indirect_verification_command,
+    validate_bridge_authority_policy,
+)
 from software_factory.execution.context import workspace_context_sha256
 from software_factory.execution.leash_artifact import (
     LEASH_HARDENED_BASE_REVISION,
@@ -64,7 +68,11 @@ from software_factory.execution.pnpm_toolchain import (
 from software_factory.execution.pnpm_toolchain import (
     measure_pnpm_toolchain as _measure_pnpm_toolchain,
 )
-from software_factory.execution.protocol import CONTAINMENT_FAILURE_REASONS, BridgeResponse
+from software_factory.execution.protocol import (
+    CONTAINMENT_FAILURE_REASONS,
+    PREPARE_FAILURE_REASONS,
+    BridgeResponse,
+)
 from software_factory.loop.state import default_state_dir
 
 CELL_STATE_SCHEMA = "validation-cell-state-v2"
@@ -131,6 +139,30 @@ _DEPENDENCY_GUEST_FAILURE_DETAILS = frozenset(
     }
 )
 _DEPENDENCY_STOP_RESULTS = frozenset({"pending", "stopped", "failed"})
+_IMPORT_FAILURE_STAGES = frozenset({"stage", "copy", "lock", "prepare", "attest"})
+_IMPORT_FAILURE_REASONS = frozenset(
+    {
+        "import-operation-failed",
+        "import-stage-failed",
+        "import-lock-failed",
+        "prepare-failed",
+        "import-prepare-attestation-failed",
+    }
+) | PREPARE_FAILURE_REASONS
+_CREATED_STATE_FIELDS = frozenset(
+    {
+        "bootstrap",
+        "created_by_controller",
+        "creation_nonce",
+        "destroyed",
+        "disk_uuid",
+        "instance",
+        "instance_id",
+        "lifecycle",
+        "machine_id",
+        "schema_version",
+    }
+)
 _DEPENDENCY_ATTEMPT_FIELDS = frozenset(
     {"stage", "attempt_id", "imported_state_digest"}
 )
@@ -207,6 +239,24 @@ _HYDRATION_CREATE_STAGES = frozenset(
         "bootstrap-coder-image",
         "bootstrap-upstream-leash-image",
         "bootstrap-upstream-leash-image-discard",
+    }
+)
+_POST_HYDRATION_CREATE_STAGES = frozenset(
+    {
+        "machine-id",
+        "disk-uuid",
+        "transport-mkdir",
+        "copy-wheel",
+        "copy-policy",
+        "copy-toolchain",
+        "copy-leash-archive",
+        "copy-leash-build-record",
+        "copy-leash-test-record",
+        "bootstrap-install",
+        "leash-image-load",
+        "transport-cleanup",
+        "bootstrap-attestation",
+        "state-finalize",
     }
 )
 _CREATE_STAGES = frozenset(
@@ -305,12 +355,22 @@ _LEASH_IMAGE_LOAD_FAILURE_DETAILS = frozenset(
 _CREATE_FAILURE_DETAILS = {
     **{
         stage: frozenset({"controller-stop-failed"})
-        for stage in _BPF_LSM_CREATE_STAGES | _HYDRATION_CREATE_STAGES
+        for stage in (
+            _BPF_LSM_CREATE_STAGES
+            | _HYDRATION_CREATE_STAGES
+            | _POST_HYDRATION_CREATE_STAGES
+        )
     },
     "start": frozenset({"controller-stop-failed"}),
-    "bootstrap-install": _BOOTSTRAP_INSTALL_FAILURE_DETAILS,
-    "bootstrap-attestation": _ATTESTATION_FAILURE_DETAILS,
-    "leash-image-load": _LEASH_IMAGE_LOAD_FAILURE_DETAILS,
+    "bootstrap-install": (
+        _BOOTSTRAP_INSTALL_FAILURE_DETAILS | {"controller-stop-failed"}
+    ),
+    "bootstrap-attestation": (
+        _ATTESTATION_FAILURE_DETAILS | {"controller-stop-failed"}
+    ),
+    "leash-image-load": (
+        _LEASH_IMAGE_LOAD_FAILURE_DETAILS | {"controller-stop-failed"}
+    ),
 }
 _BOOTSTRAP_INPUT_DIGEST_FIELDS = frozenset(
     {
@@ -1427,6 +1487,7 @@ class ValidationCell:
             raise CellError("cell-unowned")
         self._validate_dependency_attempt(state)
         self._validate_dependency_failure(state)
+        self._validate_import_failure(state)
         self._validate_containment_authority(state)
         if state.get("destroyed") is True:
             raise CellError("cell-unowned")
@@ -1441,6 +1502,7 @@ class ValidationCell:
         bpf_stop_present = "bpf_activation_stop" in state
         start_stop_present = "start_failure_stop" in state
         hydration_stop_present = "hydration_failure_stop" in state
+        creation_stop_present = "creation_failure_stop" in state
         create_stage = state["create_stage"] if create_present else None
         failure_stage = state["failure_stage"] if failure_present else None
         failure_detail = state["failure_detail"] if detail_present else None
@@ -1448,6 +1510,15 @@ class ValidationCell:
         start_stop = state["start_failure_stop"] if start_stop_present else None
         hydration_stop = (
             state["hydration_failure_stop"] if hydration_stop_present else None
+        )
+        creation_stop = (
+            state["creation_failure_stop"] if creation_stop_present else None
+        )
+        creation_stopped = (
+            type(creation_stop) is dict
+            and creation_stop.get("result") == "stopped"
+            and state.get("lifecycle") == "stopped"
+            and state.get("retained_lifecycle") == "pending"
         )
         if (
             (
@@ -1473,6 +1544,7 @@ class ValidationCell:
             or (
                 (create_present or failure_present or detail_present)
                 and state.get("lifecycle") != "pending"
+                and not creation_stopped
             )
             or (
                 bpf_stop_present
@@ -1537,6 +1609,37 @@ class ValidationCell:
                 )
             )
             or (
+                creation_stop_present
+                and (
+                    type(creation_stop) is not dict
+                    or set(creation_stop) != {"attempted", "result"}
+                    or creation_stop.get("attempted") is not True
+                    or creation_stop.get("result")
+                    not in {"pending", "stopped", "failed"}
+                    or state.get("created_by_controller") is not True
+                    or create_stage not in _POST_HYDRATION_CREATE_STAGES
+                    or failure_stage != create_stage
+                    or (
+                        creation_stop.get("result") in {"pending", "failed"}
+                        and (
+                            state.get("lifecycle") != "pending"
+                            or "retained_lifecycle" in state
+                        )
+                    )
+                    or (
+                        creation_stop.get("result") == "stopped"
+                        and not creation_stopped
+                    )
+                    or (
+                        creation_stop.get("result") == "failed"
+                        and failure_detail != "controller-stop-failed"
+                    )
+                    or (
+                        creation_stop.get("result") != "failed" and detail_present
+                    )
+                )
+            )
+            or (
                 failure_detail == "controller-stop-failed"
                 and (
                     (
@@ -1550,6 +1653,10 @@ class ValidationCell:
                     and (
                         type(hydration_stop) is not dict
                         or hydration_stop.get("result") != "failed"
+                    )
+                    and (
+                        type(creation_stop) is not dict
+                        or creation_stop.get("result") != "failed"
                     )
                 )
             )
@@ -1673,6 +1780,68 @@ class ValidationCell:
             result == "stopped"
             and (lifecycle != "stopped" or retained != "imported")
         ):
+            raise CellError("controller-state-invalid")
+
+    @staticmethod
+    def _validate_import_failure(state: Mapping[str, Any]) -> None:
+        if "import_failure" not in state:
+            return
+        failure = state["import_failure"]
+        if type(failure) is not dict or set(failure) != {
+            "pre_import_state_digest",
+            "reason",
+            "stage",
+            "stop",
+        }:
+            raise CellError("controller-state-invalid")
+        stop = failure["stop"]
+        result = stop.get("result") if type(stop) is dict else None
+        retained_lifecycle = (
+            state.get("retained_lifecycle")
+            if result == "stopped"
+            else state.get("lifecycle")
+        )
+        authority_fields = (
+            _CREATED_STATE_FIELDS
+            if retained_lifecycle == "created"
+            else _DEPENDENCY_IMPORTED_STATE_FIELDS
+            if retained_lifecycle == "imported"
+            else frozenset()
+        )
+        expected_fields = authority_fields | {"import_failure"} | (
+            {"retained_lifecycle"} if result == "stopped" else set()
+        )
+        if (
+            set(state) != expected_fields
+            or failure.get("stage") not in _IMPORT_FAILURE_STAGES
+            or failure.get("reason") not in _IMPORT_FAILURE_REASONS
+            or not _is_digest(failure.get("pre_import_state_digest"))
+            or type(stop) is not dict
+            or set(stop) != {"attempted", "result"}
+            or stop.get("attempted") is not True
+            or result not in _DEPENDENCY_STOP_RESULTS
+            or state.get("created_by_controller") is not True
+            or type(state.get("destroyed")) is not bool
+        ):
+            raise CellError("controller-state-invalid")
+        pre_import = {field: state[field] for field in authority_fields}
+        pre_import["destroyed"] = False
+        pre_import["lifecycle"] = retained_lifecycle
+        if failure["pre_import_state_digest"] != _digest_bytes(
+            _json_bytes(pre_import, newline=True)
+        ):
+            raise CellError("controller-state-invalid")
+        if state.get("destroyed") is True:
+            if (
+                result != "stopped"
+                or state.get("lifecycle") != "destroyed"
+                or retained_lifecycle not in {"created", "imported"}
+            ):
+                raise CellError("controller-state-invalid")
+        elif result == "stopped":
+            if state.get("lifecycle") != "stopped":
+                raise CellError("controller-state-invalid")
+        elif "retained_lifecycle" in state:
             raise CellError("controller-state-invalid")
 
     @staticmethod
@@ -1884,6 +2053,21 @@ class ValidationCell:
         return report
 
     @staticmethod
+    def _import_retirement_report(
+        instance: str, state: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            "destroyed": state["destroyed"],
+            "import_failure": dict(state["import_failure"]),
+            "instance": instance,
+            "lifecycle": state["lifecycle"],
+            "retained_lifecycle": state.get(
+                "retained_lifecycle", state["lifecycle"]
+            ),
+            "runnable": False,
+        }
+
+    @staticmethod
     def _require_monotonic_dependency_authority(
         current: Mapping[str, Any],
         candidate: Mapping[str, Any],
@@ -2042,6 +2226,45 @@ class ValidationCell:
                     raise CellError("controller-state-invalid")
 
     @staticmethod
+    def _require_monotonic_import_failure(
+        current: Mapping[str, Any],
+        candidate: Mapping[str, Any],
+        *,
+        conditional: bool,
+    ) -> None:
+        current_failure = current.get("import_failure")
+        candidate_failure = candidate.get("import_failure")
+        if current_failure is None:
+            if candidate_failure is None:
+                return
+            if (
+                not conditional
+                or current.get("lifecycle") not in {"created", "imported"}
+                or candidate_failure.get("stop", {}).get("result") != "pending"
+            ):
+                raise CellError("controller-state-invalid")
+            return
+        if type(current_failure) is not dict or type(candidate_failure) is not dict:
+            raise CellError("controller-state-invalid")
+        if (
+            candidate_failure.get("pre_import_state_digest")
+            != current_failure.get("pre_import_state_digest")
+            or candidate_failure.get("stage") != current_failure.get("stage")
+            or candidate_failure.get("reason") != current_failure.get("reason")
+            or candidate_failure.get("stop", {}).get("attempted") is not True
+        ):
+            raise CellError("controller-state-invalid")
+        current_result = current_failure.get("stop", {}).get("result")
+        candidate_result = candidate_failure.get("stop", {}).get("result")
+        if candidate_result != current_result:
+            progresses = (
+                current_result == "pending"
+                and candidate_result in {"failed", "stopped"}
+            ) or (current_result == "failed" and candidate_result == "stopped")
+            if not conditional or not progresses:
+                raise CellError("controller-state-invalid")
+
+    @staticmethod
     def _require_monotonic_hydration_stop(
         current: Mapping[str, Any],
         candidate: Mapping[str, Any],
@@ -2076,6 +2299,41 @@ class ValidationCell:
         ):
             raise CellError("controller-state-invalid")
 
+    @staticmethod
+    def _require_monotonic_creation_stop(
+        current: Mapping[str, Any],
+        candidate: Mapping[str, Any],
+        *,
+        conditional: bool,
+    ) -> None:
+        current_stop = current.get("creation_failure_stop")
+        candidate_stop = candidate.get("creation_failure_stop")
+        if current_stop is None:
+            if candidate_stop is not None and not conditional:
+                raise CellError("controller-state-invalid")
+            return
+        if type(current_stop) is not dict or type(candidate_stop) is not dict:
+            raise CellError("controller-state-invalid")
+        if (
+            current.get("create_stage") != candidate.get("create_stage")
+            or current.get("failure_stage") != candidate.get("failure_stage")
+            or candidate_stop.get("attempted") is not True
+        ):
+            raise CellError("controller-state-invalid")
+        current_result = current_stop.get("result")
+        candidate_result = candidate_stop.get("result")
+        allowed_results = {
+            "pending": {"pending", "failed", "stopped"},
+            "failed": {"failed", "stopped"},
+            "stopped": {"stopped"},
+        }
+        if (
+            not conditional
+            or current_result not in allowed_results
+            or candidate_result not in allowed_results[current_result]
+        ):
+            raise CellError("controller-state-invalid")
+
     def _validate_state(self, instance: str, state: Mapping[str, Any]) -> None:
         instance = _instance(instance)
         if state.get("schema_version") != CELL_STATE_SCHEMA or state.get("instance") != instance:
@@ -2083,6 +2341,7 @@ class ValidationCell:
         self._validate_create_stages(state)
         self._validate_dependency_attempt(state)
         self._validate_dependency_failure(state)
+        self._validate_import_failure(state)
         self._validate_containment_authority(state)
 
     def _save_initial(self, instance: str, state: Mapping[str, Any]) -> None:
@@ -2127,6 +2386,16 @@ class ValidationCell:
             ):
                 raise CellError("controller-state-stale")
             self._require_monotonic_hydration_stop(
+                current,
+                state,
+                conditional=expected_state_digest is not None,
+            )
+            self._require_monotonic_creation_stop(
+                current,
+                state,
+                conditional=expected_state_digest is not None,
+            )
+            self._require_monotonic_import_failure(
                 current,
                 state,
                 conditional=expected_state_digest is not None,
@@ -2464,6 +2733,79 @@ class ValidationCell:
                 pass
             raise CellError("hydration-failure-stop-failed") from None
         self._stop_hydration_failure_terminal(instance, pending)
+
+    @staticmethod
+    def _creation_failure_stop_state(
+        state: Mapping[str, Any], *, stage: str, result: str
+    ) -> dict[str, Any]:
+        if stage not in _POST_HYDRATION_CREATE_STAGES:
+            raise CellError("create-stage-invalid")
+        if result not in {"pending", "stopped", "failed"}:
+            raise CellError("controller-state-invalid")
+        candidate = {
+            **state,
+            "creation_failure_stop": {"attempted": True, "result": result},
+            "create_stage": stage,
+            "failure_stage": stage,
+            "lifecycle": "pending",
+        }
+        candidate.pop("retained_lifecycle", None)
+        candidate.pop("failure_detail", None)
+        if result == "stopped":
+            candidate["lifecycle"] = "stopped"
+            candidate["retained_lifecycle"] = "pending"
+        elif result == "failed":
+            candidate["failure_detail"] = "controller-stop-failed"
+        return candidate
+
+    def _publish_creation_failure_stop(
+        self,
+        instance: str,
+        candidate: dict[str, Any],
+        *,
+        expected_state_digest: str,
+    ) -> None:
+        try:
+            self._save(
+                instance,
+                candidate,
+                expected_state_digest=expected_state_digest,
+            )
+        except BaseException:
+            try:
+                published = self._load(instance)
+            except BaseException:
+                published = None
+            if published != candidate:
+                raise CellError("creation-failure-stop-failed") from None
+
+    def _stop_creation_failure_terminal(
+        self, instance: str, pending: Mapping[str, Any]
+    ) -> None:
+        stage = pending.get("create_stage")
+        if stage not in _POST_HYDRATION_CREATE_STAGES:
+            raise CellError("controller-state-invalid")
+        pending_digest = _digest_bytes(_json_bytes(dict(pending), newline=True))
+        try:
+            self._run(["limactl", "stop", instance], timeout_seconds=60)
+        except BaseException:
+            failed = self._creation_failure_stop_state(
+                pending, stage=stage, result="failed"
+            )
+            self._publish_creation_failure_stop(
+                instance,
+                failed,
+                expected_state_digest=pending_digest,
+            )
+            raise CellError("creation-failure-stop-failed") from None
+        stopped = self._creation_failure_stop_state(
+            pending, stage=stage, result="stopped"
+        )
+        self._publish_creation_failure_stop(
+            instance,
+            stopped,
+            expected_state_digest=pending_digest,
+        )
 
     def _run(
         self,
@@ -3530,6 +3872,8 @@ class ValidationCell:
     def _start_locked(self, *, instance: str) -> dict[str, Any]:
         state = self._load(instance)
         state_digest = _digest_bytes(_json_bytes(state, newline=True))
+        if "import_failure" in state:
+            raise CellError("start-transition-invalid")
         if "containment_attempt" in state:
             raise CellError("start-transition-invalid")
         if "dependency_attempt" in state and "dependencies" not in state and (
@@ -3584,6 +3928,31 @@ class ValidationCell:
     def _stop_locked(self, *, instance: str) -> dict[str, Any]:
         state = self._load(instance)
         state_digest = _digest_bytes(_json_bytes(state, newline=True))
+        if "import_failure" in state:
+            if state["lifecycle"] == "stopped":
+                return self._import_retirement_report(instance, state)
+            try:
+                self._run(["limactl", "stop", instance])
+            except BaseException:
+                raise CellError("import-stop-failed") from None
+            stopped = {
+                **state,
+                "import_failure": {
+                    **state["import_failure"],
+                    "stop": {"attempted": True, "result": "stopped"},
+                },
+                "lifecycle": "stopped",
+                "retained_lifecycle": state["lifecycle"],
+            }
+            self._save(instance, stopped, expected_state_digest=state_digest)
+            return self._import_retirement_report(instance, stopped)
+        if (
+            state.get("lifecycle") == "stopped"
+            and state.get("retained_lifecycle") == "pending"
+            and state.get("creation_failure_stop")
+            == {"attempted": True, "result": "stopped"}
+        ):
+            return {"instance": instance, "retained": True}
         if (
             state.get("lifecycle") == "pending"
             and state.get("created_by_controller") is True
@@ -3673,6 +4042,43 @@ class ValidationCell:
                     expected_state_digest=state_digest,
                 )
             self._stop_hydration_failure_terminal(instance, terminal_state)
+            return {"instance": instance, "retained": True}
+        if (
+            state.get("lifecycle") == "pending"
+            and state.get("created_by_controller") is True
+            and state.get("create_stage") in _POST_HYDRATION_CREATE_STAGES
+            and state.get("failure_stage") in {None, state.get("create_stage")}
+        ):
+            stop = state.get("creation_failure_stop")
+            try:
+                observed_status = self._lima_instance_status(instance)
+            except BaseException:
+                observed_status = None
+            if observed_status == "Stopped":
+                stopped = self._creation_failure_stop_state(
+                    state,
+                    stage=state["create_stage"],
+                    result="stopped",
+                )
+                self._publish_creation_failure_stop(
+                    instance,
+                    stopped,
+                    expected_state_digest=state_digest,
+                )
+                return {"instance": instance, "retained": True}
+            terminal_state = state
+            if stop is None:
+                terminal_state = self._creation_failure_stop_state(
+                    state,
+                    stage=state["create_stage"],
+                    result="pending",
+                )
+                self._publish_creation_failure_stop(
+                    instance,
+                    terminal_state,
+                    expected_state_digest=state_digest,
+                )
+            self._stop_creation_failure_terminal(instance, terminal_state)
             return {"instance": instance, "retained": True}
         if "containment_attempt" in state:
             if (
@@ -3860,68 +4266,99 @@ class ValidationCell:
             )
             if validated_issue.id != bridge["issue"] or policy.verification_command is None:
                 raise ValueError("positive verification command required")
+            validate_bridge_authority_policy(bridge)
             positive_verification = policy.verification_command
-        except (KeyError, TypeError, ValueError, LocalSourceError) as error:
+        except (BridgeFailure, KeyError, TypeError, ValueError, LocalSourceError) as error:
             raise CellError("import-manifest-invalid") from error
-        client = self._client_factory(instance)
-        stage_id = self._transport_nonce_factory()
-        if not _is_digest(stage_id):
-            raise CellError("transport-nonce-invalid")
-        guest_root = f"/tmp/aifactory-import-{stage_id}"
-        staged = self._guest(
-            instance,
-            "import",
-            {"stage_id": stage_id, "transition": "stage"},
-        )
-        if staged != {"staged": True, "transport_root": guest_root}:
-            raise CellError("import-stage-failed")
-        client.copy_in(bundle_snapshot, f"{guest_root}/repository.bundle")
-        client.copy_in(bridge_path.resolve(strict=True), f"{guest_root}/manifest.json")
-        client.copy_in(issue_path.resolve(strict=True), f"{guest_root}/issue.json")
-        locked = self._guest(
-            instance,
-            "import",
-            {
-                "bundle_digest": bundle_digest,
-                "dependencies": normalized_dependencies,
-                "issue_digest": issue_digest,
-                "manifest_digest": manifest_digest,
-                "stage_id": stage_id,
-                "transition": "lock",
-            },
-        )
-        if locked != {"locked": True}:
-            raise CellError("import-lock-failed")
-        response = client.prepare(
-            context_digest=context,
-            request_id=self._request_id_factory(),
-            payload={
-                "base_revision": bridge["base_revision"],
-                "bundle_digest": bundle_digest,
-                "manifest_digest": manifest_digest,
-            },
-        )
-        if (
-            type(response) is not BridgeResponse
-            or response.status != "ok"
-            or dict(response.result)
-            != {
-                "base_revision": bridge["base_revision"],
-                "workspace": f"{WORKSPACE_ROOT}/{context}",
-            }
-        ):
-            raise CellError("prepare-failed")
-        prepared = self._guest(
-            instance,
-            "import",
-            {
-                "context_digest": context,
-                "manifest_digest": manifest_digest,
-                "transition": "prepared",
-            },
-        )
-        if prepared != {"prepared": True}:
-            raise CellError("import-prepare-attestation-failed")
+        failure_stage = "stage"
+        try:
+            client = self._client_factory(instance)
+            stage_id = self._transport_nonce_factory()
+            if not _is_digest(stage_id):
+                raise CellError("transport-nonce-invalid")
+            guest_root = f"/tmp/aifactory-import-{stage_id}"
+            staged = self._guest(
+                instance,
+                "import",
+                {"stage_id": stage_id, "transition": "stage"},
+            )
+            if staged != {"staged": True, "transport_root": guest_root}:
+                raise CellError("import-stage-failed")
+            failure_stage = "copy"
+            client.copy_in(bundle_snapshot, f"{guest_root}/repository.bundle")
+            client.copy_in(bridge_path.resolve(strict=True), f"{guest_root}/manifest.json")
+            client.copy_in(issue_path.resolve(strict=True), f"{guest_root}/issue.json")
+            failure_stage = "lock"
+            locked = self._guest(
+                instance,
+                "import",
+                {
+                    "bundle_digest": bundle_digest,
+                    "dependencies": normalized_dependencies,
+                    "issue_digest": issue_digest,
+                    "manifest_digest": manifest_digest,
+                    "stage_id": stage_id,
+                    "transition": "lock",
+                },
+            )
+            if locked != {"locked": True}:
+                raise CellError("import-lock-failed")
+            failure_stage = "prepare"
+            response = client.prepare(
+                context_digest=context,
+                request_id=self._request_id_factory(),
+                payload={
+                    "base_revision": bridge["base_revision"],
+                    "bundle_digest": bundle_digest,
+                    "manifest_digest": manifest_digest,
+                },
+            )
+            if (
+                type(response) is BridgeResponse
+                and response.status == "failed"
+                and set(response.result) == {"reason"}
+                and response.result["reason"] in PREPARE_FAILURE_REASONS
+            ):
+                raise CellError(str(response.result["reason"]))
+            if (
+                type(response) is not BridgeResponse
+                or response.status != "ok"
+                or dict(response.result)
+                != {
+                    "base_revision": bridge["base_revision"],
+                    "workspace": f"{WORKSPACE_ROOT}/{context}",
+                }
+            ):
+                raise CellError("prepare-failed")
+            failure_stage = "attest"
+            prepared = self._guest(
+                instance,
+                "import",
+                {
+                    "context_digest": context,
+                    "manifest_digest": manifest_digest,
+                    "transition": "prepared",
+                },
+            )
+            if prepared != {"prepared": True}:
+                raise CellError("import-prepare-attestation-failed")
+        except BaseException as error:
+            reason = (
+                error.reason
+                if isinstance(error, CellError)
+                and error.reason in _IMPORT_FAILURE_REASONS
+                else "import-operation-failed"
+            )
+            self._retire_import_failure(
+                instance,
+                state,
+                stage=failure_stage,
+                reason=reason,
+                pre_import_state_digest=state_digest,
+            )
+            if isinstance(error, Exception):
+                raise CellError("import-operation-failed") from None
+            raise
         state["request"] = {
             "base_revision": bridge["base_revision"],
             "bundle_digest": bundle_digest,
@@ -3943,6 +4380,75 @@ class ValidationCell:
         state["lifecycle"] = "imported"
         self._save(instance, state, expected_state_digest=state_digest)
         return {"context_digest": context, "manifest_digest": manifest_digest, "prepared": True}
+
+    def _retire_import_failure(
+        self,
+        instance: str,
+        state: Mapping[str, Any],
+        *,
+        stage: str,
+        reason: str,
+        pre_import_state_digest: str,
+    ) -> None:
+        pending = {
+            **state,
+            "import_failure": {
+                "pre_import_state_digest": pre_import_state_digest,
+                "reason": reason,
+                "stage": stage,
+                "stop": {"attempted": True, "result": "pending"},
+            },
+        }
+        try:
+            self._save(
+                instance,
+                pending,
+                expected_state_digest=pre_import_state_digest,
+            )
+        except BaseException:
+            try:
+                self._run(["limactl", "stop", instance])
+            except BaseException:
+                pass
+            raise CellError("import-stop-failed") from None
+        try:
+            self._run(["limactl", "stop", instance])
+        except BaseException:
+            failed = {
+                **pending,
+                "import_failure": {
+                    **pending["import_failure"],
+                    "stop": {"attempted": True, "result": "failed"},
+                },
+            }
+            try:
+                self._save(
+                    instance,
+                    failed,
+                    expected_state_digest=_digest_bytes(
+                        _json_bytes(pending, newline=True)
+                    ),
+                )
+            except BaseException:
+                pass
+            raise CellError("import-stop-failed") from None
+        stopped = {
+            **pending,
+            "import_failure": {
+                **pending["import_failure"],
+                "stop": {"attempted": True, "result": "stopped"},
+            },
+            "lifecycle": "stopped",
+            "retained_lifecycle": state["lifecycle"],
+        }
+        try:
+            self._save(
+                instance,
+                stopped,
+                expected_state_digest=_digest_bytes(_json_bytes(pending, newline=True)),
+            )
+        except BaseException:
+            raise CellError("import-stop-failed") from None
 
     def dependencies(self, *, instance: str) -> dict[str, Any]:
         with self._instance_transition_lock(instance):
@@ -5074,6 +5580,40 @@ class ValidationCell:
         if state.get("created_by_controller") is not True or state.get("lifecycle") == "pending":
             raise CellError("cell-not-created")
         state_digest = _digest_bytes(_json_bytes(state, newline=True))
+        if "import_failure" in state:
+            try:
+                self._run(["limactl", "start", instance])
+                report = self._doctor_running(instance=instance, state=state)
+                if (
+                    report["observation"]["instance_id"] != state["instance_id"]
+                    or report["guest"]["instance_id"] != state["instance_id"]
+                    or report["guest"]["bootstrap_digest"]
+                    != state["bootstrap"]["bootstrap_digest"]
+                ):
+                    raise CellError("instance-authority-mismatch")
+                self._run(["limactl", "stop", instance])
+                self._run(["limactl", "delete", instance])
+            except BaseException as error:
+                try:
+                    self._run(["limactl", "stop", instance])
+                except BaseException:
+                    raise CellError("import-stop-failed") from None
+                raise error
+            destroyed = {
+                **state,
+                "destroyed": True,
+                "import_failure": {
+                    **state["import_failure"],
+                    "stop": {"attempted": True, "result": "stopped"},
+                },
+                "lifecycle": "destroyed",
+            }
+            self._save(
+                instance,
+                destroyed,
+                expected_state_digest=state_digest,
+            )
+            return {"destroyed": True, "instance": instance}
         if "containment_attempt" in state:
             result = state.get("containment_result")
             if type(result) is not dict:
@@ -5604,6 +6144,61 @@ def _regular_directory(path: Path) -> Path:
     ):
         raise CellError("directory-invalid")
     return resolved
+
+
+def _exclude_managed_dependency_tree(repository: Path, project: Path) -> None:
+    """Keep the exact controller-managed dependency tree out of Git status."""
+    try:
+        repository = _regular_directory(repository)
+        project = _regular_directory(project)
+        relative = project.relative_to(repository)
+        git_directory = _regular_directory(repository / ".git")
+        info_directory = _regular_directory(git_directory / "info")
+        exclude = info_directory / "exclude"
+        info = info_directory.lstat()
+        exclude_info = exclude.lstat()
+        if (
+            info.st_uid != os.geteuid()
+            or info.st_mode & 0o022
+            or not stat.S_ISREG(exclude_info.st_mode)
+            or exclude_info.st_nlink != 1
+            or exclude_info.st_uid != os.geteuid()
+            or exclude_info.st_mode & 0o022
+        ):
+            raise CellError("dependency-exclude-invalid")
+        raw = _stable_file_bytes(exclude, max_bytes=MAX_DOCUMENT_BYTES)
+        text = raw.decode("utf-8", errors="strict")
+        pattern = "/node_modules/" if relative == Path(".") else f"/{relative.as_posix()}/node_modules/"
+        if pattern in text.splitlines():
+            return
+        payload = raw + (b"" if not raw or raw.endswith(b"\n") else b"\n") + pattern.encode("utf-8") + b"\n"
+        descriptor, temporary = tempfile.mkstemp(prefix=".exclude.", dir=info_directory)
+        try:
+            os.fchmod(descriptor, stat.S_IMODE(exclude_info.st_mode))
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(descriptor, payload[offset:])
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            os.replace(temporary, exclude)
+            directory = os.open(info_directory, os.O_RDONLY | _DIRECTORY | _NOFOLLOW)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except BaseException:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+    except CellError:
+        raise
+    except (OSError, UnicodeError, ValueError) as error:
+        raise CellError("dependency-exclude-invalid") from error
 
 
 def _local_issue(value: object) -> None:
@@ -6943,6 +7538,7 @@ permit(principal, action == Action::\"NetworkConnect\", resource) when { resourc
     tree_digest = normalized_tree_digest(node_modules)
     if requires_dependency_tree and tree_digest == hashlib.sha256().hexdigest():
         raise CellError("dependency-tree-invalid")
+    _exclude_managed_dependency_tree(repository_workspace, workspace)
     _remove_dependency_control_tree(workspace, expected_uid=dependency_uid)
     state["dependency"] = {
         "dependency_tree_digest": tree_digest,

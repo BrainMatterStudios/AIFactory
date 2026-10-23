@@ -226,7 +226,7 @@ class _ControllerAuthority:
     instance_id: str
 
     @contextmanager
-    def dispatch(self) -> Iterator[None]:
+    def dispatch(self) -> Iterator[int]:
         root_fd = instance_fd = lock_fd = state_fd = manifest_fd = -1
         body_failed = False
         authorized = False
@@ -373,7 +373,7 @@ class _ControllerAuthority:
             ):
                 raise RuntimeError("Lima controller authority is unavailable")
             authorized = True
-            yield
+            yield instance_fd
         except OSError as error:
             body_failed = True
             if authorized:
@@ -393,6 +393,84 @@ class _ControllerAuthority:
                 except BaseException:
                     if not body_failed:
                         raise RuntimeError("Lima controller authority is unavailable") from None
+
+    def write_private_diagnostic(self, document: Mapping[str, Any]) -> None:
+        content = _canonical_json_bytes(document)
+        if len(content) > 2 * 1024 * 1024:
+            raise RuntimeError("Lima controller diagnostic is unavailable")
+        controller_fd = diagnostics_fd = output_fd = -1
+        temporary_name = "." + uuid4().hex + ".tmp"
+        output_name = "workspace-output-paths-denied-" + uuid4().hex + ".json"
+        try:
+            with self.dispatch() as instance_fd:
+                controller_fd = os.open(
+                    "controller-authority",
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=instance_fd,
+                )
+                controller_info = os.fstat(controller_fd)
+                controller_named = os.stat(
+                    "controller-authority", dir_fd=instance_fd, follow_symlinks=False
+                )
+                if (
+                    not stat.S_ISDIR(controller_info.st_mode)
+                    or controller_info.st_uid != os.geteuid()
+                    or controller_info.st_mode & 0o022
+                    or (controller_info.st_dev, controller_info.st_ino)
+                    != (controller_named.st_dev, controller_named.st_ino)
+                ):
+                    raise RuntimeError("Lima controller diagnostic is unavailable")
+                try:
+                    os.mkdir("private-diagnostics", mode=0o700, dir_fd=controller_fd)
+                except FileExistsError:
+                    pass
+                diagnostics_fd = os.open(
+                    "private-diagnostics",
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=controller_fd,
+                )
+                diagnostics_info = os.fstat(diagnostics_fd)
+                if (
+                    not stat.S_ISDIR(diagnostics_info.st_mode)
+                    or diagnostics_info.st_uid != os.geteuid()
+                    or stat.S_IMODE(diagnostics_info.st_mode) != 0o700
+                ):
+                    raise RuntimeError("Lima controller diagnostic is unavailable")
+                output_fd = os.open(
+                    temporary_name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                    dir_fd=diagnostics_fd,
+                )
+                view = memoryview(content)
+                while view:
+                    written = os.write(output_fd, view)
+                    if written <= 0:
+                        raise RuntimeError("Lima controller diagnostic is unavailable")
+                    view = view[written:]
+                os.fsync(output_fd)
+                os.close(output_fd)
+                output_fd = -1
+                os.rename(
+                    temporary_name,
+                    output_name,
+                    src_dir_fd=diagnostics_fd,
+                    dst_dir_fd=diagnostics_fd,
+                )
+                os.fsync(diagnostics_fd)
+        except OSError as error:
+            raise RuntimeError("Lima controller diagnostic is unavailable") from error
+        finally:
+            for descriptor in (output_fd, diagnostics_fd, controller_fd):
+                if descriptor >= 0:
+                    os.close(descriptor)
 
 
 class _ControllerAuthorizedTransport:
@@ -428,6 +506,9 @@ class _ControllerAuthorizedTransport:
 
     def copy_out(self, guest_source: str, destination: Path) -> Mapping[str, str]:
         return self._call("copy_out", guest_source, destination)
+
+    def write_private_diagnostic(self, document: Mapping[str, Any]) -> None:
+        self._authority.write_private_diagnostic(document)
 
 
 @dataclass(frozen=True)
@@ -1169,6 +1250,12 @@ class LimaWorkspace:
         if result["base_revision"] != self.base or result["workspace"] != expected_workspace:
             raise RuntimeError("Lima workspace preparation identity mismatch")
 
+    def contract_artifact_path(self) -> str:
+        paths = self._phase_writable_paths.get("contract-author")
+        if paths is None or len(paths) != 1:
+            raise ValueError("Lima workspace lacks exact Contract artifact authority")
+        return paths[0]
+
     def execution_scope(
         self, turn_kind: str, *, expected_input_fingerprint: str | None = None
     ) -> ExecutionScope:
@@ -1769,24 +1856,66 @@ class LimaLeashRunner:
             for allowed in allowed_paths
         )
 
-    def _reset_denied(self, context: str, revision: str, *, category: str, model: str) -> RunResult:
+    def _reset_denied(
+        self,
+        context: str,
+        revision: str,
+        *,
+        category: str,
+        model: str,
+        failure_reason: str | None = None,
+    ) -> RunResult:
         try:
             result = self._workspace_result(context, "reset_to", {"revision": revision})
             if result != {"reset": True}:
                 raise RuntimeError("reset was not confirmed")
         except Exception:
             category = "process"
-        return RunResult(
-            ok=False,
-            output="scoped execution denied",
-            model=model,
-            meta={
+        safe_failure_reasons = {
+            "agent-exit-nonzero",
+            "agent-timeout-cleanup-failed",
+            "claude-error-during-execution",
+            "claude-error-max-budget",
+            "claude-error-max-turns",
+            "claude-authentication-failed",
+            "claude-configuration-invalid",
+            "claude-api-invalid-request",
+            "claude-api-billing-failed",
+            "claude-api-forbidden",
+            "claude-model-unavailable",
+            "claude-network-failed",
+            "claude-rate-limited",
+            "claude-result-invalid",
+            "claude-runtime-permission-denied",
+            "filesystem-controller-state-denied",
+            "filesystem-repository-denied",
+            "filesystem-system-denied",
+            "filesystem-unknown-denied",
+            "guest-operation-failed",
+            "agent-stderr-nonzero",
+            "timeout",
+            "workspace-output-identity-invalid",
+            "workspace-output-paths-denied",
+        }
+        if failure_reason is not None:
+            meta = (
+                {"executor_failure_reason": failure_reason}
+                if failure_reason in safe_failure_reasons
+                else {}
+            )
+        else:
+            meta = {
                 "executor_action": {
                     "schema_version": "executor-action-v1",
                     "disposition": "denied",
                     "category": category,
                 }
-            },
+            }
+        return RunResult(
+            ok=False,
+            output="scoped execution denied",
+            model=model,
+            meta=meta,
         )
 
     def run_scoped_agent(
@@ -1839,6 +1968,7 @@ class LimaLeashRunner:
             )
             if type(response) is not BridgeResponse or response.status != "ok":
                 category = "process"
+                failure_reason = None
                 if type(response) is BridgeResponse and response.status == "denied":
                     action = response.result.get("action")
                     category = (
@@ -1848,8 +1978,24 @@ class LimaLeashRunner:
                         if action in {"file.read", "file.write"}
                         else "process"
                     )
+                    resource = response.result.get("resource")
+                    if category == "filesystem" and resource in {
+                        "controller-state",
+                        "repository-path",
+                        "system-path",
+                        "unknown",
+                    }:
+                        failure_reason = "filesystem-" + resource.removesuffix("-path") + "-denied"
+                elif type(response) is BridgeResponse and response.status == "failed":
+                    reason = response.result.get("reason")
+                    if type(reason) is str:
+                        failure_reason = reason
                 return self._reset_denied(
-                    scope.context_digest, scope.input_revision, category=category, model=model
+                    scope.context_digest,
+                    scope.input_revision,
+                    category=category,
+                    model=model,
+                    failure_reason=failure_reason,
                 )
             result = dict(response.result)
             if (
@@ -1887,13 +2033,39 @@ class LimaLeashRunner:
                 or set(changed) != {"output_revision", "paths"}
                 or changed["output_revision"] != after_head["revision"]
                 or type(paths) is not list
-                or any(
-                    type(path) is not str or not self._allowed(path, scope.writable_paths)
-                    for path in paths
-                )
+                or any(type(path) is not str for path in paths)
             ):
                 return self._reset_denied(
-                    scope.context_digest, scope.input_revision, category="filesystem", model=model
+                    scope.context_digest,
+                    scope.input_revision,
+                    category="filesystem",
+                    model=model,
+                    failure_reason="workspace-output-identity-invalid",
+                )
+            if any(not self._allowed(path, scope.writable_paths) for path in paths):
+                denied_paths = sorted(
+                    path for path in paths if not self._allowed(path, scope.writable_paths)
+                )
+                try:
+                    self._client.write_private_diagnostic(
+                        {
+                            "context_digest": scope.context_digest,
+                            "denied_paths": denied_paths,
+                            "failure_reason": "workspace-output-paths-denied",
+                            "input_revision": scope.input_revision,
+                            "schema_version": "runner-private-diagnostic-v1",
+                            "turn_kind": scope.turn_kind,
+                        }
+                    )
+                except RuntimeError:
+                    # Diagnostics never weaken the mandatory fail-closed reset.
+                    pass
+                return self._reset_denied(
+                    scope.context_digest,
+                    scope.input_revision,
+                    category="filesystem",
+                    model=model,
+                    failure_reason="workspace-output-paths-denied",
                 )
         except Exception:
             return self._reset_denied(

@@ -335,6 +335,68 @@ def test_contract_author_brief_and_turn_expose_only_the_contract_path(tmp_path):
     assert runner.calls[0]["cwd"] is not None
 
 
+def test_contract_authoring_and_checkpoint_use_workspace_contract_path(tmp_path):
+    from software_factory.build.orchestrator import (
+        _contract_is_unchanged,
+        _local_artifact_controller_roots,
+        _publication_revision_is_authorized,
+    )
+
+    _, workspace, root = _workspace(tmp_path)
+    relative = "runbooks/contracts/custom-score.contract.json"
+    workspace.contract_artifact_path = lambda: relative
+
+    def write(worktree):
+        path = worktree / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_phase_v2()) + "\n", encoding="utf-8")
+
+    runner = FakeRunner(write)
+    result = _run(tmp_path, runner, workspace=workspace)
+    assert result.disposition is IntentDisposition.PASS
+    assert f"`{relative}`" in runner.calls[0]["prompt"]
+    assert not (root / "contracts/7.json").exists()
+    assert relative in _local_artifact_controller_roots("contracts", contract_path=relative)
+    assert _publication_revision_is_authorized(
+        workspace,
+        revision=result.checkpoint_sha,
+        checkpoint=result.checkpoint_sha,
+        contracts_dir="contracts",
+        issue_id="7",
+        repository="acme/widgets",
+        expected_text=result.contract_text,
+        expected_digest=result.contract_digest,
+        expected_surface_digest=workspace.publication_fingerprint(result.checkpoint_sha),
+    )[0]
+    assert _contract_is_unchanged(
+        workspace,
+        contracts_dir="contracts",
+        issue_id="7",
+        expected_text=result.contract_text,
+        expected_digest=result.contract_digest,
+        checkpoint=result.checkpoint_sha,
+    )[0]
+    (root / relative).write_text("{}", encoding="utf-8")
+    assert not _contract_is_unchanged(
+        workspace,
+        contracts_dir="contracts",
+        issue_id="7",
+        expected_text=result.contract_text,
+        expected_digest=result.contract_digest,
+        checkpoint=result.checkpoint_sha,
+    )[0]
+
+
+@pytest.mark.parametrize("path", ["../contract.json", "/contract.json", "a//b.json", "", None])
+def test_invalid_workspace_contract_path_blocks_without_default_fallback(tmp_path, path):
+    _, workspace, _ = _workspace(tmp_path)
+    workspace.contract_artifact_path = lambda: path
+    runner = FakeRunner(_write_contract(_phase_v2()))
+    result = _run(tmp_path, runner, workspace=workspace)
+    assert result.disposition is IntentDisposition.BLOCKED
+    assert not runner.calls
+
+
 def test_contract_authoring_uses_opaque_workspace_transport(tmp_path):
     workspace = OpaqueMemoryWorkspace()
     document = _phase_v2()
@@ -366,6 +428,100 @@ def test_missing_contract_is_blocked_without_workspace_preservation(tmp_path):
     assert result.constraint_digest == _constraints()[1]
     assert result.previous_contract_digest is None
     assert result.revision_request_digest is None
+
+
+@pytest.mark.parametrize(
+    ("meta", "reason"),
+    [
+        ({"executor_failure_reason": "timeout"}, "contract-runner-timeout"),
+        (
+            {"executor_failure_reason": "claude-api-invalid-request"},
+            "contract-runner-claude-api-invalid-request",
+        ),
+        (
+            {"executor_failure_reason": "claude-api-billing-failed"},
+            "contract-runner-claude-api-billing-failed",
+        ),
+        (
+            {"executor_failure_reason": "claude-api-forbidden"},
+            "contract-runner-claude-api-forbidden",
+        ),
+        (
+            {"executor_failure_reason": "agent-exit-nonzero"},
+            "contract-runner-exit-nonzero",
+        ),
+        (
+            {"executor_failure_reason": "claude-error-during-execution"},
+            "contract-runner-claude-error-during-execution",
+        ),
+        (
+            {"executor_failure_reason": "claude-authentication-failed"},
+            "contract-runner-claude-authentication-failed",
+        ),
+        (
+            {"executor_failure_reason": "agent-stderr-nonzero"},
+            "contract-runner-stderr-nonzero",
+        ),
+        (
+            {"executor_failure_reason": "filesystem-repository-denied"},
+            "contract-runner-filesystem-repository-denied",
+        ),
+        (
+            {"executor_failure_reason": "filesystem-system-denied"},
+            "contract-runner-filesystem-system-denied",
+        ),
+        (
+            {"executor_failure_reason": "filesystem-controller-state-denied"},
+            "contract-runner-filesystem-controller-state-denied",
+        ),
+        (
+            {"executor_failure_reason": "filesystem-unknown-denied"},
+            "contract-runner-filesystem-unknown-denied",
+        ),
+        (
+            {"executor_failure_reason": "workspace-output-identity-invalid"},
+            "contract-runner-workspace-output-identity-invalid",
+        ),
+        (
+            {"executor_failure_reason": "workspace-output-paths-denied"},
+            "contract-runner-workspace-output-paths-denied",
+        ),
+        (
+            {
+                "executor_action": {
+                    "schema_version": "executor-action-v1",
+                    "disposition": "denied",
+                    "category": "process",
+                }
+            },
+            "contract-runner-process-denied",
+        ),
+        ({"executor_failure_reason": "secret provider detail"}, "contract-external-failure"),
+        (
+            {
+                "executor_action": {
+                    "schema_version": "executor-action-v1",
+                    "disposition": "denied",
+                    "category": "secret provider detail",
+                }
+            },
+            "contract-external-failure",
+        ),
+    ],
+)
+def test_failed_contract_runner_exposes_only_bounded_authenticated_reason(
+    tmp_path, meta, reason
+):
+    class FailedRunner:
+        def run_agent(self, prompt, *, model, system=None, tools=None, cwd=None):
+            del prompt, system, tools, cwd
+            return RunResult(False, "must remain private", model, meta=meta)
+
+    result = _run(tmp_path, FailedRunner())
+
+    assert result.disposition is IntentDisposition.BLOCKED
+    assert result.reason == reason
+    assert "private" not in result.reason
 
 
 def test_missing_contract_reason_scrubs_secret_shaped_issue_identity(tmp_path):

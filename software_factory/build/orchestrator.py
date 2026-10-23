@@ -104,6 +104,7 @@ from software_factory.build.workspace import (
     NothingToCommit,
     Workspace,
     require_configured_workspace_identity,
+    workspace_contract_path,
     workspace_contract_precedes_implementation,
     workspace_file_state,
     workspace_read_file,
@@ -385,9 +386,16 @@ def _normalized_repository_path(value: object, *, allow_dot: bool = False) -> st
     return value
 
 
-def _local_artifact_controller_roots(contracts_dir: str) -> tuple[str, ...]:
+def _local_artifact_controller_roots(
+    contracts_dir: str, *, contract_path: str | None = None
+) -> tuple[str, ...]:
     contract_root = _normalized_repository_path(contracts_dir.rstrip("/"))
-    return tuple(sorted({*_LOCAL_ARTIFACT_FIXED_CONTROLLER_ROOTS, contract_root}))
+    roots = {*_LOCAL_ARTIFACT_FIXED_CONTROLLER_ROOTS, contract_root}
+    if contract_path is not None:
+        path = _normalized_repository_path(contract_path)
+        if path != contract_root and not path.startswith(contract_root + "/"):
+            roots.add(path)
+    return tuple(sorted(roots))
 
 
 def _local_artifact_product_paths(
@@ -925,8 +933,8 @@ def _contract_is_unchanged(
     checkpoint: str,
 ) -> tuple[bool, str]:
     """Compare current bytes and canonical digest to the accepted Git blob."""
-    relative_path = f"{contracts_dir.rstrip('/')}/{issue_id}.json"
     try:
+        relative_path = workspace_contract_path(workspace, contracts_dir, issue_id)
         if workspace_file_state(workspace, relative_path).kind != "regular":
             return False, "accepted contract path is missing or is not a regular file"
         current = workspace_read_file(
@@ -972,8 +980,8 @@ def _publication_revision_is_authorized(
         or any(character not in "0123456789abcdef" for character in revision)
     ):
         return False, "commit did not return an exact Git object id"
-    rel = f"{contracts_dir.rstrip('/')}/{issue_id}.json"
     try:
+        rel = workspace_contract_path(workspace, contracts_dir, issue_id)
         revision_exists = workspace_revision_is_ancestor(
             workspace, revision, revision
         )
@@ -5061,7 +5069,14 @@ def run_build(
             assert evidence_store is not None
             assert local_artifact_exporter is not None
             try:
-                controller_roots = _local_artifact_controller_roots(contracts_dir)
+                controller_roots = _local_artifact_controller_roots(
+                    contracts_dir,
+                    contract_path=(
+                        workspace_contract_path(workspace, contracts_dir, issue.id)
+                        if contract_mode
+                        else None
+                    ),
+                )
                 product_paths = _local_artifact_product_paths(
                     workspace.changed_files(),
                     approved_roots=execution_policy.implementation_writable_paths,
