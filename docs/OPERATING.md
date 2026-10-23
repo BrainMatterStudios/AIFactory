@@ -162,8 +162,45 @@ names, credentials, absolute paths, target accounts, local controller paths, or
 field-trial transcripts in this repository. Keep those records in the private
 operator evidence store and feed only the redacted summary to the preflight.
 The [roadmap](ROADMAP.md#the-040-entry-gate) defines what evidence satisfies
-each criterion. The planned 0.3.1 `factory eval` command is intended to emit
-this summary from a private evaluation run.
+each criterion.
+
+### Measuring the factory with `factory eval`
+
+`factory eval` runs a private, held-out task suite and reports how often each
+arm produces a change that passes hidden acceptance checks. Keep the suite and
+the results directory outside every evaluated repository and outside this
+checkout; neither belongs in a public repository.
+
+```bash
+factory eval check-suite ~/private/eval-suite          # prove every check can fail
+factory eval run ~/private/eval-suite --results ~/private/eval-results/2026-10-23
+factory eval readiness-summary --report ~/private/eval-results/2026-10-23/report.json \
+  --roadmap docs/ROADMAP.md \
+  --brief docs/superpowers/specs/2026-09-26-aifactory-0.4.0-quality-verification-brief.md
+```
+
+A suite directory holds `suite.json` and the patches it names. Each task names
+an absolute path to a local repository, a full base commit, a request (`title`
+and `body`), optional `tier_hint`, hidden `checks` (an `argv` list, an expected
+exit status, and a timeout), an optional `known_good` patch, and optional
+`seeded_defects` that apply on top of `known_good`.
+
+- `check-suite` fails a check that passes on the unchanged base (vacuous), a
+  check that fails on `known_good`, and a seeded defect that no check catches.
+  `run` validates first and refuses a suite with any problem.
+- Each trial attempts the task in its own clone with no remote, then verifies
+  the candidate in a second fresh clone. Arms receive only the request; hidden
+  checks never enter an agent's context.
+- A trial passes only when every check executed and passed. Runner failures,
+  empty changes, and unappliable patches are counted as failures.
+- The report gives pass@1 and pass^k per arm and tier, cost, time, and status
+  counts. `readiness-summary` emits only the `field-evaluation-record`
+  criterion, built from digests and counts, and marks it satisfied only with at
+  least 15 tasks, three trials, and both the `factory` and `single-agent` arms.
+
+The `single-agent` arm is available now. The `factory` arm, which drives
+`factory build` with local-bundle publication, is the next increment; until it
+ships, `run --arm factory` is refused.
 
 Future browser, accessibility, visual, mobile, Review Canvas, or other UI-facing
 quality providers must include user-like end-to-end verification with Playwright
