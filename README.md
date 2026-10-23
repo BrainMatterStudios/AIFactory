@@ -42,13 +42,14 @@ demand. The *autonomous* build loop (`factory build`) is newer, remains
 experimental, and is not scientifically or production validated. See
 [KNOWN_ISSUES.md](KNOWN_ISSUES.md) and §Provenance for the exact boundary.
 
-> **0.3.0 compatibility warning:** new scaffolds require the harness analyzer for
-> Design IR. Ordinary current macOS APFS volumes cannot prove the analyzer's
-> no-atime requirement, so any present supported harness file produces
-> high-security fail-closed evidence and blocks the Design gate. Preview with
-> `factory doctor`; use a verifiable no-atime volume/environment or keep existing
-> Contract parents on their sticky legacy workflow. See
-> [the 0.3.0 release notes](docs/releases/0.3.0.md).
+> **macOS compatibility:** new scaffolds require the harness analyzer for Design
+> IR, and the analyzer must read harness files without changing their access
+> time. In the 0.3.0 release, ordinary macOS APFS volumes could not prove that,
+> so any supported harness file blocked the Design gate. `main` now reads a
+> copy-on-write clone of each file on APFS and verifies the original's access
+> time is unchanged; when cloning is unavailable (for example on a non-APFS
+> external volume) the analyzer still fails closed. Preview with
+> `factory analyze harness`. See [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
 ## Documentation
 
