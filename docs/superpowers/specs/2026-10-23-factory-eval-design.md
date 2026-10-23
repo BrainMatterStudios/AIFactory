@@ -2,8 +2,8 @@
 
 **Date:** 2026-10-23
 
-**Status:** Draft for approval. Implementation must not start until the open
-decisions below are resolved and this design is approved.
+**Status:** Approved 2026-10-23 with the recommended resolution of every
+decision below.
 
 **Release:** 0.3.1, workstream D of the
 [0.3.1 brief](2026-10-23-aifactory-0.3.1-platform-evaluation-brief.md)
@@ -140,7 +140,9 @@ transcripts.
 - Results are evidence. No score changes routing, waives a gate, or promotes a
   release.
 
-## Open decisions
+## Decisions
+
+Each decision below was resolved as recommended on 2026-10-23.
 
 1. **Approvals during evaluation.** T2 work stops until a human approves the
    exact Contract and Design digests. Options:

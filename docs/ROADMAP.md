@@ -153,7 +153,7 @@ value to operators, not by release number:
 
 - [0.3.0 design authority design](superpowers/specs/2026-08-10-aifactory-0.3.0-design-authority-design.md)
 - [0.3.1 platform paths and factory evaluation brief](superpowers/specs/2026-10-23-aifactory-0.3.1-platform-evaluation-brief.md)
-- [`factory eval` design (draft for approval)](superpowers/specs/2026-10-23-factory-eval-design.md)
+- [`factory eval` design](superpowers/specs/2026-10-23-factory-eval-design.md)
 - [0.4.0 quality evidence and 0.4.1 independent verification brief](superpowers/specs/2026-09-26-aifactory-0.4.0-quality-verification-brief.md)
 - [0.5.0 human review and evidence brief](superpowers/specs/2026-08-10-aifactory-0.5.0-human-review-brief.md)
 - [0.6.0 managed adoption and harness posture brief](superpowers/specs/2026-08-10-aifactory-0.6.0-managed-adoption-brief.md)
