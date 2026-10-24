@@ -3637,6 +3637,103 @@ def cmd_release_readiness(args) -> int:
     return 0 if report.status is ReleaseReadinessStatus.READY else 1
 
 
+def cmd_eval_check_suite(args) -> int:
+    """Prove every hidden check in a suite can fail. Exit 1 on any problem."""
+    from software_factory.evaluation import SuiteError, load_suite, validate_suite
+
+    try:
+        suite = load_suite(args.suite)
+    except SuiteError as exc:
+        print(f"eval → {exc}")
+        return 2
+    validations = validate_suite(suite)
+    problems = [(item.task_id, problem) for item in validations for problem in item.problems]
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "suite": suite.name,
+                    "digest": suite.digest,
+                    "tasks": len(suite.tasks),
+                    "problems": [
+                        {"task": task_id, "problem": problem} for task_id, problem in problems
+                    ],
+                },
+                sort_keys=True,
+            )
+        )
+    else:
+        print(f"suite {suite.name} ({suite.digest[:12]}): {len(suite.tasks)} task(s)")
+        for task_id, problem in problems:
+            print(f"  {task_id}: {problem}")
+        print("ok: every check can fail" if not problems else f"{len(problems)} problem(s)")
+    return 1 if problems else 0
+
+
+def cmd_eval_run(args) -> int:
+    """Run a validated suite under the selected arms and write a private report."""
+    from software_factory.evaluation import (
+        EvaluationError,
+        SingleAgentArm,
+        SuiteError,
+        load_suite,
+        run_suite,
+    )
+
+    selected = args.arm or ["single-agent"]
+    if "factory" in selected:
+        print("eval → the factory arm is not available yet; use --arm single-agent")
+        return 2
+    try:
+        suite = load_suite(args.suite)
+        cfg = _load_config(args.config)
+        runner = cfg.build("runner")
+    except SuiteError as exc:
+        print(f"eval → {exc}")
+        return 2
+    except (KeyError, OSError, TypeError, ValueError):
+        print("eval → factory.config.yaml could not be loaded: run factory doctor for details")
+        return 2
+    arms = [SingleAgentArm(runner, model=args.model)]
+
+    def progress(record) -> None:
+        result = "pass" if record.passed else f"fail ({record.status})"
+        print(f"  {record.task_id} [{record.arm}] trial {record.trial}: {result}", flush=True)
+
+    print(f"eval → running {suite.name}: {len(suite.tasks)} task(s), validating first")
+    try:
+        report = run_suite(
+            suite, arms, Path(args.results), trials=args.trials, on_trial=progress
+        )
+    except EvaluationError as exc:
+        print(f"eval → {exc}")
+        return 2
+    from software_factory.evaluation import summary_text
+
+    print(summary_text(report), end="")
+    print(f"eval → report written to {Path(args.results).resolve() / 'report.json'}")
+    return 0
+
+
+def cmd_eval_readiness_summary(args) -> int:
+    """Emit public-safe readiness evidence for field-evaluation-record."""
+    from software_factory.build.release_readiness import ReadinessError
+    from software_factory.evaluation import readiness_summary
+
+    try:
+        report = json.loads(Path(args.report).read_text(encoding="utf-8"))
+        document = readiness_summary(
+            report,
+            roadmap=Path(args.roadmap).read_bytes(),
+            brief=Path(args.brief).read_bytes(),
+        )
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError, ReadinessError):
+        print("eval → the report, roadmap, or brief could not be read as expected")
+        return 2
+    print(json.dumps(document, indent=2, sort_keys=True))
+    return 0 if document["criteria"][0]["state"] == "satisfied" else 1
+
+
 def _design_gate_inspection_document(result) -> dict[str, object]:
     from software_factory.core.design.gate import design_gate_document
 
@@ -4472,6 +4569,31 @@ def build_parser() -> argparse.ArgumentParser:
     evidence_show.add_argument("--digest")
     evidence_show.add_argument("--json", action="store_true")
     evidence_show.set_defaults(func=cmd_evidence_show)
+
+    evaluation = sub.add_parser("eval", help="measure the factory on a private task suite")
+    eval_command = evaluation.add_subparsers(dest="eval_command", required=True)
+    eval_check = eval_command.add_parser(
+        "check-suite", help="prove every hidden check can fail"
+    )
+    eval_check.add_argument("suite", help="suite directory containing suite.json")
+    eval_check.add_argument("--json", action="store_true")
+    eval_check.set_defaults(func=cmd_eval_check_suite)
+    eval_run = eval_command.add_parser("run", help="run a validated suite and write a report")
+    eval_run.add_argument("suite", help="suite directory containing suite.json")
+    eval_run.add_argument("--results", required=True, help="new private results directory")
+    eval_run.add_argument(
+        "--arm", action="append", default=None, choices=("single-agent", "factory")
+    )
+    eval_run.add_argument("--model", default="sonnet", help="model tier for single-agent")
+    eval_run.add_argument("--trials", type=int, help="override the suite's trial count")
+    eval_run.set_defaults(func=cmd_eval_run)
+    eval_summary = eval_command.add_parser(
+        "readiness-summary", help="emit public-safe 0.4.0 readiness evidence"
+    )
+    eval_summary.add_argument("--report", required=True)
+    eval_summary.add_argument("--roadmap", required=True, help="path to docs/ROADMAP.md")
+    eval_summary.add_argument("--brief", required=True, help="path to the 0.4.0 brief")
+    eval_summary.set_defaults(func=cmd_eval_readiness_summary)
 
     release = sub.add_parser("release", help="inspect release preparation gates")
     release_command = release.add_subparsers(dest="release_command", required=True)
