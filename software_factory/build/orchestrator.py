@@ -179,6 +179,23 @@ def run_design_phase(**kwargs):
     return implementation(**kwargs)
 
 
+def new_lifecycle_run_id() -> str:
+    """Return a fresh run id that survives the decision log's redaction.
+
+    The decision log stores redacted text, and replay matches events by run id.
+    An id the redactor rewrites (a 32-character token-like run, for example)
+    makes every completed run unmatchable on replay. Twenty hex digits keep
+    80 bits of uniqueness while staying under every redaction pattern, and the
+    check below turns a future pattern change into a loud failure.
+    """
+    from software_factory.trace.redact import redact
+
+    candidate = f"build-{uuid4().hex[:20]}"
+    if redact(candidate) != candidate:
+        raise RuntimeError("generated run id would be redacted in the decision log")
+    return candidate
+
+
 class BuildStatus(str, Enum):
     SHIPPED = "shipped"  # a PR was opened into the dev branch
     VALIDATED = "validated"  # completed locally without remote promotion
@@ -1101,7 +1118,7 @@ def run_build(
     _ceiling_kw = {"extra_prod_refs": tuple(prod_refs)} if prod_refs else {}
     protocol = "verdict_v1" if review_protocol is None else review_protocol
     _finding_overrides = tuple(finding_overrides)
-    lifecycle_run_id = run_id or f"build-{uuid4().hex}"
+    lifecycle_run_id = run_id or new_lifecycle_run_id()
     lifecycle_timestamp = timestamp or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     last_decision_digest: dict[str, str | None] = {"value": None}
     selected_design_protocol: str | None = None
