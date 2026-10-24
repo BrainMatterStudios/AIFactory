@@ -104,6 +104,58 @@ class BudgetConfig:
     daily_alert_usd: float | None = None
 
 
+def parse_execution_policy(
+    raw_policy: object, *, policy_where: str = "factory.build.execution_policy"
+) -> ExecutionPolicySpec:
+    """Parse one execution policy mapping exactly as the manifest loader does."""
+    if not isinstance(raw_policy, Mapping):
+        raise TypeError(f"{policy_where} must be a mapping")
+    policy_fields = {
+        "implementation_writable_paths",
+        "verification_commands",
+        "network_profile",
+    }
+    if set(raw_policy) != policy_fields:
+        raise ValueError(f"{policy_where} must have exactly {sorted(policy_fields)!r}")
+    raw_paths = raw_policy["implementation_writable_paths"]
+    if type(raw_paths) is not list:
+        raise TypeError(f"{policy_where}.implementation_writable_paths must be a list")
+    raw_commands = raw_policy["verification_commands"]
+    if type(raw_commands) is not list:
+        raise TypeError(f"{policy_where}.verification_commands must be a list")
+    commands: list[VerificationCommandSpec] = []
+    for index, raw_command in enumerate(raw_commands):
+        command_where = f"{policy_where}.verification_commands[{index}]"
+        if not isinstance(raw_command, Mapping):
+            raise TypeError(f"{command_where} must be a mapping")
+        command_fields = {"name", "argv", "expected_exit", "environment_profile"}
+        if set(raw_command) != command_fields:
+            raise ValueError(
+                f"{command_where} must have exactly {sorted(command_fields)!r}"
+            )
+        raw_argv = raw_command["argv"]
+        if type(raw_argv) is not list:
+            raise TypeError(f"{command_where}.argv must be a list")
+        try:
+            command = VerificationCommandSpec(
+                name=raw_command["name"],
+                argv=tuple(raw_argv),
+                expected_exit=raw_command["expected_exit"],
+                environment_profile=raw_command["environment_profile"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise type(exc)(f"{command_where}: {exc}") from exc
+        commands.append(command)
+    try:
+        return ExecutionPolicySpec(
+            implementation_writable_paths=tuple(raw_paths),
+            verification_commands=tuple(commands),
+            network_profile=raw_policy["network_profile"],
+        )
+    except (TypeError, ValueError) as exc:
+        raise type(exc)(f"{policy_where}: {exc}") from exc
+
+
 class PublicationMode(str, Enum):
     PULL_REQUEST = "pull_request"
     LOCAL_BUNDLE = "local_bundle"
@@ -358,54 +410,7 @@ class FactoryConfig:
 
         execution_policy_explicit = "execution_policy" in bd
         if execution_policy_explicit:
-            raw_policy = bd["execution_policy"]
-            policy_where = "factory.build.execution_policy"
-            if not isinstance(raw_policy, Mapping):
-                raise TypeError(f"{policy_where} must be a mapping")
-            policy_fields = {
-                "implementation_writable_paths",
-                "verification_commands",
-                "network_profile",
-            }
-            if set(raw_policy) != policy_fields:
-                raise ValueError(f"{policy_where} must have exactly {sorted(policy_fields)!r}")
-            raw_paths = raw_policy["implementation_writable_paths"]
-            if type(raw_paths) is not list:
-                raise TypeError(f"{policy_where}.implementation_writable_paths must be a list")
-            raw_commands = raw_policy["verification_commands"]
-            if type(raw_commands) is not list:
-                raise TypeError(f"{policy_where}.verification_commands must be a list")
-            commands: list[VerificationCommandSpec] = []
-            for index, raw_command in enumerate(raw_commands):
-                command_where = f"{policy_where}.verification_commands[{index}]"
-                if not isinstance(raw_command, Mapping):
-                    raise TypeError(f"{command_where} must be a mapping")
-                command_fields = {"name", "argv", "expected_exit", "environment_profile"}
-                if set(raw_command) != command_fields:
-                    raise ValueError(
-                        f"{command_where} must have exactly {sorted(command_fields)!r}"
-                    )
-                raw_argv = raw_command["argv"]
-                if type(raw_argv) is not list:
-                    raise TypeError(f"{command_where}.argv must be a list")
-                try:
-                    command = VerificationCommandSpec(
-                        name=raw_command["name"],
-                        argv=tuple(raw_argv),
-                        expected_exit=raw_command["expected_exit"],
-                        environment_profile=raw_command["environment_profile"],
-                    )
-                except (TypeError, ValueError) as exc:
-                    raise type(exc)(f"{command_where}: {exc}") from exc
-                commands.append(command)
-            try:
-                execution_policy = ExecutionPolicySpec(
-                    implementation_writable_paths=tuple(raw_paths),
-                    verification_commands=tuple(commands),
-                    network_profile=raw_policy["network_profile"],
-                )
-            except (TypeError, ValueError) as exc:
-                raise type(exc)(f"{policy_where}: {exc}") from exc
+            execution_policy = parse_execution_policy(bd["execution_policy"])
         else:
             execution_policy = ExecutionPolicySpec()
         raw_publication_mode = bd.get("publication_mode", PublicationMode.PULL_REQUEST.value)
