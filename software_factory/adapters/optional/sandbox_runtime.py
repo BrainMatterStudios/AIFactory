@@ -350,7 +350,10 @@ class _Snapshot:
 
 def _take_snapshot(worktree: Path, head: str) -> _Snapshot:
     surface = _surface(worktree)
-    dirty = _git(worktree, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    # --no-renames keeps one path per record; -z rename records carry two.
+    dirty = _git(
+        worktree, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"
+    )
     if dirty.returncode != 0:
         raise SandboxRuntimeError("workspace status could not be read")
     saved: dict[str, bytes | None] = {}
@@ -472,12 +475,20 @@ class SandboxRuntimeRunner:
             return denied_result(model=model_id, category="process")
 
         def reset(reason: str, category: str = "filesystem") -> RunResult:
-            after = _surface(worktree)
-            if not _restore(worktree, before, _changed_paths(before, after)):
+            try:
+                after = _surface(worktree)
+                restored = _restore(worktree, before, _changed_paths(before, after))
+            except (OSError, SandboxRuntimeError):
+                restored = False
+            if not restored:
+                # A reset that could not be confirmed is reported as a generic
+                # process denial; the controller then refuses the workspace.
                 return denied_result(model=model_id, category="process")
             return denied_result(model=model_id, category=category, failure_reason=reason)
 
-        with tempfile.TemporaryDirectory(prefix="aifactory-srt-turn-", dir=_SHORT_TEMP_ROOT) as private:
+        with tempfile.TemporaryDirectory(
+            prefix="aifactory-srt-turn-", dir=_SHORT_TEMP_ROOT
+        ) as private:
             home = _private_home(Path(private))
             for path in scope.writable_paths:
                 # A sandbox can only allow writes beneath directories that exist.
@@ -623,7 +634,9 @@ class SandboxRuntimeWorktree(GitWorktree):
         if command is None:
             return super().run_tests(timeout_s)
         root = Path(self.path)
-        with tempfile.TemporaryDirectory(prefix="aifactory-srt-verify-", dir=_SHORT_TEMP_ROOT) as private:
+        with tempfile.TemporaryDirectory(
+            prefix="aifactory-srt-verify-", dir=_SHORT_TEMP_ROOT
+        ) as private:
             home = _private_home(Path(private))
             settings_path = Path(private) / "srt-settings.json"
             _write_private_json(
@@ -733,7 +746,9 @@ PROBE_BLOCKED_HOST = "github.com"
 
 def run_containment_probe(settings: SandboxSettings) -> dict[str, bool] | None:
     """Exercise the compiled policy shape. None when the probe could not run."""
-    with tempfile.TemporaryDirectory(prefix="aifactory-srt-probe-", dir=_SHORT_TEMP_ROOT) as private:
+    with tempfile.TemporaryDirectory(
+        prefix="aifactory-srt-probe-", dir=_SHORT_TEMP_ROOT
+    ) as private:
         root = Path(private)
         workspace = root / "workspace"
         (workspace / "allowed").mkdir(parents=True)

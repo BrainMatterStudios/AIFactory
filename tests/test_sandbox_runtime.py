@@ -585,3 +585,46 @@ def test_backend_module_has_no_import_side_effects_beyond_registration():
         env={**os.environ, "PATH": ""},
     )
     assert completed.stdout.strip() == "sandbox-runtime"
+
+
+def test_a_reset_that_cannot_reread_the_workspace_is_a_generic_denial(tools, tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    runner = backend.SandboxRuntimeRunner(_options(tools["srt"](), tools["agent"]))
+    calls = {"count": 0}
+    real_surface = backend._surface
+
+    def failing_after_turn(worktree):
+        calls["count"] += 1
+        if calls["count"] > 1:
+            raise backend.SandboxRuntimeError("unreadable")
+        return real_surface(worktree)
+
+    monkeypatch.setattr(backend, "_surface", failing_after_turn)
+
+    result = _run(runner, repo, "WRITE README.md=escape")
+
+    assert result.ok is False
+    assert result.meta["executor_action"]["category"] == "process"
+
+
+def test_pre_turn_renames_do_not_confuse_the_snapshot(tools, tmp_path):
+    repo = _repo(tmp_path)
+    _git(repo, "mv", "src/app.py", "src/renamed.py")
+    runner = backend.SandboxRuntimeRunner(_options(tools["srt"](), tools["agent"]))
+
+    result = _run(runner, repo, "WRITE src/renamed.py=VALUE = 9\nWRITE README.md=escape")
+
+    assert result.ok is False
+    assert (repo / "src/renamed.py").read_text() == "VALUE = 1\n"
+    assert not (repo / "src/app.py").exists()
+    assert (repo / "README.md").read_text() == "readme\n"
+
+
+def test_snapshot_paths_stay_relative_to_the_worktree_across_renames(tmp_path):
+    repo = _repo(tmp_path)
+    _git(repo, "mv", "src/app.py", "src/renamed.py")
+
+    snapshot = backend._take_snapshot(repo, _git(repo, "rev-parse", "HEAD"))
+
+    assert set(snapshot.saved) == {"src/app.py", "src/renamed.py"}
+    assert not any(path.startswith("/") for path in snapshot.saved)
