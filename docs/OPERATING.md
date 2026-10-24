@@ -198,9 +198,55 @@ exit status, and a timeout), an optional `known_good` patch, and optional
   criterion, built from digests and counts, and marks it satisfied only with at
   least 15 tasks, three trials, and both the `factory` and `single-agent` arms.
 
-The `single-agent` arm is available now. The `factory` arm, which drives
-`factory build` with local-bundle publication, is the next increment; until it
-ships, `run --arm factory` is refused.
+#### The `factory` arm
+
+`--arm factory` runs the real `factory build` once per trial, as a subprocess,
+with local-bundle publication. Pass your JSON manifest with `--factory-config`;
+each trial gets a copy with its own issue file, controller state, artifact and
+workspace roots, and execution policy. A manifest that publishes pull requests
+is refused.
+
+```bash
+factory eval run ~/private/eval-suite --arm factory --arm single-agent \
+  --factory-config ~/private/eval-factory.config.json \
+  --results ~/private/eval-results/2026-10-24
+```
+
+A task that the factory arm can attempt needs `"tier_hint": "T2"` and a
+`factory` object:
+
+```json
+"factory": {
+  "labels": ["type:feature"],
+  "writable_paths": ["src"],
+  "verification_commands": [{"name": "unit", "argv": ["python3", "-m", "pytest", "-q"]}]
+}
+```
+
+Tasks without it are recorded as `factory-unsupported`, and non-T2 tasks as
+`tier-unsupported`. Both count as failed trials, because local publication
+completes only for T2 work today. The trial issue declares the tier, so the
+report prints tier routing as `not measured` for this arm.
+
+Approval pauses:
+
+- **Interactive (default).** The run prints the pending artifact, a `status`
+  command to review it, and the exact `factory approve` command for that
+  trial, then waits up to `--approval-timeout` seconds (default 3600). The
+  wait is recorded and does not count against `--build-timeout`.
+- **Stand-in (`--approvals stand-in`).** The run approves with the reserved
+  identity `aifactory-evaluation-stand-in`. The approval store accepts that
+  identity only in a state root holding the exact private
+  `evaluation-state.json` marker that `factory eval` writes, so a stand-in
+  approval copied into real state fails closed. The report shows stand-in pass
+  rates separately, labelled as measured without human review.
+
+A `blocked` build ends the trial; it is not re-run. The candidate is the
+bundle's `implementation.patch`, verified in a fresh clone like any other arm.
+
+`factory build --json` prints one `factory-build-outcome-v1` document (status,
+tier, a bounded reason, cost, unmetered turns, any pending approval digests,
+and the bundle directory when validated) and sends progress to stderr.
 
 Future browser, accessibility, visual, mobile, Review Canvas, or other UI-facing
 quality providers must include user-like end-to-end verification with Playwright

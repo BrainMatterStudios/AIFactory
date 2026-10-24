@@ -25,6 +25,20 @@ project uses semantic versioning.
 ### Added
 
 - `factory --version`.
+- `factory eval check-suite`, `run`, and `readiness-summary`: run a private,
+  held-out task suite with hidden checks, and report pass@1, pass^k, cost, and
+  statuses per arm. The `single-agent` arm gives one agent the request. The
+  `factory` arm runs the real `factory build` per trial with local-bundle
+  publication, and answers approval pauses interactively or with the
+  evaluation-only stand-in approver.
+- `factory build --json` prints one `factory-build-outcome-v1` document and
+  sends progress to stderr.
+
+### Security
+
+- The approval store accepts the reserved `aifactory-evaluation-stand-in`
+  approver only in a state root holding the exact private evaluation marker, so
+  a stand-in approval cannot grant authority in real controller state.
 
 ## [0.3.0] - 2026-08-29
 

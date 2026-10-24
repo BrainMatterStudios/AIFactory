@@ -1,6 +1,6 @@
 # `factory eval` factory arm design (slice 2)
 
-**Status:** Draft 2026-10-24, for approval.
+**Status:** Approved 2026-10-24. Decisions 1 and 2 resolved as recommended.
 **Parent:** [factory eval design](2026-10-23-factory-eval-design.md) (approved
 2026-10-23). This note fixes the details that design left open for the factory
 arm. Where they differ, the parent design wins.

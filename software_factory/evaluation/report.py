@@ -45,6 +45,33 @@ def _pass_rates(records: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _human_review(records: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None:
+    """Approval counts and waits, with pass rates split by who approved."""
+    reviewed = [record for record in records if "approval_mode" in record.get("detail", {})]
+    if not reviewed:
+        return None
+    waits = [
+        float(wait) for record in reviewed for wait in record["detail"].get("approval_waits_s", ())
+    ]
+    by_mode: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for record in reviewed:
+        by_mode[record["detail"]["approval_mode"]].append(record)
+    return {
+        "approvals_requested": sum(
+            int(record["detail"].get("approvals_requested", 0)) for record in reviewed
+        ),
+        "approvals_given": sum(
+            int(record["detail"].get("approvals_given", 0)) for record in reviewed
+        ),
+        "approval_wait_s": {"median": _percentile(waits, 0.5), "max": _percentile(waits, 1.0)},
+        "resumes": sum(int(record["detail"].get("resumes", 0)) for record in reviewed),
+        # Stand-in runs measure whether the pipeline finishes, not human review.
+        "by_approval_mode": {
+            mode: _pass_rates(items) for mode, items in sorted(by_mode.items())
+        },
+    }
+
+
 def _arm_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     costs = [float(record["cost_usd"]) for record in records]
     walls = [float(record["wall_s"]) for record in records]
@@ -64,6 +91,7 @@ def _arm_summary(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         },
         "unmetered_turns": sum(int(record["unmetered_turns"]) for record in records),
         "wall_s": {"median": _percentile(walls, 0.5), "p90": _percentile(walls, 0.9)},
+        "human_review": _human_review(records),
     }
 
 
@@ -81,6 +109,9 @@ def build_report(
     by_arm = {
         arm: _arm_summary([record for record in records if record["arm"] == arm]) for arm in arms
     }
+    if "factory" in by_arm:
+        # The local issue source declares the tier, so the factory did not choose it.
+        by_arm["factory"]["tier_routing"] = "not measured"
     comparisons = []
     for index, first in enumerate(arms):
         for second in arms[index + 1 :]:
@@ -143,6 +174,21 @@ def summary_text(report: Mapping[str, Any]) -> str:
             f"unmetered turns {summary['unmetered_turns']}",
             f"  statuses {summary['statuses']}",
         ]
+        review = summary.get("human_review")
+        if review:
+            wait = review["approval_wait_s"]
+            lines.append(
+                f"  approvals {review['approvals_given']}/{review['approvals_requested']} given, "
+                f"wait median {wait['median']}s max {wait['max']}s, resumes {review['resumes']}"
+            )
+            for mode, rates in review["by_approval_mode"].items():
+                label = " (measured without human review)" if mode == "stand-in" else ""
+                lines.append(
+                    f"  {mode} approvals: pass@1 {_rate(rates['pass_at_1'])} "
+                    f"({rates['passed_trials']}/{rates['trials']}){label}"
+                )
+        if summary.get("tier_routing"):
+            lines.append(f"  tier routing: {summary['tier_routing']}")
     for comparison in report["comparisons"]:
         first, second = comparison["arms"]
         lines.append(
