@@ -21,6 +21,12 @@ project uses semantic versioning.
 - Harness findings show their own message and required change. Analyzer text is
   shown only when it exactly matches a fixed sentence the harness analyzer
   writes; all other analyzer text stays redacted.
+- A contract that the deterministic policy passes without approval is now
+  stored as an accepted contract record. A build that resumes after a later
+  pause, such as Design approval, reuses that exact contract instead of
+  authoring a new one. Before, every resume paid for another contract-author
+  turn, and a model that did not repeat the contract byte for byte blocked the
+  approved Design with "Capability context changed after gate authorization".
 
 ### Added
 
