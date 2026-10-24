@@ -218,10 +218,17 @@ A task that the factory arm can attempt needs `"tier_hint": "T2"` and a
 ```json
 "factory": {
   "labels": ["type:feature"],
-  "writable_paths": ["src"],
+  "writable_paths": ["src", "tests"],
   "verification_commands": [{"name": "unit", "argv": ["python3", "-m", "pytest", "-q"]}]
 }
 ```
+
+Make `verification_commands` run the project's own test suite, and include
+the test directory in `writable_paths`, so the factory can add tests for the
+change. A command that cannot exercise the requested behaviour leaves the
+Design with an open high-severity question about evidence, and the Design gate
+blocks it, as it should. The hidden `checks` stay separate and are never shown
+to the factory.
 
 Tasks without it are recorded as `factory-unsupported`, and non-T2 tasks as
 `tier-unsupported`. Both count as failed trials, because local publication
