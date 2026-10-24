@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project uses semantic versioning.
 
+## [Unreleased]
+
+### Fixed
+
+- The harness analyzer no longer blocks the Design gate on ordinary macOS APFS
+  volumes. When a file cannot be opened without updating its access time, the
+  analyzer reads a copy-on-write clone taken from the pinned descriptor in
+  controller scratch space outside the workspace, removes the clone, and
+  re-verifies the original's access time. Every clone failure still produces
+  the existing high-security fail-closed finding.
+- `factory analyze` and `factory capabilities` name the failed precondition
+  (an unloadable manifest, the scaffold placeholder repository, a missing
+  repository identity, or an analyzer that is not configured) instead of a
+  generic "inspection is invalid" message.
+- Harness findings show their own message and required change. Analyzer text is
+  shown only when it exactly matches a fixed sentence the harness analyzer
+  writes; all other analyzer text stays redacted.
+
+### Added
+
+- `factory --version`.
+
 ## [0.3.0] - 2026-08-29
 
 ### Added
