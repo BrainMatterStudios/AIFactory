@@ -1806,6 +1806,27 @@ _DANGEROUS_COMMAND_RE = re.compile(
 )
 _ANALYZER_FINDING_MESSAGE = "analyzer finding reported"
 _ANALYZER_REQUIRED_CHANGE = "analyzer change requested"
+_CREDENTIAL_FINDING_MESSAGE = "A credential-shaped literal is redacted."
+
+
+def _analyzer_text(value: object, fallback: str) -> str:
+    """Show analyzer text only when it is a fixed sentence the factory wrote.
+
+    Analyzer output can carry repository-derived text, so anything that is not
+    an exact member of the built-in catalog is replaced by the fallback.
+    """
+    from software_factory.analyzers.harness import (
+        CREDENTIAL_FINDING_PREFIX,
+        FIXED_FINDING_TEXT,
+    )
+
+    if type(value) is not str:
+        return fallback
+    if value in FIXED_FINDING_TEXT:
+        return value
+    if value.startswith(CREDENTIAL_FINDING_PREFIX):
+        return _CREDENTIAL_FINDING_MESSAGE
+    return fallback
 
 
 @contextmanager
@@ -1860,12 +1881,22 @@ def _contained_call(callable_):
         return callable_()
 
 
+class _InspectionPrecondition(ValueError):
+    """A configuration precondition failed; the message is fixed operator guidance.
+
+    Only literal sentences written in this module may be raised with this type,
+    so the message can be shown without echoing configured or repository values.
+    """
+
+
 def _load_inspection_config(path: str | None):
     """Load configurable code without permitting output or raw load failures."""
     try:
         return _contained_call(lambda: _load_config(path))
     except BaseException:
-        raise ValueError("inspection configuration is invalid") from None
+        raise _InspectionPrecondition(
+            "factory.config.yaml could not be loaded: run factory doctor for details"
+        ) from None
 
 
 def _safe_output_text(value: str) -> str:
@@ -1908,8 +1939,10 @@ def _analyzer_finding_output_document(finding) -> dict[str, object]:
         "evidence": [
             {"path": location["path"], "line": location["line"]} for location in finding["evidence"]
         ],
-        "message": _ANALYZER_FINDING_MESSAGE,
-        "required_change": _ANALYZER_REQUIRED_CHANGE,
+        "message": _analyzer_text(finding["message"], _ANALYZER_FINDING_MESSAGE),
+        "required_change": _analyzer_text(
+            finding["required_change"], _ANALYZER_REQUIRED_CHANGE
+        ),
     }
 
 
@@ -1989,7 +2022,7 @@ def _gate_output_document(document) -> dict[str, object]:
                 "category": finding["category"],
                 "source": finding["source"],
                 "message": (
-                    _ANALYZER_FINDING_MESSAGE
+                    _analyzer_text(finding["message"], _ANALYZER_FINDING_MESSAGE)
                     if finding["id"].startswith("analyzer:")
                     else _safe_output_text(finding["message"])
                 ),
@@ -2185,12 +2218,30 @@ def _inspection_repository(cfg) -> tuple[Path, str]:
     repo_root = Path(resolve_repo_root(cfg)).resolve()
     configured, repository = _configured_repository_identity(cfg)
     if configured and repository is None:
-        raise ValueError("configured repository identity is invalid")
+        if _configured_repository_is_placeholder(cfg):
+            raise _InspectionPrecondition(
+                "source.repo is still the scaffold placeholder: "
+                "set it to your repository in factory.config.yaml"
+            )
+        raise _InspectionPrecondition("source.repo is not a valid repository identity")
     if not configured:
         repository = _detect_repo(repo_root)
     if repository is None:
-        raise ValueError("repository identity is unavailable")
+        raise _InspectionPrecondition(
+            "no repository identity: set source.repo in factory.config.yaml "
+            "or add a Git origin"
+        )
     return repo_root, repository
+
+
+def _configured_repository_is_placeholder(cfg) -> bool:
+    source = cfg.adapters.get("source")
+    candidate = None if source is None else source.options.get("repo")
+    if not isinstance(candidate, str):
+        return False
+    return _is_placeholder_repository(
+        normalize_repository_identity(candidate, allow_canonical=True)
+    )
 
 
 @dataclass(frozen=True)
@@ -2431,7 +2482,9 @@ def _validation_inspection_document(*, report=None, invalid: bool = False) -> di
     }
 
 
-def _analyzer_failure_document(*, adapter: str, status: str, kind: str) -> dict[str, object]:
+def _analyzer_failure_document(
+    *, adapter: str, status: str, kind: str, message: str | None = None
+) -> dict[str, object]:
     return {
         "schema_version": "factory-analyzer-inspection-v1",
         "status": status,
@@ -2442,11 +2495,13 @@ def _analyzer_failure_document(*, adapter: str, status: str, kind: str) -> dict[
         "artifact_fingerprint": None,
         "design_digest": None,
         "report": None,
-        "error": {"kind": kind, "message": f"analyzer inspection is {status}"},
+        "error": {"kind": kind, "message": message or f"analyzer inspection is {status}"},
     }
 
 
-def _capability_failure_document(*, status: str, kind: str) -> dict[str, object]:
+def _capability_failure_document(
+    *, status: str, kind: str, message: str | None = None
+) -> dict[str, object]:
     return {
         "schema_version": "factory-capabilities-inspection-v2",
         "status": status,
@@ -2462,7 +2517,7 @@ def _capability_failure_document(*, status: str, kind: str) -> dict[str, object]
         "missing_obligations": [],
         "unverifiable_obligations": [],
         "failed_obligations": [],
-        "error": {"kind": kind, "message": f"capability inspection is {status}"},
+        "error": {"kind": kind, "message": message or f"capability inspection is {status}"},
     }
 
 
@@ -2559,7 +2614,9 @@ def cmd_analyze(args) -> int:
         repo_root, repository = _inspection_repository(cfg)
         specs = tuple(spec for spec in cfg.build_cfg.design_analyzers if spec.name == args.adapter)
         if len(specs) != 1:
-            raise ValueError("analyzer selection is invalid")
+            raise _InspectionPrecondition(
+                "the named analyzer is not configured under build.design_analyzers"
+            )
         spec = specs[0]
         issue = "repository-surface"
         if args.issue is not None:
@@ -2594,6 +2651,12 @@ def cmd_analyze(args) -> int:
         )
         _print_or_json(document, as_json=args.json)
         return 1
+    except _InspectionPrecondition as precondition:
+        document = _analyzer_failure_document(
+            adapter="", status="invalid", kind="configuration", message=str(precondition)
+        )
+        _print_or_json(document, as_json=args.json)
+        return 2
     except (DesignStoreError, KeyError, OSError, RuntimeError, TypeError, ValueError):
         document = _analyzer_failure_document(adapter="", status="invalid", kind="configuration")
         _print_or_json(document, as_json=args.json)
@@ -2671,6 +2734,12 @@ def cmd_capabilities(args) -> int:
             build_capability_provider(spec)
             for spec in cfg.build_cfg.capability_providers
         )
+    except _InspectionPrecondition as precondition:
+        document = _capability_failure_document(
+            status="invalid", kind="configuration", message=str(precondition)
+        )
+        _print_or_json(document, as_json=args.json)
+        return 2
     except (KeyError, TypeError, ValueError):
         document = _capability_failure_document(status="invalid", kind="configuration")
         _print_or_json(document, as_json=args.json)
@@ -4297,6 +4366,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "-c", "--config", help="path to factory.config.yaml (default: search up from cwd)"
     )
+    p.add_argument("--version", action="version", version=f"software-factory {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("version").set_defaults(func=cmd_version)

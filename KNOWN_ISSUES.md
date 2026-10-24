@@ -56,17 +56,32 @@ and leave running.
 
 ### Required harness limitation on macOS
 
-Ordinary current macOS APFS volumes cannot prove no-atime reads. The native
-harness analyzer therefore refuses to content-open every present supported file
-and emits constant high-security fail-closed evidence. New scaffolds make this
-analyzer required, so the Design gate blocks in that condition.
+Ordinary macOS APFS volumes cannot open a file for reading without updating its
+access time, and the harness analyzer's read-only claim includes access time.
+On such a volume the analyzer now clones each supported file from its pinned
+descriptor into fresh controller scratch space outside the workspace, reads the
+clone, removes it, and then re-observes the original's access time. Cloning
+copies extents rather than reading bytes, so the original is never read.
+
+The analyzer still emits high-security fail-closed evidence for a file when
+cloning is unavailable, the scratch space is on a different volume or inside
+the workspace, the clone does not match the original's size, or the original's
+access time changed. New scaffolds make this analyzer required, so the Design
+gate blocks in those conditions. In the 0.3.0 release, which has no clone path,
+every supported harness file on ordinary APFS blocks.
+
+The no-atime claim covers the analyzer only. The controller's repository
+fingerprint, taken before and after each analyzer run to detect workspace
+mutation, reads tracked and untracked files normally, so on an atime-updating
+volume a `factory analyze` or gate run still updates those files' access times.
+Controller reads follow the same rule as `factory status`: logical read-only
+claims exclude access time.
 
 Use `factory doctor` and `factory analyze harness` to preview the environment.
-The supported mitigation is a volume or execution environment with a verifiable
-no-atime policy. Restoring atime after inspection is not safe proof because it is
-itself a mutation and exposes an intermediate state. Existing Contract parents
-can keep their sticky `legacy_plan` workflow. Removing or making the required
-analyzer optional does not preserve the released Design-authority guarantee.
+Restoring atime after inspection is not safe proof because it is itself a
+mutation and exposes an intermediate state. Existing Contract parents can keep
+their sticky `legacy_plan` workflow. Removing or making the required analyzer
+optional does not preserve the released Design-authority guarantee.
 
 The analyzer broker requires `fork`: release execution is supported on macOS and
 Linux, while native Windows analyzer execution fails unavailable.
