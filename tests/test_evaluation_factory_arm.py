@@ -201,12 +201,33 @@ def test_trial_manifest_replaces_every_trial_field_and_policy_copy(tmp_path, mon
     assert build["workspace_root"] == str(paths.workspaces)
     expected = {
         "implementation_writable_paths": ["src"],
-        "verification_commands": [{"name": "unit", "argv": ["python3", "-m", "pytest", "-q"]}],
+        "verification_commands": [
+            {
+                "name": "unit",
+                "argv": ["python3", "-m", "pytest", "-q"],
+                "expected_exit": "zero",
+                "environment_profile": "default",
+            }
+        ],
         "network_profile": "model-only-v1",
     }
     assert build["execution_policy"] == expected
     assert manifest["workspace"]["execution_policy"] == expected
     assert build["capability_providers"][0]["options"]["execution_policy"] == expected
+    # The generated policy must load through the controller's own parser.
+    from software_factory.core.design.configuration import (
+        ExecutionPolicySpec,
+        VerificationCommandSpec,
+    )
+
+    ExecutionPolicySpec(
+        implementation_writable_paths=tuple(expected["implementation_writable_paths"]),
+        verification_commands=tuple(
+            VerificationCommandSpec(**{**command, "argv": tuple(command["argv"])})
+            for command in expected["verification_commands"]
+        ),
+        network_profile=expected["network_profile"],
+    )
 
 
 @pytest.mark.parametrize(
@@ -235,6 +256,18 @@ def test_suite_refuses_malformed_factory_settings(tmp_path):
     bad = dict(FACTORY, writable_paths=["../outside"])
     suite_dir = _suite(tmp_path, tasks=1, trials=1, tier_hint="T2", factory=bad)
     with pytest.raises(SuiteError, match="writable_paths"):
+        load_suite(suite_dir)
+
+
+def test_suite_refuses_a_policy_the_controller_would_reject(tmp_path):
+    from software_factory.evaluation import SuiteError
+
+    bad = dict(
+        FACTORY,
+        verification_commands=[{"name": "unit", "argv": [" python3 ", "-m", "pytest"]}],
+    )
+    suite_dir = _suite(tmp_path, tasks=1, trials=1, tier_hint="T2", factory=bad)
+    with pytest.raises(SuiteError, match="execution policy is invalid"):
         load_suite(suite_dir)
 
 

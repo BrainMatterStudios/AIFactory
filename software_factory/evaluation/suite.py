@@ -17,6 +17,10 @@ from pathlib import Path
 from typing import Any
 
 from software_factory.core.contracts import canonical_json_bytes
+from software_factory.core.design.configuration import (
+    ExecutionPolicySpec,
+    VerificationCommandSpec,
+)
 from software_factory.core.git_environment import sanitized_git_environment
 
 SUITE_SCHEMA_VERSION = "factory-eval-suite-v1"
@@ -184,6 +188,17 @@ def _factory_settings(document: object, task_id: str) -> FactorySettings:
         commands.append((name, tuple(argv)))
     if len({name for name, _argv in commands}) != len(commands):
         raise SuiteError(f"task {task_id}: verification command names must be unique")
+    try:
+        # The controller's own policy type, so a bad policy fails at load, not mid-trial.
+        ExecutionPolicySpec(
+            implementation_writable_paths=tuple(paths),
+            verification_commands=tuple(
+                VerificationCommandSpec(name, argv, "zero", "default") for name, argv in commands
+            ),
+            network_profile="model-only-v1",
+        )
+    except (TypeError, ValueError) as exc:
+        raise SuiteError(f"task {task_id}: factory execution policy is invalid") from exc
     return FactorySettings(tuple(sorted(labels)), tuple(paths), tuple(commands))
 
 

@@ -105,7 +105,13 @@ def trial_manifest(
     policy = {
         "implementation_writable_paths": list(task.factory.writable_paths),
         "verification_commands": [
-            {"name": name, "argv": list(argv)} for name, argv in task.factory.verification_commands
+            {
+                "name": name,
+                "argv": list(argv),
+                "expected_exit": "zero",
+                "environment_profile": "default",
+            }
+            for name, argv in task.factory.verification_commands
         ],
         "network_profile": policy_network,
     }
