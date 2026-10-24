@@ -60,6 +60,7 @@ from software_factory.execution.pnpm_toolchain import (
     PNPM_VERSION,
 )
 from software_factory.execution.protocol import BridgeResponse
+from software_factory.execution.scoped_turn import denied_result, path_in_scope
 
 _SOURCE = "lima-leash-executor"
 _PNPM_IDENTITY_FIELDS = frozenset(
@@ -1850,11 +1851,7 @@ class LimaLeashRunner:
 
     @staticmethod
     def _allowed(path: str, allowed_paths: tuple[str, ...]) -> bool:
-        return any(
-            path == allowed.removesuffix("/**")
-            or (allowed.endswith("/**") and path.startswith(allowed.removesuffix("/**") + "/"))
-            for allowed in allowed_paths
-        )
+        return path_in_scope(path, allowed_paths)
 
     def _reset_denied(
         self,
@@ -1871,52 +1868,7 @@ class LimaLeashRunner:
                 raise RuntimeError("reset was not confirmed")
         except Exception:
             category = "process"
-        safe_failure_reasons = {
-            "agent-exit-nonzero",
-            "agent-timeout-cleanup-failed",
-            "claude-error-during-execution",
-            "claude-error-max-budget",
-            "claude-error-max-turns",
-            "claude-authentication-failed",
-            "claude-configuration-invalid",
-            "claude-api-invalid-request",
-            "claude-api-billing-failed",
-            "claude-api-forbidden",
-            "claude-model-unavailable",
-            "claude-network-failed",
-            "claude-rate-limited",
-            "claude-result-invalid",
-            "claude-runtime-permission-denied",
-            "filesystem-controller-state-denied",
-            "filesystem-repository-denied",
-            "filesystem-system-denied",
-            "filesystem-unknown-denied",
-            "guest-operation-failed",
-            "agent-stderr-nonzero",
-            "timeout",
-            "workspace-output-identity-invalid",
-            "workspace-output-paths-denied",
-        }
-        if failure_reason is not None:
-            meta = (
-                {"executor_failure_reason": failure_reason}
-                if failure_reason in safe_failure_reasons
-                else {}
-            )
-        else:
-            meta = {
-                "executor_action": {
-                    "schema_version": "executor-action-v1",
-                    "disposition": "denied",
-                    "category": category,
-                }
-            }
-        return RunResult(
-            ok=False,
-            output="scoped execution denied",
-            model=model,
-            meta=meta,
-        )
+        return denied_result(model=model, category=category, failure_reason=failure_reason)
 
     def run_scoped_agent(
         self,
