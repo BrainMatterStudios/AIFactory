@@ -593,11 +593,11 @@ def test_a_reset_that_cannot_reread_the_workspace_is_a_generic_denial(tools, tmp
     calls = {"count": 0}
     real_surface = backend._surface
 
-    def failing_after_turn(worktree):
+    def failing_after_turn(worktree, widened=()):
         calls["count"] += 1
         if calls["count"] > 1:
             raise backend.SandboxRuntimeError("unreadable")
-        return real_surface(worktree)
+        return real_surface(worktree, widened)
 
     monkeypatch.setattr(backend, "_surface", failing_after_turn)
 
@@ -628,3 +628,166 @@ def test_snapshot_paths_stay_relative_to_the_worktree_across_renames(tmp_path):
 
     assert set(snapshot.saved) == {"src/app.py", "src/renamed.py"}
     assert not any(path.startswith("/") for path in snapshot.saved)
+
+
+# --------------------------------------------------------------------------- #
+# Operator-login credential mode (opt-in)
+# --------------------------------------------------------------------------- #
+def test_operator_login_mode_is_explicit_and_excludes_a_scoped_key(tools):
+    options = _options(tools["srt"](), credential_mode="operator-login")
+    settings = backend.SandboxSettings.from_options(options, require_policy=True)
+
+    assert settings.operator_login is True
+    assert settings.assurance_level == "os-sandbox-operator-login-v1"
+    assert str(Path("~/.claude").expanduser()) not in settings.deny_read
+    assert str(Path("~/.ssh").expanduser()) in settings.deny_read
+    with pytest.raises(ValueError, match="does not take credential_env"):
+        backend.SandboxSettings.from_options(
+            {**options, "credential_env": "AIFACTORY_TEST_MODEL_KEY"}, require_policy=True
+        )
+    with pytest.raises(ValueError, match="credential_mode"):
+        backend.SandboxSettings.from_options(
+            {**options, "credential_mode": "whatever"}, require_policy=True
+        )
+    default = backend.SandboxSettings.from_options(_options(tools["srt"]()), require_policy=True)
+    assert default.assurance_level == "os-sandbox-v1"
+    assert default.identity_digest() != settings.identity_digest()
+
+
+def test_operator_login_turns_use_the_real_home_but_protect_agent_config(
+    tools, tmp_path, monkeypatch
+):
+    repo = _repo(tmp_path)
+    monkeypatch.setenv("UNRELATED_SERVICE_TOKEN", "must-not-leak")
+    runner = backend.SandboxRuntimeRunner(
+        _options(tools["srt"](), tools["agent"], credential_mode="operator-login")
+    )
+
+    result = _run(runner, repo, "WRITE src/app.py=VALUE = 10")
+
+    assert result.ok is True
+    assert result.meta["assurance_level"] == "os-sandbox-operator-login-v1"
+    record = tools["records"]()[-1]
+    environment = record["env"]
+    assert environment["HOME"] == str(Path.home())
+    assert "ANTHROPIC_API_KEY" not in environment
+    assert "CLAUDE_CONFIG_DIR" not in environment
+    assert "UNRELATED_SERVICE_TOKEN" not in environment
+    filesystem = record["settings"]["filesystem"]
+    assert str(Path("~/.claude").expanduser()) in filesystem["allowWrite"]
+    for protected in ("~/.claude.json", "~/.claude/settings.json", "~/.claude/commands"):
+        assert str(Path(protected).expanduser()) in filesystem["denyWrite"]
+
+
+REAL_LOGIN = os.environ.get("AIFACTORY_TEST_CLAUDE_LOGIN") == "1"
+
+
+@pytest.mark.skipif(
+    not (REAL_SRT and REAL_LOGIN),
+    reason="set AIFACTORY_TEST_SRT and AIFACTORY_TEST_CLAUDE_LOGIN=1 to use the real login",
+)
+def test_real_claude_turn_with_the_operator_login(tmp_path):
+    repo = _repo(tmp_path)
+    runner = backend.SandboxRuntimeRunner(
+        {
+            "srt": REAL_SRT,
+            "srt_version": _real_version(),
+            "credential_mode": "operator-login",
+            "models": {"haiku": os.environ.get("AIFACTORY_TEST_CLAUDE_MODEL", "claude-haiku-5-5")},
+        }
+    )
+
+    result = runner.run_scoped_agent(
+        "Change VALUE in src/app.py from 1 to 2. Do not change any other file.",
+        model="haiku",
+        scope=_scope(repo),
+        cwd=str(repo),
+    )
+
+    assert result.ok is True, result.meta
+    assert (repo / "src/app.py").read_text().strip() == "VALUE = 2"
+    assert (repo / "README.md").read_text() == "readme\n"
+
+
+# --------------------------------------------------------------------------- #
+# Kernel write widening for single-file scopes
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("scope", "kernel", "widened"),
+    [
+        (("src/**",), ("src/**",), ()),
+        (("contracts/7.json",), ("contracts/**",), ("contracts",)),
+        (
+            (".factory/judge-verdict.json", ".factory/review-findings.json"),
+            (".factory/**",),
+            (".factory",),
+        ),
+        (("README.md",), ("README.md",), ()),
+        (("src/**", "src/pkg/a.py"), ("src/**",), ("src/pkg",)),
+    ],
+)
+def test_kernel_write_paths_widen_files_to_their_directory_but_never_the_root(
+    scope, kernel, widened
+):
+    assert backend.kernel_write_paths(scope) == (kernel, widened)
+
+
+def _ignore_factory(repo: Path) -> None:
+    (repo / ".gitignore").write_text(".factory/\n")
+    _git(repo, "add", ".gitignore")
+    _git(repo, "commit", "-q", "-m", "ignore controller files")
+
+
+def test_a_widened_directory_still_enforces_the_exact_file(tools, tmp_path):
+    repo = _repo(tmp_path)
+    runner = backend.SandboxRuntimeRunner(_options(tools["srt"](), tools["agent"]))
+
+    result = _run(
+        runner, repo, "WRITE contracts/7.json={}\nWRITE contracts/8.json={}", "contracts/7.json"
+    )
+
+    assert result.meta == {"executor_failure_reason": "workspace-output-paths-denied"}
+    assert not (repo / "contracts/7.json").exists()
+    assert not (repo / "contracts/8.json").exists()
+    record = tools["records"]()[-1]
+    assert record["settings"]["filesystem"]["allowWrite"][0] == str(repo / "contracts")
+
+
+def test_ignored_files_in_a_widened_directory_are_checked_and_restored(tools, tmp_path):
+    repo = _repo(tmp_path)
+    _ignore_factory(repo)
+    (repo / ".factory").mkdir()
+    (repo / ".factory/design-author.json").write_text("controller design\n")
+    runner = backend.SandboxRuntimeRunner(_options(tools["srt"](), tools["agent"]))
+
+    result = _run(
+        runner,
+        repo,
+        "WRITE .factory/judge-verdict.json={}\n"
+        "WRITE .factory/design-author.json=tampered\n"
+        "WRITE .factory/extra.json={}",
+        ".factory/judge-verdict.json",
+        ".factory/review-findings.json",
+    )
+
+    assert result.meta == {"executor_failure_reason": "workspace-output-paths-denied"}
+    assert (repo / ".factory/design-author.json").read_text() == "controller design\n"
+    assert not (repo / ".factory/extra.json").exists()
+    assert not (repo / ".factory/judge-verdict.json").exists()
+
+
+def test_an_ignored_in_scope_file_is_kept(tools, tmp_path):
+    repo = _repo(tmp_path)
+    _ignore_factory(repo)
+    runner = backend.SandboxRuntimeRunner(_options(tools["srt"](), tools["agent"]))
+
+    result = _run(
+        runner,
+        repo,
+        'WRITE .factory/judge-verdict.json={"verdict": "PASS"}',
+        ".factory/judge-verdict.json",
+        ".factory/review-findings.json",
+    )
+
+    assert result.ok is True
+    assert (repo / ".factory/judge-verdict.json").read_text() == '{"verdict": "PASS"}'
