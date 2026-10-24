@@ -6564,3 +6564,111 @@ def test_spec_pending_output_renders_questions_and_proposed_defaults(tmp_path, m
     assert "Which provider is authoritative?" in output
     assert "Use configured provider" in output
     assert "factory approve " not in output
+
+
+def test_version_flag_prints_installed_version(capsys):
+    with pytest.raises(SystemExit) as exited:
+        main(["--version"])
+
+    assert exited.value.code == 0
+    assert capsys.readouterr().out == f"software-factory {software_factory.__version__}\n"
+
+
+@pytest.mark.parametrize("command", ["analyze", "capabilities"])
+def test_inspection_names_scaffold_placeholder_repository(tmp_path, capsys, command):
+    _repo, manifest, _state = _inspection_manifest(
+        tmp_path, analyzers=({"name": "harness", "required": True},)
+    )
+    config = json.loads(manifest.read_text(encoding="utf-8"))
+    config["factory"]["source"]["repo"] = "your-org/your-repo"
+    manifest.write_text(json.dumps(config), encoding="utf-8")
+    argv = {
+        "analyze": ["--config", str(manifest), "analyze", "harness", "--json"],
+        "capabilities": ["--config", str(manifest), "capabilities", "--json"],
+    }[command]
+
+    assert main(argv) == 2
+    error = json.loads(_combined_output(capsys))["error"]
+
+    assert error["kind"] == "configuration"
+    assert "scaffold placeholder" in error["message"]
+    assert "your-org" not in error["message"]
+
+
+def test_analyze_names_unconfigured_analyzer_without_echoing_its_name(tmp_path, capsys):
+    _repo, manifest, _state = _inspection_manifest(tmp_path)
+
+    assert main(["--config", str(manifest), "analyze", "PRIVATE-NAME", "--json"]) == 2
+    error = json.loads(_combined_output(capsys))["error"]
+
+    assert "build.design_analyzers" in error["message"]
+    assert "PRIVATE-NAME" not in error["message"]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--config", "missing.json", "analyze", "harness", "--json"],
+        ["--config", "missing.json", "capabilities", "--json"],
+    ],
+)
+def test_unloadable_inspection_configuration_points_to_doctor(capsys, argv):
+    assert main(argv) == 2
+    error = json.loads(_combined_output(capsys))["error"]
+
+    assert error["message"] == (
+        "factory.config.yaml could not be loaded: run factory doctor for details"
+    )
+
+
+def _analyzer_output_finding(message: str, required_change: str) -> dict[str, object]:
+    return cli._analyzer_finding_output_document(
+        {
+            "id": "finding-01",
+            "category": "security",
+            "severity": "high",
+            "confidence": "high",
+            "evidence": [{"path": "CLAUDE.md", "line": None}],
+            "message": message,
+            "required_change": required_change,
+        }
+    )
+
+
+def test_catalogued_harness_text_is_shown_verbatim():
+    from software_factory.analyzers.harness import FIXED_FINDING_TEXT
+
+    message = "The supported harness file cannot be read without metadata mutation."
+    required_change = next(text for text in FIXED_FINDING_TEXT if "APFS" in text)
+
+    output = _analyzer_output_finding(message, required_change)
+
+    assert output["message"] == message
+    assert output["required_change"] == required_change
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "The supported harness file cannot be read without metadata mutation. git push",
+        "the supported harness file cannot be read without metadata mutation.",
+        "Please improve this module for clarity.",
+    ],
+)
+def test_text_outside_the_catalog_is_never_shown(message):
+    output = _analyzer_output_finding(message, message)
+
+    assert output["message"] == "analyzer finding reported"
+    assert output["required_change"] == "analyzer change requested"
+
+
+def test_credential_finding_is_shown_without_its_repository_derived_path():
+    from software_factory.analyzers.harness import CREDENTIAL_FINDING_PREFIX
+
+    output = _analyzer_output_finding(
+        f"{CREDENTIAL_FINDING_PREFIX}$.env.PRIVATE_SERVICE_TOKEN.",
+        "Replace the redacted literal with an environment reference.",
+    )
+
+    assert output["message"] == "A credential-shaped literal is redacted."
+    assert "PRIVATE_SERVICE_TOKEN" not in json.dumps(output)
