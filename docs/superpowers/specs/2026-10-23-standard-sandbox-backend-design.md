@@ -2,8 +2,7 @@
 
 **Date:** 2026-10-23
 
-**Status:** Draft for approval. Implementation must not start until this design
-is approved.
+**Status:** Approved 2026-10-24.
 
 **Release:** 0.3.1, workstream C of the
 [0.3.1 brief](2026-10-23-aifactory-0.3.1-platform-evaluation-brief.md)
