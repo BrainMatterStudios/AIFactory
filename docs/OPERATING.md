@@ -161,6 +161,9 @@ store raw browser pages, HAR files, videos, console logs, private repository
 names, credentials, absolute paths, target accounts, local controller paths, or
 field-trial transcripts in this repository. Keep those records in the private
 operator evidence store and feed only the redacted summary to the preflight.
+The [roadmap](ROADMAP.md#the-040-entry-gate) defines what evidence satisfies
+each criterion. The planned 0.3.1 `factory eval` command is intended to emit
+this summary from a private evaluation run.
 
 Future browser, accessibility, visual, mobile, Review Canvas, or other UI-facing
 quality providers must include user-like end-to-end verification with Playwright
