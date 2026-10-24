@@ -30,12 +30,13 @@ sensors, and deterministic disposition.
 
 This guide assumes the doctrine path. §6 covers the other one.
 
-> **macOS adoption blocker for new scaffolds:** ordinary current macOS APFS
-> volumes cannot prove no-atime reads. Because new configurations require the
-> harness analyzer, any present supported harness file produces fail-closed
-> high-security evidence and blocks the Design gate. Preview first with `factory
-> doctor`. Use a verifiable no-atime volume/environment or leave existing
-> workflows on `legacy_plan`; making the required analyzer optional does not
+> **macOS and the required harness analyzer:** new configurations require the
+> harness analyzer, which must not change any file's access time. On APFS the
+> analyzer reads a copy-on-write clone and verifies the original is untouched.
+> Where cloning is unavailable, such as a non-APFS external volume, any present
+> supported harness file still produces fail-closed high-security evidence and
+> blocks the Design gate. The 0.3.0 release has no clone path. Preview first
+> with `factory analyze harness`; making the required analyzer optional does not
 > preserve the scaffold's Design-authority guarantees.
 
 ---
@@ -413,9 +414,10 @@ no automatic migration, and `doctor` never rewrites the manifest.
    `factory analyze <adapter>` against the intended environment. A missing
    `design_protocol` selects `legacy_plan` and emits one actionable warning.
 2. **Validate:** resolve every missing or unverifiable capability and every
-   required analyzer failure. On ordinary current macOS APFS, move the project
-   to a verifiable no-atime volume/environment if supported harness files exist.
-   Metadata restoration is not a safe workaround because it is another mutation.
+   required analyzer failure. If the harness analyzer reports that a file cannot
+   be read without metadata mutation, move the project to an APFS volume or a
+   verifiable no-atime volume/environment. Metadata restoration is not a safe
+   workaround because it is another mutation.
 3. **Opt in a new parent:** select `design_ir_v1`, author a new exact Contract,
    and follow the real Design/gate/approval lifecycle. The recorded protocol is
    sticky for that repository, issue, and parent digest.
