@@ -298,6 +298,77 @@ The architecture-first controls reduce who can authorize progress; they do not
 make the autonomous builder production-ready. `findings_v2` is current guidance.
 The `verdict_v1` protocol is a deprecated v0.x compatibility path only.
 
+### Run local builds under the standard sandbox backend
+
+The optional `sandbox-runtime` backend runs every scoped agent turn, and the
+primary verification command, under Anthropic's
+[sandbox-runtime](https://github.com/anthropic-experimental/sandbox-runtime)
+(`srt`). That is Seatbelt on macOS and bubblewrap on Linux. It is the
+lightweight alternative to the validation cell below, and it supplies the
+executor capabilities that `local_bundle` publication requires.
+
+Install `srt` outside every repository and workspace (for example
+`npm install -g @anthropic-ai/sandbox-runtime`), note its absolute path and
+`srt --version`, then configure the three roles with the same `srt` identity and
+the same execution policy as `factory.build.execution_policy`:
+
+```yaml
+factory:
+  plugins: [software_factory.adapters.optional.sandbox_runtime]
+  runner:
+    provider: sandbox-runtime-claude
+    srt: /opt/tools/bin/srt
+    srt_version: 0.0.81
+    credential_env: AIFACTORY_MODEL_API_KEY   # a scoped, revocable model key
+  workspace:
+    provider: sandbox-runtime-worktree
+    srt: /opt/tools/bin/srt
+    srt_version: 0.0.81
+    execution_policy: &policy                 # must equal build.execution_policy
+      implementation_writable_paths: [src]
+      verification_commands:
+        - {name: unit, argv: [pytest, -q], expected_exit: zero, environment_profile: default}
+      network_profile: model-only-v1
+  build:
+    publication_mode: local_bundle
+    execution_policy: *policy
+    capability_providers:
+      - name: sandbox-runtime-executor
+        options: {srt: /opt/tools/bin/srt, srt_version: 0.0.81, execution_policy: *policy}
+```
+
+What it enforces, and how it proves it:
+
+- **Writes.** Each turn may write only its scope: the contract file, the
+  controller's design and review files, or the policy's implementation paths.
+  The kernel denies every other write. Afterwards the backend compares the
+  workspace with its pre-turn state, and any change outside the scope resets
+  the whole turn.
+- **Reads.** Credential stores (`~/.ssh`, `~/.aws`, cloud and `gh` config, the
+  keychain) and the agent CLI's own stored login are denied, plus any paths in
+  `deny_read`. Add your controller `state_dir` and `local_artifact_root` there.
+- **Network.** Agent turns reach only `model_hosts` (default
+  `api.anthropic.com`); verification commands get no network.
+- **Credentials.** The agent runs with a private home directory and never sees
+  your interactive login. It receives only the key in the environment variable
+  named by `credential_env`; when that variable is unset, the turn stops before
+  running.
+- **Evidence.** The executor confirms `bounded_writable_paths`,
+  `merge_forbidden`, and `deployment_forbidden` only when a live probe through
+  `srt` shows the expected six outcomes: allowed write, denied write, denied
+  write to repository metadata, denied credential read, blocked non-model host,
+  and reachable model host. A different installed `srt` version fails closed.
+  Evidence records the `os-sandbox-v1` assurance level.
+
+Limits to know:
+- **Host trust.** This runs on your host. `srt` cannot attest its own
+  integrity, which is why the validation cell remains the higher-assurance
+  option.
+- **Exfiltration.** An allowed model host can carry data out.
+- **Git metadata.** `srt`'s built-in protection of `.git` files does not cover
+  directories inside an allowed subtree. Containment of the worktree's Git
+  metadata comes from the write allowlist, which the probe checks.
+
 ### Gate a disposable Linux validation cell before any model task
 
 Containment is a two-stage gate. Stage one admits the corrected local Leash
