@@ -89,6 +89,16 @@ def _write_private(path: Path, document: object) -> None:
         handle.write("\n")
 
 
+def _write_issue(path: Path, document: Mapping[str, Any]) -> None:
+    """The local-file source accepts only canonical JSON with one trailing newline."""
+    payload = json.dumps(
+        document, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(payload + b"\n")
+
+
 def trial_repository_identity(task: Task) -> str:
     return f"evaluation/{task.id}"
 
@@ -338,7 +348,7 @@ class FactoryArm:
             paths.workspaces,
         ):
             _private_dir(directory)
-        _write_private(paths.issue, trial_issue(task))
+        _write_issue(paths.issue, trial_issue(task))
         _write_private(paths.config, trial_manifest(self.template, task, paths))
         if self.approvals == "stand-in":
             write_evaluation_state_marker(paths.state)
@@ -352,6 +362,7 @@ class FactoryArm:
         status = "build-error"
         reason = ""
         patch = None
+        build_exit: int | None = None
 
         def attempt_result() -> Attempt:
             return Attempt(
@@ -367,6 +378,7 @@ class FactoryArm:
                     "approval_waits_s": [round(wait, 3) for wait in waits],
                     "resumes": resumes,
                     "reason": reason[:200],
+                    "build_exit": build_exit,
                 },
             )
 
@@ -380,6 +392,7 @@ class FactoryArm:
             except subprocess.TimeoutExpired:
                 status = "build-timeout"
                 return attempt_result()
+            build_exit = result.returncode
             outcome = _parse_outcome(result.stdout)
             if outcome is None:
                 status = "build-error"

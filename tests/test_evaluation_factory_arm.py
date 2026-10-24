@@ -299,6 +299,36 @@ def test_interactive_approval_resumes_to_a_validated_candidate(
     assert json.loads(issue.read_text())["tier"] == "T2"
 
 
+def test_trial_issue_loads_through_the_real_local_file_source(
+    tmp_path, monkeypatch, fake_factory
+):
+    from software_factory.adapters.reference.local_file import LocalFileSource
+
+    suite = _factory_suite(tmp_path, monkeypatch)
+    _arm(fake_factory, on_approval_request=_operator_approves).attempt(
+        suite.tasks[0], tmp_path / "trial"
+    )
+
+    source = LocalFileSource(
+        path=str(tmp_path / "trial" / "input" / "issue.json"), repository="evaluation/task-0"
+    )
+    issue = source.get_issue("1")
+    assert issue.title == "Fix add"
+    assert source.routing_signals == {"source": "feature"}
+
+
+def test_a_build_without_an_outcome_document_records_its_exit_code(
+    tmp_path, monkeypatch, fake_factory
+):
+    monkeypatch.setenv("FAKE_FACTORY_SCENARIO", "garbage")
+    suite = _factory_suite(tmp_path, monkeypatch)
+
+    attempt = _arm(fake_factory).attempt(suite.tasks[0], tmp_path / "trial")
+
+    assert attempt.status == "build-error"
+    assert attempt.detail["build_exit"] == 1
+
+
 def test_unanswered_interactive_approval_times_out(tmp_path, monkeypatch, fake_factory):
     suite = _factory_suite(tmp_path, monkeypatch)
     arm = _arm(fake_factory, approval_timeout_s=0.2)
