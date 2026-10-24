@@ -16,7 +16,11 @@ from software_factory.build import BuildStatus
 from software_factory.build.briefs import implementer_brief
 from software_factory.build.capability_runtime import execution_policy_sha256
 from software_factory.build.contract_phase import ContractPhaseResult
-from software_factory.build.contract_store import ContractEnvelopeStore
+from software_factory.build.contract_store import (
+    ContractEnvelopeStore,
+    ContractRecordState,
+    ContractStoreError,
+)
 from software_factory.build.design_gate_store import DesignGateStore
 from software_factory.build.design_phase import DesignPhaseDisposition, DesignPhaseResult
 from software_factory.build.design_store import DesignEnvelopeStore
@@ -1338,7 +1342,12 @@ def test_post_approval_capability_context_drift_fails_freshness(monkeypatch, dri
     )
 
     assert outcome.status is BuildStatus.BLOCKED
-    assert outcome.gate_state == DesignPhaseDisposition.UNAVAILABLE.value
+    if drift == "workspace":
+        assert outcome.gate_state == DesignPhaseDisposition.UNAVAILABLE.value
+    else:
+        # Base and network profile are contract constraints, so the stored
+        # contract goes stale before the design gate is reached.
+        assert outcome.reason == "contract-constraints-stale"
     assert runner.worker_calls == 0
 
 
@@ -2258,3 +2267,121 @@ def test_approval_replacement_after_judging_blocks_before_publication(monkeypatc
     assert runner.calls.count("design-author") == 1
     assert workspace.committed is None
     assert not workspace.pushed
+
+
+
+def _policy_passed_contract_lifecycle():
+    """Build a T2 lifecycle whose author never repeats a contract byte for byte."""
+    from software_factory.adapters.base import RunResult
+    from tests.test_contract_phase import _valid_v2
+
+    source, issue = _issue(labels=("type:feature",), title="new feature")
+
+    class RealCheckpointWorkspace(ContractWorkspace):
+        def checkpoint(self, message):
+            subprocess.run(["git", "add", "-A"], cwd=self.path, check=True)
+            subprocess.run(["git", "commit", "-qm", message], cwd=self.path, check=True)
+            return self.head_revision()
+
+    workspace = RealCheckpointWorkspace()
+    subprocess.run(["git", "rm", "-q", "contracts/7.json"], cwd=workspace.path, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "test: begin without a contract"],
+        cwd=workspace.path,
+        check=True,
+    )
+    contract = _valid_v2()
+    contract["repo"] = "example/repo"
+
+    class VaryingContractRunner(FindingsLifecycleDesignRunner):
+        def __init__(self):
+            super().__init__(traced_design(contract))
+            self.contract_author_turns = 0
+
+        def run_agent(self, prompt, *, model, system=None, tools=None, cwd=None):
+            if prompt.startswith("ROLE=contract-author"):
+                self.contract_author_turns += 1
+                authored = deepcopy(contract)
+                authored["generated_at"] = f"2026-08-05T10:00:0{self.contract_author_turns}Z"
+                target = pathlib.Path(cwd, "contracts", "7.json")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(json.dumps(authored) + "\n", encoding="utf-8")
+                self.design = traced_design(authored)
+                self.design.update(repo="example/repo", issue="7")
+                return RunResult(True, "contract authored", model, cost_usd=1.0)
+            return super().run_agent(prompt, model=model, system=system, tools=tools, cwd=cwd)
+
+    runner = VaryingContractRunner()
+    controller = _design_controller(_contract_controller_kwargs(workspace))
+
+    def build():
+        return _build(
+            source,
+            issue,
+            runner,
+            workspace,
+            require_contract=True,
+            repository="example/repo",
+            design_protocol="design_ir_v1",
+            review_protocol="findings_v2",
+            **controller,
+        )
+
+    return runner, controller, build
+
+
+def test_policy_passed_contract_survives_design_approval_without_reauthoring():
+    """A real author never repeats a contract byte for byte, so resume must reuse it."""
+    runner, controller, build = _policy_passed_contract_lifecycle()
+
+    pending = build()
+    assert pending.status is BuildStatus.APPROVAL_PENDING, pending.reason
+    assert pending.artifact_kind == ArtifactKind.DESIGN.value
+    assert runner.contract_author_turns == 1
+    stored = ContractEnvelopeStore(controller["repo_root"]).inspect(
+        repository="example/repo", issue="7", policy_version=None
+    )
+    assert stored is not None
+    assert stored.state is ContractRecordState.ACCEPTED
+    assert stored.envelope.artifact_digest == pending.parent_digest
+    _approve_pending_design(controller, pending)
+
+    final = build()
+
+    assert final.status is BuildStatus.SHIPPED, final.reason
+    assert runner.contract_author_turns == 1
+    assert runner.worker_calls == 1
+
+
+def test_policy_passed_contract_store_failure_blocks_before_design(monkeypatch):
+    runner, controller, build = _policy_passed_contract_lifecycle()
+
+    def refuse(self, **kwargs):
+        raise ContractStoreError("injected store failure")
+
+    monkeypatch.setattr(ContractEnvelopeStore, "write", refuse)
+
+    blocked = build()
+
+    assert blocked.status is BuildStatus.BLOCKED
+    assert blocked.reason == "Policy-passed contract could not be persisted safely"
+    assert runner.calls.count("design-author") == 0
+    assert runner.worker_calls == 0
+
+
+def test_tampered_policy_passed_contract_blocks_resume_without_reauthoring():
+    runner, controller, build = _policy_passed_contract_lifecycle()
+    pending = build()
+    assert pending.status is BuildStatus.APPROVAL_PENDING, pending.reason
+    _approve_pending_design(controller, pending)
+    accepted = ContractEnvelopeStore(controller["repo_root"]).accepted_path_for("7")
+    payload = json.loads(accepted.read_text(encoding="utf-8"))
+    payload["contract_document"]["intent"]["summary"] = "Silently widened intent"
+    accepted.write_text(json.dumps(payload), encoding="utf-8")
+
+    blocked = build()
+
+    assert blocked.status is BuildStatus.BLOCKED
+    assert blocked.reason == "stored contract envelope contract or digest does not match"
+    assert runner.contract_author_turns == 1
+    assert runner.worker_calls == 0

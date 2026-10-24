@@ -255,6 +255,7 @@ def _run(
     constraint_document=None,
     constraint_digest=None,
     tier="T1",
+    pending_contract_accepted=False,
 ):
     current_issue = issue or Issue("7", "Contract phase", "Declare intent before implementation")
     if workspace is None:
@@ -270,6 +271,8 @@ def _run(
     kwargs = {"pending_contract": pending_contract} if pending_contract is not None else {}
     if revision_request is not None:
         kwargs["revision_request"] = revision_request
+    if pending_contract_accepted:
+        kwargs["pending_contract_accepted"] = True
     return run_contract_phase(
         current_issue,
         repository="acme/widgets",
@@ -1432,6 +1435,99 @@ def test_approved_policy_pass_revision_resumes_without_an_author_turn(tmp_path):
     assert result.previous_contract_digest == rejected_digest
     assert result.revision_request_digest == "b" * 64
     assert result.checkpoint_sha is not None
+    assert runner.calls == []
+
+
+def _stored_policy_passed_contract(tmp_path):
+    envelope, _document, _text, _digest = _stored_pending_contract(tmp_path)
+    document = _phase_v2(human_owned=False)
+    text = json.dumps(document, indent=2, ensure_ascii=False) + "\n"
+    digest = artifact_sha256(document)
+    stored = replace(
+        envelope,
+        contract_text=text,
+        contract_text_digest=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        contract_document=document,
+        artifact_digest=digest,
+    )
+    return stored, document, text, digest
+
+
+def test_accepted_policy_passed_contract_resumes_without_author_turn(tmp_path):
+    stored, document, text, digest = _stored_policy_passed_contract(tmp_path)
+    runner = FakeRunner(lambda _root: pytest.fail("contract author must not run"))
+
+    result = _run(
+        tmp_path,
+        runner,
+        pending_contract=stored,
+        pending_contract_accepted=True,
+    )
+
+    assert result.disposition is IntentDisposition.PASS
+    assert runner.calls == []
+    assert not result.requires_approval
+    assert result.contract_document == document
+    assert result.contract_text == text
+    assert result.contract_digest == digest
+    assert result.checkpoint_sha is not None
+
+
+def test_pending_policy_passed_contract_still_fails_closed(tmp_path):
+    stored, _document, _text, _digest = _stored_policy_passed_contract(tmp_path)
+    runner = FakeRunner(lambda _root: pytest.fail("contract author must not run"))
+
+    result = _run(tmp_path, runner, pending_contract=stored)
+
+    assert result.disposition is IntentDisposition.BLOCKED
+    assert result.checkpoint_sha is None
+    assert runner.calls == []
+
+
+def test_accepted_policy_pass_with_revision_lineage_still_requires_approval(tmp_path):
+    stored, _document, _text, _digest = _stored_policy_passed_contract(tmp_path)
+    stored = replace(
+        stored,
+        previous_contract_digest="c" * 64,
+        revision_request_digest="b" * 64,
+    )
+    runner = FakeRunner(lambda _root: pytest.fail("contract author must not run"))
+
+    result = _run(
+        tmp_path,
+        runner,
+        pending_contract=stored,
+        pending_contract_accepted=True,
+    )
+
+    assert result.disposition is IntentDisposition.APPROVAL_PENDING
+    assert result.requires_approval
+    assert result.checkpoint_sha is None
+
+
+def test_accepted_approval_contract_still_requires_exact_approval(tmp_path):
+    envelope, _document, _text, digest = _stored_pending_contract(tmp_path)
+    runner = FakeRunner(lambda _root: pytest.fail("contract author must not run"))
+
+    result = _run(
+        tmp_path,
+        runner,
+        pending_contract=envelope,
+        pending_contract_accepted=True,
+    )
+
+    assert result.disposition is IntentDisposition.APPROVAL_PENDING
+    assert result.contract_digest == digest
+    assert result.requires_approval
+    assert result.checkpoint_sha is None
+
+
+def test_accepted_flag_without_stored_contract_fails_closed(tmp_path):
+    runner = FakeRunner(lambda _root: pytest.fail("contract author must not run"))
+
+    result = _run(tmp_path, runner, pending_contract_accepted=True)
+
+    assert result.disposition is IntentDisposition.BLOCKED
     assert runner.calls == []
 
 

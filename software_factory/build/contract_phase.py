@@ -382,6 +382,7 @@ def run_contract_phase(
     contract_author_role: str = "contract-author",
     pending_contract: ContractEnvelope | None = None,
     revision_request: (StoredContractRevision | tuple[StoredContractRevision, ...] | None) = None,
+    pending_contract_accepted: bool = False,
 ) -> ContractPhaseResult:
     """Author, admit, checkpoint, and record one contract before implementation."""
     try:
@@ -441,6 +442,13 @@ def run_contract_phase(
             inode=revision_request.inode,
         )
 
+    if pending_contract_accepted and (pending_contract is None or revision_request is not None):
+        return _result(
+            IntentDisposition.BLOCKED,
+            _CONTRACT_EXTERNAL_FAILURE,
+            constraint_digest=constraint_digest,
+            keep_workspace=True,
+        )
     if revision_request is not None and pending_contract is None:
         return _result(
             IntentDisposition.BLOCKED,
@@ -805,16 +813,32 @@ def run_contract_phase(
         )
         if forced_revision_resume:
             requires_approval = True
+        # A contract the policy passed without approval was stored as accepted
+        # so a later resume reuses it instead of asking for a new authoring turn.
+        policy_accepted_resume = (
+            resuming
+            and pending_contract_accepted
+            and pending_contract is not None
+            and pending_contract.previous_contract_digest is None
+            and pending_contract.revision_request_digest is None
+            and policy.disposition is IntentDisposition.PASS
+            and not requires_approval
+        )
         if (
             resuming
             and pending_contract is not None
             and (
                 policy.policy_version != pending_contract.policy_version
                 or (
-                    policy.disposition is not IntentDisposition.APPROVAL_PENDING
-                    and not forced_revision_resume
+                    not policy_accepted_resume
+                    and (
+                        (
+                            policy.disposition is not IntentDisposition.APPROVAL_PENDING
+                            and not forced_revision_resume
+                        )
+                        or not requires_approval
+                    )
                 )
-                or not requires_approval
             )
         ):
             return phase_result(

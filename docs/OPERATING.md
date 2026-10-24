@@ -950,6 +950,15 @@ replace the exact contract and dependent plan state through a controlled manual
 procedure, and then let the lifecycle author/checkpoint new intent and issue new
 approvals. A file replacement while a run is active is detected and blocks.
 
+A contract that the deterministic policy passes without approval is stored as
+an accepted record as soon as it passes. A later run reuses it, re-checks it
+against the same policy, and does not ask the author for another contract, so a
+Design approval stays bound to the contract it was made against. The same rules
+apply as for any accepted record: changing the issue's constraints, including
+the base revision or the network profile, makes it stale, and the run blocks
+with `contract-constraints-stale` until the record is replaced through the
+procedure above.
+
 Review-finding overrides follow a different path. They are append-only decision
 events bound to the exact reviewed fingerprint and finding ID, with operator
 authority and rationale. A changed artifact makes an old override stale. Do not

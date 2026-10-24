@@ -2253,6 +2253,10 @@ def run_build(
                     contract_author_role=contract_author_role,
                     pending_contract=pending_contract,
                     revision_request=revision_request,
+                    pending_contract_accepted=(
+                        contract_record is not None
+                        and contract_record.state is ContractRecordState.ACCEPTED
+                    ),
                 )
         except Exception:
             return _finish_prebuild(
@@ -2647,6 +2651,49 @@ def run_build(
                 ),
                 keep=True,
             )
+        if (
+            contract_record is None
+            and contract_store is not None
+            and not contract_requires_approval
+            and phase.policy_version == CONTRACT_POLICY_VERSION
+        ):
+            # Store a policy-passed contract so a resume after a later pause,
+            # such as design approval, reuses it instead of authoring anew.
+            try:
+                written_contract = contract_store.write(
+                    repository=repository,
+                    issue=issue.id,
+                    contract_text=phase.contract_text,
+                    contract_document=phase.contract_document,
+                    artifact_digest=phase.contract_digest,
+                    policy_version=CONTRACT_POLICY_VERSION,
+                    constraint_document=contract_constraint_document,
+                    constraint_digest=contract_constraint_digest,
+                )
+                contract_record = contract_store.inspect(
+                    repository=repository,
+                    issue=issue.id,
+                    policy_version=None,
+                )
+                if (
+                    contract_record is None
+                    or contract_record.state is not ContractRecordState.PENDING
+                    or contract_record.envelope != written_contract
+                ):
+                    raise ContractStoreError("policy-passed contract could not be authenticated")
+            except ContractStoreError:
+                return _finish_prebuild(
+                    BuildOutcome(
+                        issue.id,
+                        BuildStatus.BLOCKED,
+                        tier=tier,
+                        reason="Policy-passed contract could not be persisted safely",
+                        cost_usd=spent["total"],
+                        unmetered_runs=unmetered["n"],
+                        keep_workspace=True,
+                    ),
+                    keep=True,
+                )
         if contract_record is not None:
             if contract_store is None:
                 return _finish_prebuild(
