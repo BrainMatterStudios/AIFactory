@@ -273,14 +273,15 @@ it, print it, and return the verdict the pass actually reached.
 `factory build` is experimental — see [KNOWN_ISSUES.md](../KNOWN_ISSUES.md). If
 you are going to schedule it anyway:
 
-> **Required harness compatibility:** ordinary current macOS APFS volumes cannot
-> prove a no-atime read. New scaffolds require the harness analyzer, so any
-> present supported harness file blocks the Design gate with high-security
-> fail-closed evidence. Use `factory doctor` and `factory analyze harness` as a
-> preview. Move the project to an explicitly no-atime-capable
-> volume/environment or keep existing parents on `legacy_plan`. Restoring atime
-> after a read is another mutation and is not a supported workaround; disabling
-> the required analyzer does not preserve the shipped Design authority.
+> **Required harness compatibility:** new scaffolds require the harness
+> analyzer, which must read harness files without changing their access time.
+> On APFS it reads a copy-on-write clone and verifies the original is untouched;
+> where neither cloning nor a no-atime read is available, any present supported
+> harness file blocks the Design gate with high-security fail-closed evidence.
+> Use `factory doctor` and `factory analyze harness` as a preview. Restoring
+> atime after a read is another mutation and is not a supported workaround;
+> disabling the required analyzer does not preserve the shipped Design
+> authority.
 
 - Set `governance.require_branch_protection: true` and give your prod ref real
   server-side protection. `doctor` warns when your gate is convention-only, and a
