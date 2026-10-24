@@ -28,7 +28,7 @@ import sys
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from software_factory.adapters.base import RunResult
@@ -71,6 +71,27 @@ RUNNER_NAME = "sandbox-runtime-claude"
 WORKSPACE_NAME = "sandbox-runtime-worktree"
 EXECUTOR_NAME = "sandbox-runtime-executor"
 ASSURANCE_LEVEL = "os-sandbox-v1"
+#: Opt-in: the agent uses the operator's own agent CLI login. It can then read
+#: that login's token, so this is recorded as a separate, lower assurance level.
+OPERATOR_LOGIN_ASSURANCE_LEVEL = "os-sandbox-operator-login-v1"
+CREDENTIAL_MODES = ("scoped-key", "operator-login")
+#: The operator's agent login, readable only in operator-login mode.
+_LOGIN_PATHS = ("~/.claude", "~/.claude.json", "~/Library/Keychains")
+#: Agent configuration that runs code later, outside the sandbox. In
+#: operator-login mode the agent may write its session state under ~/.claude,
+#: but never these.
+OPERATOR_LOGIN_PROTECTED_WRITES = (
+    "~/.claude.json",
+    "~/.claude/settings.json",
+    "~/.claude/settings.local.json",
+    "~/.claude/CLAUDE.md",
+    "~/.claude/commands",
+    "~/.claude/agents",
+    "~/.claude/skills",
+    "~/.claude/plugins",
+    "~/.claude/hooks",
+    "~/.claude/output-styles",
+)
 NETWORK_PROFILE = "model-only-v1"
 DESIGN_AUTHOR_PATH = ".factory/design-author.json"
 DEFAULT_MODEL_HOSTS = ("api.anthropic.com",)
@@ -111,6 +132,7 @@ _OPTION_FIELDS = frozenset(
         "timeout_seconds",
         "execution_policy",
         "contracts_dir",
+        "credential_mode",
     }
 )
 _DEFAULT_EXTRA_ARGS = ("--permission-mode", "acceptEdits")
@@ -145,6 +167,15 @@ class SandboxSettings:
     timeout_seconds: int
     execution_policy: ExecutionPolicySpec | None
     contracts_dir: str
+    credential_mode: str = "scoped-key"
+
+    @property
+    def operator_login(self) -> bool:
+        return self.credential_mode == "operator-login"
+
+    @property
+    def assurance_level(self) -> str:
+        return OPERATOR_LOGIN_ASSURANCE_LEVEL if self.operator_login else ASSURANCE_LEVEL
 
     @classmethod
     def from_options(cls, options: Mapping[str, Any], *, require_policy: bool) -> SandboxSettings:
@@ -185,14 +216,22 @@ class SandboxSettings:
                 raise ValueError(f"{PROVIDER_NAME} supports only the {NETWORK_PROFILE} network")
             if not policy.implementation_writable_paths:
                 raise ValueError(f"{PROVIDER_NAME} requires implementation_writable_paths")
+        credential_mode = options.get("credential_mode", "scoped-key")
+        if credential_mode not in CREDENTIAL_MODES:
+            raise ValueError(f"{PROVIDER_NAME} credential_mode must be one of {CREDENTIAL_MODES}")
+        if credential_mode == "operator-login" and credential_env is not None:
+            raise ValueError(f"{PROVIDER_NAME} operator-login mode does not take credential_env")
         contracts_dir = options.get("contracts_dir", "contracts")
         if type(contracts_dir) is not str or not contracts_dir or contracts_dir.startswith("/"):
             raise ValueError(f"{PROVIDER_NAME} contracts_dir must be repository-relative")
+        defaults = DEFAULT_DENY_READ
+        if credential_mode == "operator-login":
+            defaults = tuple(path for path in DEFAULT_DENY_READ if path not in _LOGIN_PATHS)
         deny_read = tuple(
             dict.fromkeys(
                 str(Path(path).expanduser())
                 for path in (
-                    *DEFAULT_DENY_READ,
+                    *defaults,
                     *_string_tuple(options.get("deny_read", []), "deny_read"),
                 )
             )
@@ -213,6 +252,7 @@ class SandboxSettings:
             timeout_seconds=timeout,
             execution_policy=policy,
             contracts_dir=contracts_dir.rstrip("/"),
+            credential_mode=credential_mode,
         )
 
     def identity_digest(self) -> str:
@@ -220,7 +260,7 @@ class SandboxSettings:
         return artifact_sha256(
             {
                 "backend": PROVIDER_NAME,
-                "assurance_level": ASSURANCE_LEVEL,
+                "assurance_level": self.assurance_level,
                 "srt": str(self.srt),
                 "srt_version": self.srt_version,
                 "agent_bin": self.agent_bin,
@@ -251,6 +291,7 @@ def compile_settings(
     writable_paths: tuple[str, ...],
     extra_writable: tuple[Path, ...] = (),
     extra_deny_read: tuple[Path, ...] = (),
+    deny_write: tuple[str, ...] = (),
     network: bool,
 ) -> dict[str, Any]:
     """Translate one scope into an `srt` settings document."""
@@ -265,7 +306,7 @@ def compile_settings(
             "denyRead": [*settings.deny_read, *(str(path) for path in extra_deny_read)],
             "allowRead": [],
             "allowWrite": allow_write,
-            "denyWrite": [],
+            "denyWrite": list(deny_write),
         },
     }
 
@@ -288,6 +329,19 @@ def _sandbox_environment(home: Path, credential: str | None) -> dict[str, str]:
     }
     if credential is not None:
         environment["ANTHROPIC_API_KEY"] = credential
+    return environment
+
+
+def _operator_login_environment(tmp: Path) -> dict[str, str]:
+    """The operator's home, so the agent CLI finds its login; nothing else."""
+    environment = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(Path.home()),
+        "TMPDIR": str(tmp),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+    }
+    if os.environ.get("USER"):
+        environment["USER"] = os.environ["USER"]
     return environment
 
 
@@ -315,14 +369,55 @@ def _head(worktree: Path) -> str | None:
     return result.stdout.decode().strip() if result.returncode == 0 else None
 
 
-def _surface(worktree: Path) -> dict[str, str]:
-    """Digest of every tracked or untracked, non-ignored path's current content."""
-    listed = _git(worktree, "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+def kernel_write_paths(writable_paths: tuple[str, ...]) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Paths the kernel lets a turn write, and the directories widened to allow them.
+
+    Agent CLIs write a file by creating a temporary sibling and renaming it into
+    place, which an exact-file allowance refuses. A single-file scope therefore
+    allows its directory at the kernel, and the post-turn check still enforces
+    the exact file. A file at the repository root is never widened: the root
+    holds the worktree's `.git` pointer.
+    """
+    kernel: list[str] = []
+    widened: list[str] = []
+    for path in writable_paths:
+        parent = PurePosixPath(path).parent.as_posix()
+        if path.endswith("/**") or parent == ".":
+            kernel.append(path)
+        else:
+            kernel.append(f"{parent}/**")
+            widened.append(parent)
+    subtrees = [path.removesuffix("/**") for path in kernel if path.endswith("/**")]
+    kept = [
+        path
+        for path in dict.fromkeys(kernel)
+        if not any(path.removesuffix("/**").startswith(tree + "/") for tree in subtrees)
+    ]
+    return tuple(kept), tuple(dict.fromkeys(widened))
+
+
+def _listed(worktree: Path, *args: str) -> list[str]:
+    listed = _git(worktree, "ls-files", "-z", *args)
     if listed.returncode != 0:
         raise SandboxRuntimeError("workspace surface could not be listed")
+    return [
+        raw.decode("utf-8", "surrogateescape") for raw in filter(None, listed.stdout.split(b"\0"))
+    ]
+
+
+def _ignored_in(worktree: Path, directories: tuple[str, ...]) -> list[str]:
+    """Ignored files inside widened directories, which a turn could otherwise hide in."""
+    if not directories:
+        return []
+    return _listed(worktree, "--others", "--ignored", "--exclude-standard", "--", *directories)
+
+
+def _surface(worktree: Path, widened: tuple[str, ...] = ()) -> dict[str, str]:
+    """Digest of every tracked, untracked, and widened-directory path's content."""
+    paths = _listed(worktree, "--cached", "--others", "--exclude-standard")
+    paths += _ignored_in(worktree, widened)
     surface: dict[str, str] = {}
-    for raw in filter(None, listed.stdout.split(b"\0")):
-        path = raw.decode("utf-8", "surrogateescape")
+    for path in dict.fromkeys(paths):
         target = worktree / path
         try:
             info = target.lstat()
@@ -348,8 +443,8 @@ class _Snapshot:
     saved: dict[str, bytes | None]
 
 
-def _take_snapshot(worktree: Path, head: str) -> _Snapshot:
-    surface = _surface(worktree)
+def _take_snapshot(worktree: Path, head: str, widened: tuple[str, ...] = ()) -> _Snapshot:
+    surface = _surface(worktree, widened)
     # --no-renames keeps one path per record; -z rename records carry two.
     dirty = _git(
         worktree, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"
@@ -361,6 +456,10 @@ def _take_snapshot(worktree: Path, head: str) -> _Snapshot:
         path = record[3:].decode("utf-8", "surrogateescape")
         target = worktree / path
         saved[path] = target.read_bytes() if target.is_file() else None
+    for path in _ignored_in(worktree, widened):
+        target = worktree / path
+        if target.is_file() and not target.is_symlink():
+            saved[path] = target.read_bytes()
     return _Snapshot(head, surface, saved)
 
 
@@ -470,13 +569,14 @@ class SandboxRuntimeRunner:
                 failure_reason="workspace-output-identity-invalid",
             )
         try:
-            before = _take_snapshot(worktree, head)
+            kernel_paths, widened = kernel_write_paths(scope.writable_paths)
+            before = _take_snapshot(worktree, head, widened)
         except (OSError, SandboxRuntimeError):
             return denied_result(model=model_id, category="process")
 
         def reset(reason: str, category: str = "filesystem") -> RunResult:
             try:
-                after = _surface(worktree)
+                after = _surface(worktree, widened)
                 restored = _restore(worktree, before, _changed_paths(before, after))
             except (OSError, SandboxRuntimeError):
                 restored = False
@@ -490,7 +590,17 @@ class SandboxRuntimeRunner:
             prefix="aifactory-srt-turn-", dir=_SHORT_TEMP_ROOT
         ) as private:
             home = _private_home(Path(private))
-            for path in scope.writable_paths:
+            if self.settings.operator_login:
+                extra_writable = (home / "tmp", Path("~/.claude").expanduser())
+                deny_write = tuple(
+                    str(Path(path).expanduser()) for path in OPERATOR_LOGIN_PROTECTED_WRITES
+                )
+                environment = _operator_login_environment(home / "tmp")
+            else:
+                extra_writable = (home,)
+                deny_write = ()
+                environment = _sandbox_environment(home, credential)
+            for path in kernel_paths:
                 # A sandbox can only allow writes beneath directories that exist.
                 parent = (
                     path.removesuffix("/**") if path.endswith("/**") else str(Path(path).parent)
@@ -502,8 +612,9 @@ class SandboxRuntimeRunner:
                 compile_settings(
                     self.settings,
                     root=worktree,
-                    writable_paths=scope.writable_paths,
-                    extra_writable=(home,),
+                    writable_paths=kernel_paths,
+                    extra_writable=extra_writable,
+                    deny_write=deny_write,
                     network=True,
                 ),
             )
@@ -512,7 +623,7 @@ class SandboxRuntimeRunner:
                 completed = subprocess.run(
                     command,
                     cwd=worktree,
-                    env=_sandbox_environment(home, credential),
+                    env=environment,
                     capture_output=True,
                     text=True,
                     timeout=scope.timeout_seconds,
@@ -531,7 +642,7 @@ class SandboxRuntimeRunner:
         if not meta.get("cost_known") or not math.isfinite(cost) or cost < 0:
             return reset("claude-result-invalid", "process")
         try:
-            after = _surface(worktree)
+            after = _surface(worktree, widened)
         except (OSError, SandboxRuntimeError):
             return reset("workspace-output-identity-invalid")
         changed = _changed_paths(before, after)
@@ -544,7 +655,7 @@ class SandboxRuntimeRunner:
             cost_usd=cost,
             meta={
                 "cost_known": True,
-                "assurance_level": ASSURANCE_LEVEL,
+                "assurance_level": self.settings.assurance_level,
                 "execution_scope": {
                     "context_digest": scope.context_digest,
                     "input_revision": scope.input_revision,
@@ -837,7 +948,7 @@ class SandboxRuntimeExecutor:
                         execution_policy_sha256(self.settings.execution_policy),
                         artifact_sha256(
                             {
-                                "assurance_level": ASSURANCE_LEVEL,
+                                "assurance_level": self.settings.assurance_level,
                                 "backend": self.settings.identity_digest(),
                                 "probe": outcome,
                                 "capability_context": capability_context_sha256(context),

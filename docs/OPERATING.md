@@ -360,6 +360,23 @@ What it enforces, and how it proves it:
   and reachable model host. A different installed `srt` version fails closed.
   Evidence records the `os-sandbox-v1` assurance level.
 
+**Opt-in: run on your Claude Code subscription instead of a key.** Set
+`credential_mode: operator-login` on all three roles and omit `credential_env`.
+The agent then runs with your real home directory and uses your existing
+Claude Code login. To make that work:
+- `~/.claude`, `~/.claude.json`, and the keychain are no longer read-denied;
+- the agent may write its session state under `~/.claude`;
+- it still cannot write configuration that runs later outside the sandbox:
+  `~/.claude.json`, `~/.claude/settings*.json`, `~/.claude/CLAUDE.md`, and the
+  `commands`, `agents`, `skills`, `plugins`, `hooks`, and `output-styles`
+  directories.
+
+The cost is real. Anything that steers the agent, including text injected
+through a repository file or issue, can read your login token and use it
+through the allowed model host. Evidence therefore records a separate
+`os-sandbox-operator-login-v1` assurance level. Prefer a scoped, revocable
+credential for unattended runs.
+
 Limits to know:
 - **Host trust.** This runs on your host. `srt` cannot attest its own
   integrity, which is why the validation cell remains the higher-assurance
