@@ -609,6 +609,7 @@ def build_outcome_document(outcome) -> dict[str, object]:
         "cost_usd": round(float(outcome.cost_usd), 6),
         "unmetered_runs": int(outcome.unmetered_runs),
         "revisions": int(outcome.revisions),
+        "gate_state": outcome.gate_state,
         "approval": approval,
         "artifact_directory": (
             str(outcome.artifact_directory)
@@ -3743,6 +3744,7 @@ def cmd_eval_run(args) -> int:
                 approvals=args.approvals,
                 approval_timeout_s=float(args.approval_timeout),
                 build_timeout_s=float(args.build_timeout),
+                gate_reruns=args.gate_reruns,
             )
         )
     if "single-agent" in selected:
@@ -4669,6 +4671,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     eval_run.add_argument(
         "--build-timeout", type=int, default=7200, help="build seconds per factory trial"
+    )
+    eval_run.add_argument(
+        "--gate-reruns",
+        type=int,
+        default=1,
+        choices=range(0, 4),
+        metavar="0-3",
+        help="plain re-runs after a Design gate block, each counted (default 1)",
     )
     eval_run.set_defaults(func=cmd_eval_run)
     eval_summary = eval_command.add_parser(

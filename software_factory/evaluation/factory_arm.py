@@ -214,6 +214,7 @@ class FactoryArm:
         prompt: TextIO | None = None,
         on_approval_request: Callable[[Mapping[str, Any]], None] | None = None,
         command: Sequence[str] | None = None,
+        gate_reruns: int = 1,
     ) -> None:
         if approvals not in APPROVAL_MODES:
             raise FactoryArmError(f"approvals must be one of {', '.join(APPROVAL_MODES)}")
@@ -224,6 +225,9 @@ class FactoryArm:
         self.poll_s = poll_s
         self.prompt = prompt if prompt is not None else sys.stderr
         self.on_approval_request = on_approval_request
+        if type(gate_reruns) is not int or not 0 <= gate_reruns <= 3:
+            raise FactoryArmError("gate re-runs must be an integer from 0 to 3")
+        self.gate_reruns = gate_reruns
         self.command = (
             tuple(command)
             if command is not None
@@ -357,7 +361,7 @@ class FactoryArm:
         deadline = started + self.build_timeout_s
         cost = 0.0
         unmetered = 0
-        requested = given = resumes = 0
+        requested = given = resumes = reruns = 0
         waits: list[float] = []
         status = "build-error"
         reason = ""
@@ -377,6 +381,7 @@ class FactoryArm:
                     "approvals_given": given,
                     "approval_waits_s": [round(wait, 3) for wait in waits],
                     "resumes": resumes,
+                    "gate_reruns": reruns,
                     "reason": reason[:200],
                     "build_exit": build_exit,
                 },
@@ -409,6 +414,13 @@ class FactoryArm:
                     status = "no-change"
                     patch = None
                 return attempt_result()
+            if status == "blocked" and outcome.get("gate_state") == "block":
+                # An operator's plain re-run lets the factory re-author a Design the
+                # gate blocked. It is bounded and counted as an intervention.
+                if reruns >= self.gate_reruns:
+                    return attempt_result()
+                reruns += 1
+                continue
             if status != "approval-pending" or not isinstance(outcome.get("approval"), dict):
                 return attempt_result()
             if resumes >= MAX_RESUMES:

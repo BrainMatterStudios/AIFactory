@@ -65,6 +65,16 @@ def _human_review(records: Sequence[Mapping[str, Any]]) -> dict[str, Any] | None
         ),
         "approval_wait_s": {"median": _percentile(waits, 0.5), "max": _percentile(waits, 1.0)},
         "resumes": sum(int(record["detail"].get("resumes", 0)) for record in reviewed),
+        "gate_reruns": sum(int(record["detail"].get("gate_reruns", 0)) for record in reviewed),
+        # The strict reading: a trial that needed a re-run counts as failed.
+        "without_gate_reruns": _pass_rates(
+            {
+                **record,
+                "passed": bool(record["passed"])
+                and not int(record["detail"].get("gate_reruns", 0)),
+            }
+            for record in reviewed
+        ),
         # Stand-in runs measure whether the pipeline finishes, not human review.
         "by_approval_mode": {
             mode: _pass_rates(items) for mode, items in sorted(by_mode.items())
@@ -180,6 +190,11 @@ def summary_text(report: Mapping[str, Any]) -> str:
             lines.append(
                 f"  approvals {review['approvals_given']}/{review['approvals_requested']} given, "
                 f"wait median {wait['median']}s max {wait['max']}s, resumes {review['resumes']}"
+            )
+            strict = review["without_gate_reruns"]
+            lines.append(
+                f"  design-gate re-runs {review['gate_reruns']}; without them pass@1 "
+                f"{_rate(strict['pass_at_1'])} ({strict['passed_trials']}/{strict['trials']})"
             )
             for mode, rates in review["by_approval_mode"].items():
                 label = " (measured without human review)" if mode == "stand-in" else ""

@@ -248,12 +248,16 @@ Approval pauses:
   approval copied into real state fails closed. The report shows stand-in pass
   rates separately, labelled as measured without human review.
 
-A `blocked` build ends the trial; it is not re-run. The candidate is the
+When the Design gate blocks a Design, the arm re-runs the build once, as an
+operator would, so the factory can re-author it (`--gate-reruns`, 0 to 3,
+default 1). Each re-run is counted, and the report also prints pass@1 without
+re-runs. Any other `blocked` outcome ends the trial. The candidate is the
 bundle's `implementation.patch`, verified in a fresh clone like any other arm.
 
 `factory build --json` prints one `factory-build-outcome-v1` document (status,
 tier, a bounded reason, cost, unmetered turns, any pending approval digests,
-and the bundle directory when validated) and sends progress to stderr.
+the Design gate state, and the bundle directory when validated) and sends
+progress to stderr.
 
 Future browser, accessibility, visual, mobile, Review Canvas, or other UI-facing
 quality providers must include user-like end-to-end verification with Playwright

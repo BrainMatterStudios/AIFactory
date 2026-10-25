@@ -69,9 +69,11 @@ arm, and the report prints tier-routing agreement as **not measured**, never as
 4. Act on the outcome:
    - `approval-pending`: hand the request to the approval mode (below), then
      run the build again. At most 4 resumes per trial.
+   - `blocked` at the Design gate (`gate_state: block`): run the build again,
+     at most `--gate-reruns` times (decision 1).
    - `validated`: the candidate is the bundle's `implementation.patch`.
    - Anything else is terminal. The trial fails with that status and a bounded
-     reason. A `blocked` outcome is not re-run (see decision 1).
+     reason.
 5. Verify the candidate in a fresh clone exactly as slice 1 does.
 
 ## Machine-readable build outcome
@@ -139,6 +141,12 @@ The readiness summary may count stand-in trials only toward
      block, count each one as a human intervention, and report it.
    - **Recommendation: (a)** for this slice. Record each block's reason so the
      report shows how often a re-run might have helped, and revisit with data.
+   - **Revised 2026-10-25 to (b).** In real-model trials, the Design gate
+     blocked the first Design in three of four attempts, and an earlier real
+     build completed after one plain re-run. The arm now re-runs once after a
+     block whose `gate_state` is `block` (`--gate-reruns`, 0 to 3, default 1).
+     Each re-run is counted, and the report also gives pass rates without
+     re-runs. Other blocked outcomes still end the trial.
 2. **`--json` on `factory build`.** Recommendation: add it as above. Parsing the
    human summary would tie the evaluation to display text.
 

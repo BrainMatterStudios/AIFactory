@@ -29,8 +29,9 @@ project uses semantic versioning.
   held-out task suite with hidden checks, and report pass@1, pass^k, cost, and
   statuses per arm. The `single-agent` arm gives one agent the request. The
   `factory` arm runs the real `factory build` per trial with local-bundle
-  publication, and answers approval pauses interactively or with the
-  evaluation-only stand-in approver.
+  publication, answers approval pauses interactively or with the
+  evaluation-only stand-in approver, and re-runs once after a Design gate
+  block, counting each re-run and reporting pass rates without them.
 - `factory build --json` prints one `factory-build-outcome-v1` document and
   sends progress to stderr.
 

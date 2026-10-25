@@ -84,7 +84,15 @@ if "approve" in args:
     sys.exit(0)
 
 if scenario == "blocked":
-    outcome("blocked", reason="Current design is blocked by deterministic findings")
+    outcome("blocked", reason="Contract approval authority could not be authenticated")
+    sys.exit(1)
+gate_marker = state / "fake-gate-blocked"
+if scenario == "gate-block-always" or (
+    scenario == "gate-block-once" and not gate_marker.exists()
+):
+    gate_marker.touch()
+    outcome("blocked", reason="Current design is blocked by deterministic findings",
+            gate_state="block")
     sys.exit(1)
 if scenario == "garbage":
     print("not a document")
@@ -365,9 +373,66 @@ def test_a_blocked_build_is_terminal_and_not_rerun(tmp_path, monkeypatch, fake_f
     attempt = _arm(fake_factory).attempt(suite.tasks[0], tmp_path / "trial")
 
     assert attempt.status == "blocked"
-    assert attempt.detail["reason"].startswith("Current design is blocked")
+    assert attempt.detail["reason"].startswith("Contract approval authority")
+    assert attempt.detail["gate_reruns"] == 0
     builds = [line for line in fake_factory.log.read_text().splitlines() if '"build"' in line]
     assert len(builds) == 1
+
+
+def _builds(fake_factory) -> int:
+    return sum('"build"' in line for line in fake_factory.log.read_text().splitlines())
+
+
+def test_a_design_gate_block_gets_one_counted_rerun(tmp_path, monkeypatch, fake_factory):
+    monkeypatch.setenv("FAKE_FACTORY_SCENARIO", "gate-block-once")
+    suite = _factory_suite(tmp_path, monkeypatch)
+
+    attempt = _arm(fake_factory, approvals="stand-in").attempt(
+        suite.tasks[0], tmp_path / "trial"
+    )
+
+    assert attempt.status == "validated", attempt.detail
+    assert attempt.detail["gate_reruns"] == 1
+    assert _builds(fake_factory) == 3
+
+
+def test_gate_reruns_are_bounded(tmp_path, monkeypatch, fake_factory):
+    monkeypatch.setenv("FAKE_FACTORY_SCENARIO", "gate-block-always")
+    suite = _factory_suite(tmp_path, monkeypatch)
+
+    attempt = _arm(fake_factory).attempt(suite.tasks[0], tmp_path / "trial")
+
+    assert attempt.status == "blocked"
+    assert attempt.detail["gate_reruns"] == 1
+    assert _builds(fake_factory) == 2
+
+
+def test_zero_gate_reruns_restores_the_strict_rule(tmp_path, monkeypatch, fake_factory):
+    monkeypatch.setenv("FAKE_FACTORY_SCENARIO", "gate-block-once")
+    suite = _factory_suite(tmp_path, monkeypatch)
+
+    attempt = _arm(fake_factory, gate_reruns=0).attempt(suite.tasks[0], tmp_path / "trial")
+
+    assert attempt.status == "blocked"
+    assert _builds(fake_factory) == 1
+
+
+def test_report_shows_pass_rates_with_and_without_gate_reruns(
+    tmp_path, monkeypatch, fake_factory
+):
+    monkeypatch.setenv("FAKE_FACTORY_SCENARIO", "gate-block-once")
+    suite = _factory_suite(tmp_path, monkeypatch)
+
+    report = run_suite(
+        suite, [_arm(fake_factory, approvals="stand-in")], tmp_path / "results", trials=1
+    )
+
+    review = report["arms"]["factory"]["human_review"]
+    assert report["arms"]["factory"]["passed_trials"] == 1
+    assert review["gate_reruns"] == 1
+    assert review["without_gate_reruns"]["passed_trials"] == 0
+    summary = (tmp_path / "results" / "summary.txt").read_text()
+    assert "design-gate re-runs 1; without them pass@1 0% (0/1)" in summary
 
 
 def test_display_text_is_never_parsed_as_an_outcome(tmp_path, monkeypatch, fake_factory):
@@ -560,6 +625,7 @@ def test_build_json_prints_one_outcome_document_with_the_pending_approval(
         "cost_usd": 0.31,
         "unmetered_runs": 0,
         "revisions": 0,
+        "gate_state": None,
         "approval": {"kind": "design", "digest": DESIGN_DIGEST, "parent": CONTRACT_DIGEST},
         "artifact_directory": None,
     }
