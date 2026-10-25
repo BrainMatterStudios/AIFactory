@@ -11,8 +11,8 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .arms import Arm, Attempt
@@ -39,9 +39,10 @@ class TrialRecord:
     cost_usd: float
     unmetered_turns: int
     wall_s: float
+    detail: Mapping[str, object] = field(default_factory=dict)
 
     def document(self) -> dict[str, object]:
-        return {
+        document: dict[str, object] = {
             "task": self.task_id,
             "arm": self.arm,
             "trial": self.trial,
@@ -53,6 +54,9 @@ class TrialRecord:
             "unmetered_turns": self.unmetered_turns,
             "wall_s": round(self.wall_s, 3),
         }
+        if self.detail:
+            document["detail"] = dict(self.detail)
+        return document
 
 
 def _prepare_results(results_dir: Path, suite: Suite) -> Path:
@@ -109,6 +113,7 @@ def run_trial(arm: Arm, task: Task, trial: int) -> TrialRecord:
         cost_usd=attempt.cost_usd,
         unmetered_turns=attempt.unmetered_turns,
         wall_s=attempt.wall_s,
+        detail=attempt.detail,
     )
 
 

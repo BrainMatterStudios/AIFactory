@@ -17,6 +17,10 @@ from pathlib import Path
 from typing import Any
 
 from software_factory.core.contracts import canonical_json_bytes
+from software_factory.core.design.configuration import (
+    ExecutionPolicySpec,
+    VerificationCommandSpec,
+)
 from software_factory.core.git_environment import sanitized_git_environment
 
 SUITE_SCHEMA_VERSION = "factory-eval-suite-v1"
@@ -29,10 +33,22 @@ _ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 _COMMIT_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _SUITE_FIELDS = frozenset({"schema_version", "name", "trials", "tasks"})
 _TASK_FIELDS = frozenset(
-    {"id", "repository", "base", "request", "tier_hint", "checks", "known_good", "seeded_defects"}
+    {
+        "id",
+        "repository",
+        "base",
+        "request",
+        "tier_hint",
+        "checks",
+        "known_good",
+        "seeded_defects",
+        "factory",
+    }
 )
 _REQUIRED_TASK_FIELDS = frozenset({"id", "repository", "base", "request", "checks"})
 _CHECK_FIELDS = frozenset({"id", "argv", "expect_exit", "timeout_s"})
+_FACTORY_FIELDS = frozenset({"labels", "writable_paths", "verification_commands"})
+_LABEL_RE = re.compile(r"[a-z0-9][a-z0-9:._/-]{0,63}\Z")
 
 
 class SuiteError(ValueError):
@@ -54,6 +70,15 @@ class SeededDefect:
 
 
 @dataclass(frozen=True)
+class FactorySettings:
+    """What the factory arm needs that differs per repository."""
+
+    labels: tuple[str, ...]
+    writable_paths: tuple[str, ...]
+    verification_commands: tuple[tuple[str, tuple[str, ...]], ...]
+
+
+@dataclass(frozen=True)
 class Task:
     id: str
     repository: Path
@@ -64,6 +89,7 @@ class Task:
     checks: tuple[Check, ...]
     known_good: bytes | None
     seeded_defects: tuple[SeededDefect, ...]
+    factory: FactorySettings | None = None
 
 
 @dataclass(frozen=True)
@@ -114,6 +140,66 @@ def _check(document: object, task_id: str) -> Check:
     if type(timeout_s) not in (int, float) or not 0 < timeout_s <= 86_400:
         raise SuiteError(f"task {task_id}: check {check_id} timeout_s is out of range")
     return Check(check_id, tuple(argv), expect_exit, float(timeout_s))
+
+
+def _factory_settings(document: object, task_id: str) -> FactorySettings:
+    if type(document) is not dict or set(document) != _FACTORY_FIELDS:
+        raise SuiteError(
+            f"task {task_id}: factory requires exactly labels, writable_paths, "
+            "and verification_commands"
+        )
+    labels = document["labels"]
+    if (
+        type(labels) is not list
+        or not labels
+        or any(type(label) is not str or _LABEL_RE.fullmatch(label) is None for label in labels)
+        or len(set(labels)) != len(labels)
+    ):
+        raise SuiteError(f"task {task_id}: factory labels must be unique lowercase labels")
+    paths = document["writable_paths"]
+    if type(paths) is not list or not paths:
+        raise SuiteError(f"task {task_id}: factory writable_paths must be a non-empty list")
+    for path in paths:
+        if (
+            type(path) is not str
+            or not path
+            or path.startswith("/")
+            or "\\" in path
+            or any(part in {"", ".", "..", ".git"} for part in path.split("/"))
+        ):
+            raise SuiteError(f"task {task_id}: factory writable_paths must be relative paths")
+    commands_value = document["verification_commands"]
+    if type(commands_value) is not list or not commands_value:
+        raise SuiteError(
+            f"task {task_id}: factory verification_commands must be a non-empty list"
+        )
+    commands = []
+    for item in commands_value:
+        if type(item) is not dict or set(item) != {"name", "argv"}:
+            raise SuiteError(
+                f"task {task_id}: a verification command requires exactly name and argv"
+            )
+        name = _identifier(item["name"], f"task {task_id}: verification command name")
+        argv = item["argv"]
+        if type(argv) is not list or not argv or any(type(a) is not str or not a for a in argv):
+            raise SuiteError(
+                f"task {task_id}: verification command {name} argv must be non-empty strings"
+            )
+        commands.append((name, tuple(argv)))
+    if len({name for name, _argv in commands}) != len(commands):
+        raise SuiteError(f"task {task_id}: verification command names must be unique")
+    try:
+        # The controller's own policy type, so a bad policy fails at load, not mid-trial.
+        ExecutionPolicySpec(
+            implementation_writable_paths=tuple(paths),
+            verification_commands=tuple(
+                VerificationCommandSpec(name, argv, "zero", "default") for name, argv in commands
+            ),
+            network_profile="model-only-v1",
+        )
+    except (TypeError, ValueError) as exc:
+        raise SuiteError(f"task {task_id}: factory execution policy is invalid") from exc
+    return FactorySettings(tuple(sorted(labels)), tuple(paths), tuple(commands))
 
 
 def _git_commit(repository: Path, base: str) -> str:
@@ -196,6 +282,10 @@ def _task(root: Path, document: object, *, verify_repositories: bool) -> Task:
     if len({defect.id for defect in defects}) != len(defects):
         raise SuiteError(f"task {task_id}: seeded defect ids must be unique")
 
+    factory = None
+    if document.get("factory") is not None:
+        factory = _factory_settings(document["factory"], task_id)
+
     return Task(
         id=task_id,
         repository=repository,
@@ -206,6 +296,7 @@ def _task(root: Path, document: object, *, verify_repositories: bool) -> Task:
         checks=checks,
         known_good=known_good,
         seeded_defects=tuple(defects),
+        factory=factory,
     )
 
 

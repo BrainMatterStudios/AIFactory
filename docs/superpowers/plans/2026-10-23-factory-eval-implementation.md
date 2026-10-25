@@ -63,6 +63,13 @@ runner, two tasks, three trials, one seeded defect, and one vacuous check.
   `FACTORY_STATE_DIR` must be set per trial, the issue id must be numeric, and a
   blocked trial must not be re-run in place.
 
+### Status (2026-10-24)
+
+The factory arm, `factory build --json`, both approval modes, and stand-in
+containment are implemented per the
+[factory arm design](../specs/2026-10-24-factory-eval-factory-arm-design.md).
+Calibration mode and `representative-t2-lifecycle` evidence move to slice 3.
+
 ### Work
 
 - Run `factory build <issue>` as a subprocess against a generated per-trial

@@ -38,6 +38,28 @@ _OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
 _NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 _MAX_RECORD_BYTES = 1024 * 1024
 
+#: The reserved approver identity for evaluation-only stand-in approvals.
+STAND_IN_APPROVER = "aifactory-evaluation-stand-in"
+#: The marker that makes a state root evaluation-only. It sits beside the
+#: approvals directory, and only `factory eval` writes it.
+EVALUATION_STATE_MARKER = "evaluation-state.json"
+EVALUATION_STATE_CONTENT = b'{"schema_version":"evaluation-state-v1"}\n'
+
+
+def is_stand_in_approver(approver: str) -> bool:
+    return approver.strip().casefold() == STAND_IN_APPROVER
+
+
+def write_evaluation_state_marker(state_root: str | Path) -> Path:
+    """Mark a private state root as evaluation-only, so stand-in approvals count there."""
+    root = Path(state_root)
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    marker = root / EVALUATION_STATE_MARKER
+    descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | (_NOFOLLOW or 0), 0o600)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(EVALUATION_STATE_CONTENT)
+    return marker
+
 
 class ApprovalError(RuntimeError):
     """Approval authority is absent, invalid, unreadable, or does not match."""
@@ -80,6 +102,8 @@ class ApprovalStore:
     def approve(self, record: ApprovalRecord) -> None:
         """Validate and atomically replace the record for its identity."""
         self._validate_record(record)
+        if is_stand_in_approver(record.approver) and not self._in_evaluation_state():
+            raise ApprovalError("stand-in approvals are valid only in evaluation state")
         filename = self._filename_for(record.repository, record.issue, record.artifact_kind)
         payload = json.dumps(
             self._record_data(record), ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -113,7 +137,36 @@ class ApprovalStore:
                 "approval authority does not match the requested artifact",
                 kind=AuthorityFailureKind.POLICY_STALE,
             )
+        if is_stand_in_approver(record.approver) and not self._in_evaluation_state():
+            # A stand-in approval copied out of an evaluation never grants authority.
+            raise ApprovalError("stand-in approval is outside evaluation state")
         return record
+
+    def _in_evaluation_state(self) -> bool:
+        """True only for an exact, private marker beside the approvals directory."""
+        try:
+            descriptor = os.open(
+                self.root.parent / EVALUATION_STATE_MARKER,
+                os.O_RDONLY | (_NOFOLLOW or 0) | _NONBLOCK,
+            )
+        except OSError:
+            return False
+        try:
+            info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_size != len(EVALUATION_STATE_CONTENT)
+            ):
+                return False
+            return os.read(descriptor, len(EVALUATION_STATE_CONTENT) + 1) == (
+                EVALUATION_STATE_CONTENT
+            )
+        except OSError:
+            return False
+        finally:
+            os.close(descriptor)
 
     def _filename_for(self, repository: str, issue: str, artifact_kind: ArtifactKind) -> str:
         self._validate_identity(repository, issue, artifact_kind)

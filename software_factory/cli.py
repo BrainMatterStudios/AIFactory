@@ -16,6 +16,7 @@ Everything here is thin glue over the library; the logic lives in core/ and loop
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import fcntl
 import hashlib
@@ -585,8 +586,46 @@ def cmd_observe(args) -> int:
     return 1 if report.overall is CheckVerdict.FAIL else 0
 
 
+BUILD_OUTCOME_SCHEMA = "factory-build-outcome-v1"
+_BUILD_OUTCOME_REASON_LIMIT = 500
+
+
+def build_outcome_document(outcome) -> dict[str, object]:
+    """The machine-readable build outcome: status, cost, and pending authority only."""
+    from software_factory.build.orchestrator import BuildStatus
+
+    approval = None
+    if outcome.status is BuildStatus.APPROVAL_PENDING and outcome.artifact_kind:
+        approval = {
+            "kind": outcome.artifact_kind,
+            "digest": outcome.artifact_digest,
+            "parent": outcome.parent_digest,
+        }
+    return {
+        "schema_version": BUILD_OUTCOME_SCHEMA,
+        "status": outcome.status.value,
+        "tier": outcome.tier.value if outcome.tier else None,
+        "reason": (outcome.reason or "")[:_BUILD_OUTCOME_REASON_LIMIT],
+        "cost_usd": round(float(outcome.cost_usd), 6),
+        "unmetered_runs": int(outcome.unmetered_runs),
+        "revisions": int(outcome.revisions),
+        "gate_state": outcome.gate_state,
+        "approval": approval,
+        "artifact_directory": (
+            str(outcome.artifact_directory)
+            if outcome.status is BuildStatus.VALIDATED and outcome.artifact_directory
+            else None
+        ),
+    }
+
+
 def cmd_build(args) -> int:
     """Drive one issue through the doctrine to a PR (T0/T1) or a plan-halt (T2)."""
+    if getattr(args, "json", False) and getattr(args, "_json_stream", None) is None:
+        # Progress and diagnostics go to stderr so stdout holds one document.
+        args._json_stream = sys.stdout
+        with contextlib.redirect_stdout(sys.stderr):
+            return cmd_build(args)
     from software_factory.core.governance import AlreadyRunning, RunLock
 
     cfg = _load_config(args.config)
@@ -3674,27 +3713,48 @@ def cmd_eval_run(args) -> int:
     """Run a validated suite under the selected arms and write a private report."""
     from software_factory.evaluation import (
         EvaluationError,
+        FactoryArm,
+        FactoryArmError,
         SingleAgentArm,
         SuiteError,
+        load_factory_template,
         load_suite,
         run_suite,
     )
 
-    selected = args.arm or ["single-agent"]
-    if "factory" in selected:
-        print("eval → the factory arm is not available yet; use --arm single-agent")
+    selected = list(dict.fromkeys(args.arm or ["single-agent"]))
+    if "factory" in selected and not args.factory_config:
+        print("eval → --arm factory requires --factory-config <manifest.json>")
         return 2
     try:
         suite = load_suite(args.suite)
-        cfg = _load_config(args.config)
-        runner = cfg.build("runner")
     except SuiteError as exc:
         print(f"eval → {exc}")
         return 2
-    except (KeyError, OSError, TypeError, ValueError):
-        print("eval → factory.config.yaml could not be loaded: run factory doctor for details")
-        return 2
-    arms = [SingleAgentArm(runner, model=args.model)]
+    arms = []
+    if "factory" in selected:
+        try:
+            template = load_factory_template(args.factory_config)
+        except FactoryArmError as exc:
+            print(f"eval → {exc}")
+            return 2
+        arms.append(
+            FactoryArm(
+                template,
+                approvals=args.approvals,
+                approval_timeout_s=float(args.approval_timeout),
+                build_timeout_s=float(args.build_timeout),
+                gate_reruns=args.gate_reruns,
+            )
+        )
+    if "single-agent" in selected:
+        try:
+            cfg = _load_config(args.config)
+            runner = cfg.build("runner")
+        except (KeyError, OSError, TypeError, ValueError):
+            print("eval → factory.config.yaml could not be loaded: run factory doctor for details")
+            return 2
+        arms.append(SingleAgentArm(runner, model=args.model))
 
     def progress(record) -> None:
         result = "pass" if record.passed else f"fail ({record.status})"
@@ -4329,6 +4389,12 @@ def _run_build_locked(
         prod_refs=cfg.governance.prod_refs or None,
         **local_runtime,
     )
+    exit_code = 0 if outcome.status.value in ("shipped", "validated", "plan-pending") else 1
+    json_stream = getattr(args, "_json_stream", None)
+    if json_stream is not None:
+        json_stream.write(json.dumps(build_outcome_document(outcome), sort_keys=True) + "\n")
+        json_stream.flush()
+        return exit_code
     print(f"  tier      : {outcome.tier.value if outcome.tier else '—'}")
     print(f"  status    : {outcome.status.value.upper()}")
     print(f"  revisions : {outcome.revisions}")
@@ -4503,6 +4569,11 @@ def build_parser() -> argparse.ArgumentParser:
     build_source.add_argument("--repo", help="path to the target git repo (default: cwd)")
     build_source.add_argument("--source-bundle", help="authenticated Git source bundle")
     bd.add_argument("--base", help="exact revision contained in --source-bundle")
+    bd.add_argument(
+        "--json",
+        action="store_true",
+        help="print one factory-build-outcome-v1 document; progress goes to stderr",
+    )
     bd.set_defaults(func=cmd_build)
 
     approve = sub.add_parser("approve", help="approve an exact contract, plan, or design digest")
@@ -4586,6 +4657,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     eval_run.add_argument("--model", default="sonnet", help="model tier for single-agent")
     eval_run.add_argument("--trials", type=int, help="override the suite's trial count")
+    eval_run.add_argument(
+        "--factory-config", help="JSON manifest the factory arm runs with, per trial"
+    )
+    eval_run.add_argument(
+        "--approvals",
+        choices=("interactive", "stand-in"),
+        default="interactive",
+        help="who answers factory approval pauses (stand-in is evaluation-only)",
+    )
+    eval_run.add_argument(
+        "--approval-timeout", type=int, default=3600, help="seconds to wait for each approval"
+    )
+    eval_run.add_argument(
+        "--build-timeout", type=int, default=7200, help="build seconds per factory trial"
+    )
+    eval_run.add_argument(
+        "--gate-reruns",
+        type=int,
+        default=1,
+        choices=range(0, 4),
+        metavar="0-3",
+        help="plain re-runs after a Design gate block, each counted (default 1)",
+    )
     eval_run.set_defaults(func=cmd_eval_run)
     eval_summary = eval_command.add_parser(
         "readiness-summary", help="emit public-safe 0.4.0 readiness evidence"

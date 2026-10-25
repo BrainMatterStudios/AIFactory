@@ -6,10 +6,20 @@ waives a gate, or promotes a release.
 
 from .arms import Arm, Attempt, SingleAgentArm, single_agent_prompt
 from .checks import CheckResult, EvidenceState, run_check
+from .factory_arm import FactoryArm, FactoryArmError, load_factory_template
 from .readiness import readiness_summary
 from .report import REPORT_SCHEMA_VERSION, build_report, summary_text
 from .run import EvaluationError, TrialRecord, run_suite, run_trial
-from .suite import SUITE_SCHEMA_VERSION, Check, SeededDefect, Suite, SuiteError, Task, load_suite
+from .suite import (
+    SUITE_SCHEMA_VERSION,
+    Check,
+    FactorySettings,
+    SeededDefect,
+    Suite,
+    SuiteError,
+    Task,
+    load_suite,
+)
 from .validate import TaskValidation, validate_suite
 
 __all__ = [
@@ -21,6 +31,9 @@ __all__ = [
     "CheckResult",
     "EvaluationError",
     "EvidenceState",
+    "FactoryArm",
+    "FactoryArmError",
+    "FactorySettings",
     "SeededDefect",
     "SingleAgentArm",
     "Suite",
@@ -29,6 +42,7 @@ __all__ = [
     "TaskValidation",
     "TrialRecord",
     "build_report",
+    "load_factory_template",
     "load_suite",
     "readiness_summary",
     "run_check",
