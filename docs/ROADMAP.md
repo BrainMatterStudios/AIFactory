@@ -12,13 +12,16 @@ gates and digest-bound approvals. That design suited weaker models. With
 current frontier models it is slow, and it is no longer used. The new
 direction:
 
-1. **Measure first.** Collect every agent session (Claude Code, Codex, CI),
-   find where agents struggle, and track throughput and SDLC KPIs. Build this
-   as a standalone analytics module in this repository: the factory's
-   self-improvement loop.
-2. **Then simplify, guided by the data.** One strong agent session per issue,
-   gates enforced by the platform (CI, branch rulesets, native agent
-   permissions), one independent review, and a human merge and deploy.
+1. **Go lean now.** Retire the 0.x machinery straight away, with no
+   head-to-head comparison (decided 2026-11-20). Build a lean factory: one
+   strong agent session per issue, gates enforced by the platform (CI, branch
+   rulesets, native agent permissions), one independent review, and a human
+   merge and deploy.
+2. **Measure in parallel.** Collect every agent session (Claude Code, Codex,
+   CI), find where agents struggle, and track throughput and SDLC KPIs. Build
+   this as a standalone analytics module in this repository: the factory's
+   self-improvement loop. The lean factory and analytics are built side by
+   side, and neither waits for the other.
 3. **Close the loop.** Weekly findings become small changes to the factory's
    configuration (CLAUDE.md, AGENTS.md, skills, hooks, settings), and the next
    weeks' data confirms or refutes each one.
@@ -41,26 +44,30 @@ direction:
 
 ## Sequence
 
-| Phase | Theme | Primary result | Exit criterion | Status |
-|---|---|---|---|---|
-| **0** | Stop the bleeding | Retention raised, telemetry on, history backed up, old roadmap frozen | Both machines exporting OTel to Grafana Cloud; local transcript history backed up | **Now (this week)** |
-| **A1** | Collect | Redacted transcripts from both machines and both agents land in the bucket every night | 14 consecutive days with ≥99% of sessions archived (reconciled against OTel `session.count`) | Next |
-| **A2** | Extract and join | Deterministic signals, Parquet/DuckDB store, session↔PR↔CI↔deploy joins, KPI dashboard | Dashboard shows the core KPIs for the last 30 days; 10 spot-checked joins correct | After A1 |
-| **A3** | Diagnose | Calibrated rubric pass (batch), weekly synthesis report and deduped issues | Rubric meets the calibration bar; 2 weekly reports produce ≥3 issues the team accepts | After A2 |
-| **F0** | Measure the old factory | Head-to-head: `factory build` versus one headless session on 5 real issues | Report on time, cost, human interventions and hidden-check pass rate per arm | Parallel with A3 |
-| **F1** | Lean factory v1 | One-session-per-issue dispatcher, platform gates, cross-vendor review, human merge | 2 weeks of real issues through it, with KPIs no worse than the manual baseline | After F0 |
-| **F2** | Retire the old machinery | Archive `build/`, `execution/`, `design/`, `contracts/`, `analyzers/`, `trace/` | `main` holds only kept modules plus analytics; tagged `v0.3-archive` | After F1 |
-| **F3** | Closed loop | Weekly proposals become config PRs, with each change's KPI effect tracked | 3 changes shipped with measured before/after | Ongoing |
+Two tracks run in parallel after phase 0. Week targets are approximate and
+come from scope estimates, not commitments.
+
+| Phase | Track | Theme | Primary result | Exit criterion | Target |
+|---|---|---|---|---|---|
+| **0** | — | Start | Retention raised, telemetry on, history backed up, `v0.3-archive` tagged | Both machines exporting OTel to Grafana Cloud | **This week** |
+| **L1** | Lean | Retire | Old machinery removed from `main`; slim CLI | `main` holds only kept modules; CI green | Week 1 |
+| **L2** | Lean | Lean factory v1 | One-session-per-issue dispatcher, platform gates, cross-vendor review, human merge | First 5 real issues through it end to end | Weeks 2–3 |
+| **A1** | Analytics | Collect | Redacted transcripts from both machines and both agents land in the bucket every night | 7 consecutive days with ≥99% of sessions archived (reconciled against OTel `session.count`) | Weeks 1–2 |
+| **A2** | Analytics | Extract and join | Deterministic signals, Parquet/DuckDB store, session↔PR↔CI↔deploy joins, KPI dashboard | Dashboard shows the core KPIs; 10 spot-checked joins correct | Weeks 2–4 |
+| **A3** | Analytics | Diagnose | Calibrated rubric pass (batch), weekly synthesis report and deduped issues | Rubric meets the calibration bar; first weekly report filed | Weeks 4–6 |
+| **L3** | Both | Closed loop | Weekly proposals become config PRs, with each change's KPI effect tracked | 3 changes shipped with measured before/after | From week 6, ongoing |
+
+Every session from day one is collected, including those run through the
+lean factory. The first weeks of data are therefore the lean factory's own
+baseline. No separate comparison against the old factory is planned.
 
 ## Phase 0: stop the bleeding (this week)
 
 - [ ] **Raise transcript retention now** on both machines: `cleanupPeriodDays`
       (the default deletes sessions after 30 days). Then copy
       `~/.claude/projects` and `~/.codex/sessions` to the bucket or an
-      encrypted disk as-is. The old factory's runs (`.factory-worktrees` paths)
-      are F0's audit data.
-- [ ] Back up the old factory's controller state (decision logs, spend ledger)
-      from both machines.
+      encrypted disk as-is. These are the history that the first analytics
+      runs work from.
 - [ ] Enable Claude Code OTel to Grafana Cloud through **Enterprise managed
       settings**, not a repo `.claude/settings.json`, where the variables are
       ignored. Turn on metrics and logs, set
@@ -72,8 +79,55 @@ direction:
 - [ ] Agree the privacy rules: redaction before storage, a client-repository
       exclusion list, mutual read access, and KPIs that are not a personal
       leaderboard.
-- [ ] Freeze the 0.x roadmap. Tag `v0.3-archive`. No new work on `build/`,
-      `execution/`, eval tooling, or 0.4+ briefs.
+- [ ] Tag `v0.3-archive` on the current `main`. That tag is the only copy of
+      the 0.x machinery after L1.
+- [ ] Set up the lean factory's bot identity: a GitHub App or fine-grained
+      token with contents and PR write access, no merge or admin rights.
+      Protect `main` with a ruleset that requires CI and a human approval.
+
+## L1: retire the old machinery (week 1)
+
+- In one PR, remove `build/`, `execution/`, `core/design/`,
+  `core/contracts/`, `core/approvals.py`, `analyzers/`, `trace/`, the persona
+  catalog, release readiness, and their tests and docs (including
+  `docs/superpowers/`).
+- Keep:
+  - `loop/` (verify, harvester, collectors, ratchet, security, spend);
+  - `adapters/`;
+  - `core/governance.py` (kill switch, budget, prod-ref ceiling);
+  - `core/publication.py` (secret and public-content scanner);
+  - `core/config.py`;
+  - `core/orchestrate/classify_tier`.
+- Slim `cli.py` to `init`, `doctor`, `observe`, `pickup`, `schedule`, and the
+  new `dispatch`.
+- Rewrite README and KNOWN_ISSUES for the new shape. Keep the candour, drop the
+  machinery history; the archive tag holds it.
+- Expected result: roughly 6 to 8K source lines, down from about 66K.
+
+## L2: lean factory v1 (weeks 2–3)
+
+- **Intake:** observe loops (production through the fleet agent, the factory
+  through analytics) file deduped issues. A human adds the `ready` label.
+- **Dispatch:** `factory dispatch` runs on the VPS through Dokploy, or as a
+  GitHub Action. It starts **one** agent session per ready issue in the
+  agent's native sandbox, with the bot identity's least-privilege
+  credentials. The agent plans, implements, runs tests, and opens a PR into
+  the dev branch. Claude Code headless is the default; Codex `exec` is a
+  configuration choice.
+- **Scope gate:** when `classify_tier` says "large feature", the agent posts a
+  short plan and waits for a human approval label. That is the only pause.
+- **Gates:**
+  - CI runs tests, lint, and the secret and public-content scan;
+  - one independent review by the other vendor's model, through the Claude
+    Code GitHub Action or Codex review;
+  - the `main` ruleset;
+  - the bot cannot merge, administer, or deploy.
+- **Release:** a human merges to `main` and triggers the Dokploy deploy. The
+  ceiling is unchanged.
+- **Telemetry from day one:** dispatched sessions export OTel and upload their
+  transcripts, so analytics sees them like any interactive session.
+- **Per-repository config:** CLAUDE.md, AGENTS.md, skills and hooks are the
+  factory's tunable surface, and the closed loop edits them.
 
 ## A1: Collect
 
@@ -145,50 +199,20 @@ direction:
     of creating a new one.
 - Weekly spot check: a human reads 5 random sessions against their tags.
 
-## F0: measure the old factory
+## L3: closed loop (from week 6)
 
-- Pick 5 recently closed issues with objective acceptance checks.
-- Arm 1 is `factory build` with `local_bundle` publication. Arm 2 is one
-  headless Claude Code or Codex session with the same model and `verify_cmd`.
-  Run 2 trials each, with telemetry on.
-- The analytics module produces the comparison. No new eval framework is
-  built. The 0.3.1 `factory eval` design is retired.
-
-## F1: lean factory v1
-
-- **Intake:** observe loops (production through the fleet agent, the factory
-  through analytics) file deduped issues. A human adds the `ready` label.
-- **Dispatch:** a small runner on the VPS, or a GitHub Action, starts **one**
-  agent session per ready issue in the agent's native sandbox, with
-  least-privilege credentials. The agent plans, implements, runs tests, and
-  opens a PR into the dev branch.
-- **Scope gate:** when `classify_tier` says "large feature", the agent posts a
-  short plan and waits for a human approval label. That is the only pause.
-- **Gates:**
-  - CI runs tests, lint, and the secret and public-content scan;
-  - one independent review by the other vendor's model;
-  - branch rulesets on `main`;
-  - the bot identity has no merge, admin, or deploy rights.
-- **Release:** a human merges to `main` and triggers the Dokploy deploy. The
-  ceiling is unchanged.
-- **Per-repository config:** CLAUDE.md, AGENTS.md, skills and hooks are the
-  factory's tunable surface, and the closed loop edits them.
-
-## F2: retire
-
-- Move archived modules and their tests to the `v0.3-archive` tag. Remove them
-  from `main` in one PR. Keep `loop/`, `adapters/`, `core/governance.py`,
-  `core/publication.py`, `core/orchestrate/classify_tier`, and the slimmed
-  CLI.
-- Rewrite README and KNOWN_ISSUES for the new shape. Keep the candour, drop the
-  machinery history.
+- Each accepted weekly proposal becomes a small config PR: CLAUDE.md,
+  AGENTS.md, a skill, a hook, a settings change, or a dispatcher tweak.
+- Each PR names the KPI it should move. The weekly report tracks before and
+  after for every shipped change, and reverts changes that don't help.
 
 ## Not doing (explicitly retired)
 
+- Any head-to-head comparison against the old factory (decided 2026-11-20).
 - 0.3.1 sandbox backend, `factory eval`, PyPI publication under a new name.
 - 0.4.0/0.4.1 quality obligations, exploratory tester, judge calibration.
 - 0.5.0 Review Canvas. 0.6.0 managed adoption. 0.7.0 governed evolution, now
-  replaced by F3. 0.8.0 portable knowledge.
+  replaced by L3. 0.8.0 portable knowledge.
 - The containment track (Lima, Leash, pnpm staging, graduated autonomy
   levels). Native agent sandboxes and platform permissions cover it.
 
@@ -201,6 +225,8 @@ lean design fails to handle.
    fidelity check.
 2. **Bucket provider and region.** Any S3-compatible store works. Pick one
    close to the VPS.
-3. **Codex in CI or dispatch?** It depends on F0 and on review-quality data.
+3. **Which vendor implements and which reviews?** Start with Claude Code
+   implementing and Codex reviewing. Revisit after 4 weeks of A2 data on
+   rework and first-pass CI.
 4. **Whether to keep the repository public.** The analytics module and rubric
    are fine to publish. Transcripts and derived data never are.
