@@ -52,7 +52,7 @@ come from scope estimates, not commitments.
 | **0** | — | Start | Retention raised, telemetry on, history backed up, `v0.3-archive` branch created | Both machines exporting OTel to Grafana Cloud | **This week** |
 | **L1** | Lean | Retire | Old machinery removed from `main`; slim CLI | `main` holds only kept modules; CI green | **Done on branch, awaiting merge** |
 | **L2** | Lean | Lean factory v1 | One-session-per-issue dispatcher, platform gates, cross-vendor review, human merge | First 5 real issues through it end to end | **In progress:** `factory dispatch` built |
-| **A1** | Analytics | Collect | Redacted transcripts from both machines and both agents land in the bucket every night | 7 consecutive days with ≥99% of sessions archived (reconciled against OTel `session.count`) | Weeks 1–2 |
+| **A1** | Analytics | Collect | Redacted transcripts from both machines and both agents land in the bucket every night | 7 consecutive days with ≥99% of sessions archived (reconciled against OTel `session.count`) | **In progress:** collector built (`insights/`) |
 | **A2** | Analytics | Extract and join | Deterministic signals, Parquet/DuckDB store, session↔PR↔CI↔deploy joins, KPI dashboard | Dashboard shows the core KPIs; 10 spot-checked joins correct | Weeks 2–4 |
 | **A3** | Analytics | Diagnose | Calibrated rubric pass (batch), weekly synthesis report and deduped issues | Rubric meets the calibration bar; first weekly report filed | Weeks 4–6 |
 | **L3** | Both | Closed loop | Weekly proposals become config PRs, with each change's KPI effect tracked | 3 changes shipped with measured before/after | From week 6, ongoing |
@@ -104,10 +104,8 @@ baseline. No separate comparison against the old factory is planned.
 - Rewrite README and KNOWN_ISSUES for the new shape. Keep the candour, drop the
   machinery history; the archive branch holds it.
 - Expected result: roughly 6 to 8K source lines, down from about 66K.
-- Follow-up after the L1 PR merges: remove the retired security-control
-  exemptions from `public-content-policy.json` and `core/publication.py`. They
-  stay until then because the PR's history-range scan still sees the deleted
-  files in earlier commits.
+- Done after the L1 merge: the retired security-control exemptions were
+  removed from `public-content-policy.json` and `core/publication.py`.
 
 ## L2: lean factory v1 (weeks 2–3)
 
@@ -139,6 +137,14 @@ real git. Remaining: deploy it on the VPS, the `main` ruleset and bot identity
   factory's tunable surface, and the closed loop edits them.
 
 ## A1: Collect
+
+**Status (2026-11-21):** decided: Cloudflare R2, with machine sync as the
+primary source and the Compliance API as a backfill and weekly completeness
+check. The collector (`insights/`, `aif-insights collect`) is built and tested
+on real Claude Code transcripts: discovery including subagents, redaction,
+per-session index, append-only upload. Remaining: the R2 bucket and tokens,
+installing it on both laptops and the VPS, verifying the Codex parser on a real
+file, the Compliance API backfill, and the reconciliation job.
 
 - Package `insights/` (Python `aif_insights`, its own `pyproject.toml` in a uv
   workspace). It must **not** import `software_factory`, enforced by an
@@ -230,10 +236,10 @@ lean design fails to handle.
 
 ## Open decisions
 
-1. **Compliance API or laptop sync for Claude Code.** Decide after the A1
-   fidelity check.
-2. **Bucket provider and region.** Any S3-compatible store works. Pick one
-   close to the VPS.
+1. ~~Compliance API or laptop sync for Claude Code.~~ Decided 2026-11-21:
+   machine sync is primary; the Compliance API backfills older history and
+   checks completeness weekly.
+2. ~~Bucket provider.~~ Decided 2026-11-21: Cloudflare R2.
 3. **Which vendor implements and which reviews?** Start with Claude Code
    implementing and Codex reviewing. Revisit after 4 weeks of A2 data on
    rework and first-pass CI.
