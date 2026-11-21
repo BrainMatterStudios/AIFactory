@@ -17,7 +17,7 @@ The lean-factory reset. See `docs/REVIEW-2026-11.md` and `docs/ROADMAP.md`.
   `core/contracts/`, `core/personas/` and `core/rubrics/` packages;
   `core/approvals.py`, `loop/spend.py`, the judge-verdict helpers
   (`combine`, `decide_restart`), and the optional Lima/Leash adapter. The code
-  is preserved in the `v0.3-archive` tag.
+  is preserved in the `v0.3-archive` branch.
 - The `workspace` adapter kind and the `aifactory-execution-bridge` and
   `aifactory-validation-cell-guest` entry points.
 - `governance.eval_gate_path` and the `personas:` manifest block.

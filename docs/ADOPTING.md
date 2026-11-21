@@ -17,7 +17,7 @@ session per issue** (Claude Code or Codex), working in its own sandbox, opening 
 PR into your dev branch. CI, one independent review and a human merge stand
 between that PR and production. There are no persona panels, contracts or
 digest approvals; the 0.x machinery that did that is retired and preserved
-only in the `v0.3-archive` tag.
+only in the `v0.3-archive` branch.
 
 ---
 

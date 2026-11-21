@@ -9,7 +9,7 @@ Honest status, by subsystem. Read this before you rely on anything here.
 The 0.x autonomous builder (`factory build`) and everything that supported it
 (persona catalog, judge panels, Contract v2, Design IR, digest approvals,
 analyzers, decision log, Lima/Leash validation cells) were removed in November
-2026. They are preserved in the `v0.3-archive` tag. That builder never ran in
+2026. They are preserved in the `v0.3-archive` branch. That builder never ran in
 production, and successive adversarial review rounds kept finding defects in
 it. See [docs/REVIEW-2026-11.md](docs/REVIEW-2026-11.md).
 

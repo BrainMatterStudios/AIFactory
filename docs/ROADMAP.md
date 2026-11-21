@@ -49,7 +49,7 @@ come from scope estimates, not commitments.
 
 | Phase | Track | Theme | Primary result | Exit criterion | Target |
 |---|---|---|---|---|---|
-| **0** | — | Start | Retention raised, telemetry on, history backed up, `v0.3-archive` tagged | Both machines exporting OTel to Grafana Cloud | **This week** |
+| **0** | — | Start | Retention raised, telemetry on, history backed up, `v0.3-archive` branch created | Both machines exporting OTel to Grafana Cloud | **This week** |
 | **L1** | Lean | Retire | Old machinery removed from `main`; slim CLI | `main` holds only kept modules; CI green | **Done on branch, awaiting merge** |
 | **L2** | Lean | Lean factory v1 | One-session-per-issue dispatcher, platform gates, cross-vendor review, human merge | First 5 real issues through it end to end | **In progress:** `factory dispatch` built |
 | **A1** | Analytics | Collect | Redacted transcripts from both machines and both agents land in the bucket every night | 7 consecutive days with ≥99% of sessions archived (reconciled against OTel `session.count`) | Weeks 1–2 |
@@ -79,8 +79,9 @@ baseline. No separate comparison against the old factory is planned.
 - [ ] Agree the privacy rules: redaction before storage, a client-repository
       exclusion list, mutual read access, and KPIs that are not a personal
       leaderboard.
-- [ ] Tag `v0.3-archive` on the current `main`. That tag is the only copy of
-      the 0.x machinery after L1.
+- [x] Create the `v0.3-archive` branch at `main` (`00fe2d1`), done
+      2026-11-21. It is the only copy of the 0.x machinery after L1. Consider
+      protecting it so it cannot be deleted or force-pushed.
 - [ ] Set up the lean factory's bot identity: a GitHub App or fine-grained
       token with contents and PR write access, no merge or admin rights.
       Protect `main` with a ruleset that requires CI and a human approval.
@@ -101,7 +102,7 @@ baseline. No separate comparison against the old factory is planned.
 - Slim `cli.py` to `init`, `doctor`, `observe`, `pickup`, `schedule`, and the
   new `dispatch`.
 - Rewrite README and KNOWN_ISSUES for the new shape. Keep the candour, drop the
-  machinery history; the archive tag holds it.
+  machinery history; the archive branch holds it.
 - Expected result: roughly 6 to 8K source lines, down from about 66K.
 - Follow-up after the L1 PR merges: remove the retired security-control
   exemptions from `public-content-policy.json` and `core/publication.py`. They

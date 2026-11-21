@@ -16,7 +16,7 @@ cd ~/my-project && factory init && factory doctor && factory demo
 **Status:** 0.4.0.dev0, being rebuilt. The 0.x autonomous builder (persona
 teams, judge panels, Contract v2, Design IR, digest approvals, Lima/Leash
 validation cells) was retired in November 2026 because it was too slow with
-current frontier models. It is preserved in the `v0.3-archive` tag. See
+current frontier models. It is preserved in the `v0.3-archive` branch. See
 [docs/REVIEW-2026-11.md](docs/REVIEW-2026-11.md) for why and
 [docs/ROADMAP.md](docs/ROADMAP.md) for what comes next.
 
@@ -127,6 +127,6 @@ collectors and ratchets, and the governance rails are generalized from a
 production factory (ElBasket `TheScraperEngine`). The single-session build
 model replaces an autonomous builder that never reached production; its full
 history, including eight adversarial review rounds, is in the `v0.3-archive`
-tag.
+branch.
 
 Apache-2.0. Maintainer: BrainMatterStudios.
