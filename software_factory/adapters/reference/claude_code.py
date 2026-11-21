@@ -1,8 +1,7 @@
 """Claude Code runner adapter (reference) — spawns a headless agent via the
 `claude` CLI.
 
-The doctrine's tier→model policy is applied by the orchestrator; this adapter
-just runs one agent turn at the requested model. When the caller passes a tool
+The dispatcher runs one agent session per issue at the configured model. When the caller passes a tool
 list it is forwarded as `--allowedTools`; on top of that, every turn carries a
 default deny list for the release verbs, so the ceiling reaches the agent process
 and not only the loop that spawned it.
@@ -11,30 +10,23 @@ from __future__ import annotations
 
 import subprocess
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from software_factory.adapters.base import RunResult
 from software_factory.adapters.registry import register
 
-if TYPE_CHECKING:
-    from software_factory.core.design.capabilities import (
-        CapabilityObservation,
-        RunnerCapabilityDeclaration,
-    )
-
 # Default tier→model mapping (overridable in the manifest). These are the
 # doctrine's model tiers; concrete IDs live in config so they track new releases.
 DEFAULT_MODELS = {
-    "opus": "claude-opus-5",
-    "sonnet": "claude-sonnet-5",
-    "haiku": "claude-haiku-4-5-20251001",
+    "opus": "claude-opus-5-5",
+    "sonnet": "claude-sonnet-5-5",
+    "haiku": "claude-haiku-5-5",
 }
 
 #: Refused on every turn, worker and judge alike. The loop's own ceiling stops
 #: *loop* code from merging or deploying; it says nothing about the agent, which
 #: is a separate process with its own shell. These are the verbs that cross the
-#: production boundary. The loop pushes its branch itself, via the workspace, so
-#: denying the agent them costs the build nothing.
+#: production boundary.
 #:
 #: This narrows the blast radius; it does not seal it. A determined agent can
 #: reach the same effect through a script or an unmatched invocation, and pattern
@@ -75,29 +67,6 @@ class ClaudeCodeRunner:
     def resolve_model(self, model: str) -> str:
         # Accept either a tier name ("opus") or a concrete id.
         return self.models.get(model, model)
-
-    def capability_declaration(self) -> RunnerCapabilityDeclaration:
-        """Declare no controller guarantees: deny patterns are not a sandbox."""
-        from software_factory.core.design.capabilities import RunnerCapabilityDeclaration
-
-        return RunnerCapabilityDeclaration(
-            schema_version="runner-capability-v1",
-            source="claude_code",
-            capabilities=frozenset(),
-        )
-
-    def observe_capabilities(
-        self, *, workspace_path: str, repo_root: str
-    ) -> CapabilityObservation:
-        from software_factory.core.design.capabilities import CapabilityObservation
-
-        del workspace_path, repo_root
-        return CapabilityObservation(
-            schema_version="capability-observation-v1",
-            source="claude_code",
-            confirmed=frozenset(),
-            failed=frozenset(),
-        )
 
     def run_agent(self, prompt, *, model, system=None, tools=None, cwd=None) -> RunResult:
         model_id = self.resolve_model(model)

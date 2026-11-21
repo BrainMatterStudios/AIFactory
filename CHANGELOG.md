@@ -6,21 +6,36 @@ project uses semantic versioning.
 
 ## [Unreleased]
 
-### Fixed
+The lean-factory reset. See `docs/REVIEW-2026-11.md` and `docs/ROADMAP.md`.
 
-- The harness analyzer no longer blocks the Design gate on ordinary macOS APFS
-  volumes. When a file cannot be opened without updating its access time, the
-  analyzer reads a copy-on-write clone taken from the pinned descriptor in
-  controller scratch space outside the workspace, removes the clone, and
-  re-verifies the original's access time. Every clone failure still produces
-  the existing high-security fail-closed finding.
-- `factory analyze` and `factory capabilities` name the failed precondition
-  (an unloadable manifest, the scaffold placeholder repository, a missing
-  repository identity, or an analyzer that is not configured) instead of a
-  generic "inspection is invalid" message.
-- Harness findings show their own message and required change. Analyzer text is
-  shown only when it exactly matches a fixed sentence the harness analyzer
-  writes; all other analyzer text stays redacted.
+### Removed
+
+- The 0.x autonomous builder and everything that supported it: `factory build`,
+  `approve`, `revise`, `design`, `analyze`, `capabilities`, `evidence`,
+  `release readiness`, `status`, `personas`, and the validation-cell commands;
+  the `build/`, `execution/`, `analyzers/`, `trace/`, `core/design/`,
+  `core/contracts/`, `core/personas/` and `core/rubrics/` packages;
+  `core/approvals.py`, `loop/spend.py`, the judge-verdict helpers
+  (`combine`, `decide_restart`), and the optional Lima/Leash adapter. The code
+  is preserved in the `v0.3-archive` tag.
+- The `workspace` adapter kind and the `aifactory-execution-bridge` and
+  `aifactory-validation-cell-guest` entry points.
+- `governance.eval_gate_path` and the `personas:` manifest block.
+- The 0.3.1–0.8.0 roadmap, its design briefs and implementation plans, the
+  0.2.0/0.3.0 release notes, and `docs/MODEL_TIERING.md`.
+
+### Changed
+
+- `core/doctrine.md` is now the brief for one agent session per issue: size the
+  work, plan/implement/test in one session, open a PR. A T2 feature waits for
+  human scope approval; there are no persona teams, judge panels, or digest
+  approvals.
+- Retired `factory.build` keys (`design_protocol`, `review_protocol`,
+  `require_contract`, `max_revise`, and the rest) are ignored with a
+  deprecation warning, so older manifests still load for observe and pickup.
+- The content allowlist accepts only the synthetic test fixture.
+- Default Claude model ids are `claude-opus-5-5`, `claude-sonnet-5-5`, and
+  `claude-haiku-5-5`.
 
 ### Added
 
@@ -81,7 +96,7 @@ project uses semantic versioning.
 - Status is a linearizable "as observed" read-only projection, not a repository
   snapshot or cooperative lock.
 
-See the [0.3.0 release notes](docs/releases/0.3.0.md) for the complete lifecycle,
+See the [0.3.0 release notes](https://github.com/BrainMatterStudios/AIFactory/blob/v0.3-archive/docs/releases/0.3.0.md) for the complete lifecycle,
 migration procedure, threat model, and non-claims.
 
 ## [0.2.0] - 2026-08-09
@@ -142,8 +157,8 @@ migration procedure, threat model, and non-claims.
   structured intent improves software. The autonomous builder remains
   experimental and should not be run unattended on important repositories.
 
-See the [0.2.0 release notes](docs/releases/0.2.0.md) for migration guidance,
+See the [0.2.0 release notes](https://github.com/BrainMatterStudios/AIFactory/blob/v0.3-archive/docs/releases/0.2.0.md) for migration guidance,
 the threat model, and the complete operating limits.
 
-[0.2.0]: docs/releases/0.2.0.md
-[0.3.0]: docs/releases/0.3.0.md
+[0.2.0]: https://github.com/BrainMatterStudios/AIFactory/blob/v0.3-archive/docs/releases/0.2.0.md
+[0.3.0]: https://github.com/BrainMatterStudios/AIFactory/blob/v0.3-archive/docs/releases/0.3.0.md

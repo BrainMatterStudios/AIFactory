@@ -15,22 +15,10 @@ authorizes any later shared-state action.
   each against the implementation rather than carrying forward a prior
   release's feature list.
 
-## Roadmap entry preflight
-
-- [ ] For a roadmap-gated release, run the release-specific entry preflight
-  before writing the detailed design. For 0.4.0, run
-  `factory release readiness 0.4.0 --json` first; if private retained evidence
-  exists, rerun with the redacted public-safe evidence summary described in the
-  operating guide.
-- [ ] Treat the preflight as an entry check, not a release approval. A ready
-  0.4.0 preflight means the detailed design may be written and reviewed; it does
-  not authorize a version bump, push, pull request, merge, tag, GitHub release,
-  registry publication, deployment, or any production write.
-
 ## Verification and packaging
 
-- [ ] Run selected authority, migration, adversarial, and end-to-end tests;
-  record the command, exact pass/skip/fail counts, and candidate `HEAD`.
+- [ ] Run the full test suite; record the command, exact pass/skip/fail
+  counts, and candidate `HEAD`.
 - [ ] Run the complete documented local CI from a clean environment and record
   every job, exit code, and exact test count.
 - [ ] Run the repository-pinned Ruff version and `git diff --check`.
@@ -40,12 +28,9 @@ authorizes any later shared-state action.
 - [ ] Install the wheel without extras in a clean environment. Confirm the core
   imports and `factory version` work with zero third-party runtime dependencies;
   then test each documented optional extra separately where applicable.
-- [ ] Exercise current CLI examples, exact Contract and Design approvals,
-  Design gate replay, and the documented status exit taxonomy in a temporary
-  synthetic repository with external temporary controller state.
-- [ ] Exercise the explicit migration preview, capability/analyzer validation,
-  new-parent opt-in, sticky-parent behavior, and later-new-parent rollback. Prove
-  legacy and Design records remain readable and unmodified.
+- [ ] Exercise the current CLI examples (`init`, `doctor`, `demo`, `observe`,
+  `pickup`, `schedule`) and the documented exit codes in a temporary synthetic
+  repository.
 
 ## Public boundary and provenance
 
@@ -69,13 +54,9 @@ authorizes any later shared-state action.
 
 - [ ] Reconcile the release note, README, adoption guide, operating guide,
   security model, and known limits with the exact candidate behavior.
-- [ ] Confirm schema correctness is not claimed as semantic correctness;
-  analyzer false positives/negatives, installed-code trust, process and storage
-  non-sandbox limits, local approval identity, status observation semantics,
-  platform constraints, and the experimental builder warning are explicit.
-- [ ] Confirm migration is opt-in per new Contract parent, no auto-migration is
-  implied, and rollback does not rewrite sticky in-progress workflows or erase
-  prior records.
+- [ ] Confirm the known limits are explicit: scanners are backstops, the
+  runner deny list is not a sandbox, and the ceiling depends on server-side
+  branch protection and least-privilege credentials.
 - [ ] Verify the hosting provider has effective protected production refs with
   required checks and review. A manifest flag or `factory doctor` output is not
   server-side evidence.

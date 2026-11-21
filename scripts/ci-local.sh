@@ -201,7 +201,7 @@ if run_job test; then
   if "$VENV/bin/python" -m pytest -q; then pass "pytest"; else fail "pytest"; fi
   # CI runs the suite on several interpreters and a whole-suite pass can hide an
   # import cycle that only bites a cold single-file run.
-  if "$VENV/bin/python" -m pytest -q tests/test_judge_blockers.py >/dev/null 2>&1; then
+  if "$VENV/bin/python" -m pytest -q tests/test_cli.py >/dev/null 2>&1; then
     pass "single-file run"
   else
     fail "single-file run (likely an import cycle)"
@@ -210,7 +210,6 @@ fi
 
 if run_job policy; then
   say "job: policy"
-  if "$VENV/bin/python" -m software_factory.cli personas >/dev/null; then pass "tier policy + persona drift"; else fail "tier policy"; fi
   if "$VENV/bin/python" -m software_factory.cli demo >/dev/null; then pass "offline loop"; else fail "offline loop"; fi
 fi
 
@@ -239,7 +238,7 @@ if run_job no-hard-deps; then
 import importlib.util, sys
 if importlib.util.find_spec("yaml") is not None:
     sys.exit("PyYAML is present; this job must run bare")
-from software_factory.core.orchestrate import classify_tier, combine   # noqa: F401
+from software_factory.core.orchestrate import classify_tier           # noqa: F401
 from software_factory.loop.verify import scan_logs                     # noqa: F401
 from software_factory.loop.harvester import harvest                    # noqa: F401
 PY

@@ -10,34 +10,14 @@ gets done and confirmed. Nobody can write the checks for you.
 
 ---
 
-## Before you start: which path you are on
+## Before you start: how the fix gets built
 
-The package supports two ways of building the fix, and they are not equal.
-
-| | **Doctrine path** *(recommended)* | **`factory build`** *(experimental)* |
-|---|---|---|
-| Who writes the code | An agent session you drive | An unattended process |
-| Who manages git | Your agent tool | The package |
-| Provenance | How the origin factory actually runs, and where its results come from | Written for this release, no production behind it |
-| Use it when | Now | You are experimenting, and read [KNOWN_ISSUES.md](../KNOWN_ISSUES.md) first |
-
-Both share observing, queueing, tier rules, and the production ceiling. The
-human-supervised doctrine uses an independent judge under operator control. The
-experimental autonomous path adds the architecture-first controller: Contract
-v2, a sticky per-parent workflow protocol, Design IR v1, conservative
-capabilities, bounded analyzer evidence, exact approvals, findings-only model
-sensors, and deterministic disposition.
-
-This guide assumes the doctrine path. §6 covers the other one.
-
-> **macOS and the required harness analyzer:** new configurations require the
-> harness analyzer, which must not change any file's access time. On APFS the
-> analyzer reads a copy-on-write clone and verifies the original is untouched.
-> Where cloning is unavailable, such as a non-APFS external volume, any present
-> supported harness file still produces fail-closed high-security evidence and
-> blocks the Design gate. The 0.3.0 release has no clone path. Preview first
-> with `factory analyze harness`; making the required analyzer optional does not
-> preserve the scaffold's Design-authority guarantees.
+The factory observes, diagnoses and queues. The fix is built by **one agent
+session per issue** (Claude Code or Codex), working in its own sandbox, opening a
+PR into your dev branch. CI, one independent review and a human merge stand
+between that PR and production. There are no persona panels, contracts or
+digest approvals; the 0.x machinery that did that is retired and preserved
+only in the `v0.3-archive` tag.
 
 ---
 
@@ -67,9 +47,8 @@ factory doctor        # validates it
 
 `doctor` is a real pre-flight, not a banner. It will refuse a scaffold
 placeholder repo, tell you when `verify_cmd` names a binary that is not on your
-PATH, check every adapter actually constructs, verify the persona catalog has not
-drifted, and confirm the model-tier floor is intact. Get it to `healthy` before
-continuing.
+PATH, check every adapter actually constructs, and refuse a dev branch the ceiling
+treats as production. Get it to `healthy` before continuing.
 
 The manifest is the only thing that lives in your project. Every stack-specific
 value is in it; nothing is templated into the source. Full reference with
@@ -87,15 +66,8 @@ The fields worth thinking about:
 
 ```yaml
 build:
-  dev_branch: develop        # the ONLY base the loop may target. Must exist LOCALLY.
+  dev_branch: develop        # the ONLY base agent PRs may target
   verify_cmd: "pytest -q"    # YOUR gate. Must be runnable and must actually fail on bad code.
-  require_contract: true     # current guidance: freeze Contract v2 before code
-  review_protocol: findings_v2
-  design_protocol: design_ir_v1
-  design_author_role: design-author
-  design_analyzers:
-    - name: harness
-      required: true
 
 governance:
   prod_refs: [main, release] # ADDS to main/master/production/prod — never replaces
@@ -104,45 +76,6 @@ governance:
 `verify_cmd` is load-bearing. It is the objective gate between an agent's opinion
 that the work is done and the work actually being done. If your test suite does
 not fail on broken code, the factory inherits that.
-
-Before opting in, use the read-only inspection surface:
-
-```bash
-factory doctor
-factory design validate <file>
-factory design gate <file>
-factory analyze <adapter>
-factory capabilities
-factory status [issue]
-```
-
-The four Design inspection commands and `status` accept `--json`. None repairs,
-approves, migrates, refreshes, or stores evidence. `doctor` reports the active
-protocol, analyzer requirements, controller separation, and capability gaps
-without invoking models or analyzers. Exit `0` means a successful passing
-inspection (or ready/degraded/complete status), `1` means a runtime/authority or
-non-pass result, and `2` means invalid invocation, input, or configuration.
-
-Capability names are guarantees, not requested tools:
-
-| Capability | Meaning |
-|---|---|
-| `isolated_worktree` | implementation runs on an isolated repository surface |
-| `approval_pause` | the runner can stop and resume around external approval |
-| `controller_state_separation` | authority state is outside runner-writable worktrees |
-| `artifact_fingerprinting` | exact repository surfaces can be observed and rebound |
-| `bounded_writable_paths` | runner writes are confined to declared paths |
-| `analyzer_evidence` | configured analyzers can produce bounded evidence |
-| `objective_verification` | a non-model verification command is enforced |
-| `credential_scan` | produced content receives the objective credential scan |
-| `merge_forbidden` / `deployment_forbidden` | the lifecycle does not grant those actions |
-
-Trusted adapter code declares capabilities; runtime observation may confirm or
-remove them, never add an undeclared guarantee. `factory capabilities` reports
-declared, confirmed, failed, effective, required, missing, and unverifiable sets.
-The reference Echo runner declares only merge/deployment prohibition. The
-reference Claude Code runner declares none because command deny patterns are not
-a sandbox.
 
 ---
 
@@ -251,232 +184,44 @@ right several times.
 
 ---
 
-## 5. Building the fix: the doctrine path
-
-This is how the origin factory actually operates.
+## 5. Building the fix: one agent session
 
 ```bash
 factory pickup      # prints the next Ready issue, highest priority first
 ```
 
-Then open an agent session in your repo and give it the doctrine plus the issue.
-With Claude Code, the shape is:
+Give that issue to one agent session in your repository, interactively or
+headless. The [doctrine](../software_factory/core/doctrine.md) is the short
+brief for that session:
 
-```
-Follow the orchestration doctrine in
-$(python3 -c "import software_factory.core, pathlib; print(pathlib.Path(software_factory.core.__file__).parent / 'doctrine.md')")
+1. **Read the issue in full**, including its Expected outcome field.
+2. **Size it** with `classify_tier`. A large feature posts a short plan as an
+   issue comment and waits for a human to approve scope. Everything else
+   proceeds.
+3. **Plan, implement and test in the same session**, failing test first,
+   until `verify_cmd` passes.
+4. **Open a PR into the dev branch.** Never merge, tag, release or deploy.
 
-Work issue #42. Read it in full first — note its Expected outcome field.
-```
+CI runs the tests and the secret and public-content scan. One review from a
+different model (for example Codex reviewing Claude Code's PR) adds an
+independent read. A human merges to `main` and deploys.
 
-The doctrine ([`core/doctrine.md`](../software_factory/core/doctrine.md)) tells
-the agent to:
+### Make the agent's environment do the enforcing
 
-1. **Classify the tier** — T0 trivial, T1 standard, T2 complex — using
-   `classify_tier`, a pure function. It is a *floor*: the agent may size up and
-   must say why; it may never silently size down.
-2. **Form a proportional team** from the persona catalog, at the model tier each
-   role requires. Judges and the security veto are on the frontier floor and
-   cannot be downgraded — `factory doctor` fails if someone edits that away.
-3. **Do the work**, failing-test-first, against the issue's expected outcome.
-4. **Submit to an independent judge** — always a different agent from the ones
-   that did the work. `combine()` applies the verdict rules: PASS finalises,
-   REVISE returns with required changes (capped at 2), BLOCK escalates to you.
-5. **Stop at the ceiling.** Open a PR into your dev branch. Never merge to prod,
-   never deploy.
+The agent should be unable, not merely told not, to cross the ceiling:
 
-**A T2 feature stops after planning and waits for you.** That is the second human
-gate, upstream of the prod boundary, and it exists because scope is a human
-decision.
+- protect `main` with a ruleset that requires CI and a human approval;
+- give the agent a token or GitHub App that cannot merge, administer or deploy;
+- deny the release verbs in the agent's own permission settings
+  (`git push` to protected refs, `gh pr merge`, `gh release`);
+- run it in the agent's native sandbox with least-privilege credentials.
 
-### Why a session rather than a script
-
-You are in the loop at the two moments that matter — approving scope on a T2, and
-approving the release — and out of it for everything else. The agent tool already
-handles worktrees, diffs and commits well; the doctrine supplies the discipline
-those tools lack.
-
-### Verify the judge is real
-
-The most common way this degrades is the judging becoming ceremonial. Two things
-to watch:
-
-- **The judge must be a different agent instance from the worker.** A worker
-  reviewing its own output is checking whether it did what it decided to do.
-- **The security veto is a separate channel.** `security_block=True` must be read
-  from the judge's structured output explicitly, never inferred from it also
-  saying BLOCK. A vote that can be outvoted is not a veto.
+If you find yourself reviewing every diff line by line, strengthen those gates
+and the tests rather than adding reviewers.
 
 ---
 
-## 6. The other path: `factory build`
-
-```bash
-factory build 42     # EXPERIMENTAL
-```
-
-A narrower controller-driven loop, with no human supervising each agent turn. It
-uses this lifecycle for an adopted T2 Design workflow:
-
-```text
-issue -> isolated worktree -> Contract-only author turn
-      -> deterministic intent gate -> frozen Contract v2 checkpoint
-      -> sticky protocol -> capability preflight -> Design IR v1
-      -> bounded analyzers -> deterministic Design gate
-      -> exact Design-and-parent approval
-      -> implementation -> objective verify_cmd
-      -> findings_v2 model sensors -> deterministic disposition
-      -> reverify -> refreshed Design gate -> objective secret scan
-      -> publication replay -> PR into the development branch
-```
-
-An unresolved blocking ambiguity returns `SPEC_PENDING`; no implementer runs.
-A human-owned irreversible choice returns `APPROVAL_PENDING` with the exact
-Contract digest. Design authoring happens only after intent and capability
-preflight pass; the Design is bound to its own digest, parent Contract,
-configuration, capabilities, repository fingerprint, and analyzer evidence.
-Compatibility-mode parents retain the parent-bound plan path. Labels do not
-grant authority.
-
-When a contract needs human authority, the controller persists its exact text,
-document, digest, repository/issue identity, and policy version as **pending**.
-On the next build it materializes those same bytes into the fresh worktree and
-re-runs validation, intent policy, and the current approval lookup without
-dispatching the contract author again. A matching approval lets the controller
-checkpoint the contract and atomically promote the pending record to
-**accepted**.
-
-Accepted does not mean “approved forever.” Every resume re-checks the exact
-approval. Removing the approval record returns the same accepted digest as
-`APPROVAL_PENDING`; atomically replacing the approval with a different digest is
-a mismatch and blocks. The accepted contract record remains the artifact being
-checked until a stopped, audited manual state procedure replaces that lifecycle
-state. Do not edit pending or accepted JSON in place: descriptor, inode, identity,
-and digest checks block invalid or corrupt records, and a file replacement while
-a run is active is detected and blocks.
-
-The build prints a copyable command. It assumes Git provides `user.email` or
-`user.name`; if neither is configured, add `--approver <operator-identity>`.
-These equivalent examples contain only deliberately synthetic values:
-
-```bash
-factory approve contract demo-42 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-  --approver demo-operator --reason "synthetic intent review"
-
-factory approve plan demo-42 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
-  --parent aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-  --approver demo-operator --reason "synthetic plan review"
-
-factory approve design demo-42 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
-  --parent aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-  --approver demo-operator --reason "synthetic design review"
-```
-
-Plan and Design commands require the exact parent digest. Any changed, stale, missing,
-unreadable, corrupt, or wrong-parent approval fails closed. Manifest
-`factory.build.state_dir` selects approval/decision storage first; when absent,
-`FACTORY_STATE_DIR` is used, then the controller default. That location must be
-outside the repository and every registered worktree. Exact pending/accepted
-contract records and contract-bound plan envelopes are separate controller-owned
-local state under the canonical checkout's ignored `.factory` directory, not the
-disposable agent worktree.
-
-The build's last content check is a high-signal secret scan over the Git blobs it
-would propose. It does not run the full public-content scanner. Hosted/local CI
-and the release process separately run the current-tree and history-range policy
-from [PUBLIC_CONTENT_POLICY.md](PUBLIC_CONTENT_POLICY.md).
-
-Review models use `findings_v2`: they report typed observations and evidence
-locations but cannot author the final disposition. The controller freezes each
-report against the reviewed artifact fingerprint and applies pinned routing
-rules. A finding override must be a decision event bound to the exact fingerprint
-and finding ID, with operator authority and rationale. It is not a manifest flag,
-and the contract/plan approval command does not override a review finding.
-
-Read [KNOWN_ISSUES.md](../KNOWN_ISSUES.md) before you use it. Eight adversarial
-review panels have examined this subsystem and each found real defects; they are
-fixed and pinned by tests, but it has never run unattended against a real
-repository for a sustained period. It is the only part of this package with no
-production behind it.
-
-If you do try it: your `dev_branch` must exist **locally** (nothing here fetches),
-one build runs per repo at a time, budget caps only bind if your runner reports a
-finite cost, and controller state needs a tested backup. Directory separation
-alone does not isolate state from an unrestricted runner; sandbox the runner and
-give it least-privilege credentials.
-
-## 7. Migrating an existing project to Design IR v1
-
-Migration is explicit and applies only to a new exact Contract parent. There is
-no automatic migration, and `doctor` never rewrites the manifest.
-
-1. **Preview:** run `factory doctor`, `factory capabilities`, and each configured
-   `factory analyze <adapter>` against the intended environment. A missing
-   `design_protocol` selects `legacy_plan` and emits one actionable warning.
-2. **Validate:** resolve every missing or unverifiable capability and every
-   required analyzer failure. If the harness analyzer reports that a file cannot
-   be read without metadata mutation, move the project to an APFS volume or a
-   verifiable no-atime volume/environment. Metadata restoration is not a safe
-   workaround because it is another mutation.
-3. **Opt in a new parent:** select `design_ir_v1`, author a new exact Contract,
-   and follow the real Design/gate/approval lifecycle. The recorded protocol is
-   sticky for that repository, issue, and parent digest.
-4. **Rollback for later work:** restore `legacy_plan` only before creating a
-   later new Contract parent. The already selected parent stays Design IR; an
-   existing legacy parent stays legacy. Old Plan, Design, gate, approval, and
-   decision records remain readable and are not erased or converted.
-
-A legacy plan approval never becomes a Design approval. Disabling a required
-analyzer may change configured policy, but does not preserve the released Design
-authority and must not be described as a compatibility fix.
-
-A parseable JSON object that fails Design IR v1 schema validation receives at
-most one corrective author turn. The controller supplies only bounded diagnostic
-codes plus the authoritative schema and Contract; it does not preserve or echo
-the rejected object. Both turns are metered and pass through the configured
-budget guard. Syntactically invalid JSON is not retried, and a second schema
-failure remains blocked.
-
-### Contract migration
-
-Contract v1 is readable during v0.x but deprecated; it emits migration evidence
-and is not current authoring guidance. For Contract v2:
-
-1. Set `schema_version` to `2` and remove `approved_git_rev`.
-2. Add `intent` with scope, non-goals, risk flags, ambiguities, invariants,
-   failure modes, irreversible operations, and exact dependency pins.
-3. Give every child a stable unique ID and make criteria cover every invariant
-   and irreversible operation.
-4. Run the intent gate and resolve `SPEC_PENDING` questions without inventing
-   facts.
-5. Obtain a new exact contract approval if policy requires human authority.
-6. For a Design IR parent, author and approve a new Design digest after a fresh
-   passing gate. For a compatibility parent, regenerate and approve the legacy
-   plan with the exact parent Contract digest.
-
-Changing intent invalidates downstream plan authority. Do not copy a label,
-filename, or old approval record to the new artifact.
-
-### Review migration
-
-Set `review_protocol: findings_v2` explicitly. The `verdict_v1` protocol and a
-manifest that omits `review_protocol` are deprecated v0.x compatibility paths
-only. They emit warnings and remain readable so upgrades do not silently break,
-but new scaffolds and current guidance use `findings_v2`.
-
-Before the first real run, verify that your runner can write the single findings
-scratch file, cannot read controller state, and cannot mutate the reviewed code
-surface without the fingerprint check detecting it.
-
-Installed analyzers are trusted code, not an OS sandbox. Process and output
-normalization bounds evidence and persistent fingerprinting detects lasting
-workspace mutation; neither can prove there was no transient mutation or
-external side effect. Native analyzer execution requires the `fork` broker and
-is supported for this release on macOS/Linux; Windows fails unavailable.
-
----
-
-## 8. Closing the loop
+## 6. Closing the loop
 
 The next `factory observe` re-runs the check that produced the issue. If it
 passes, the fix is confirmed by measurement rather than by assertion. If it does
@@ -494,6 +239,7 @@ silent without anyone noticing.
 | | |
 |---|---|
 | Running it unattended, safely | [OPERATING.md](OPERATING.md) |
-| Which model each role runs on, and why | [MODEL_TIERING.md](MODEL_TIERING.md) |
+| Where this is going | [ROADMAP.md](ROADMAP.md) |
+| The brief each agent session follows | [`core/doctrine.md`](../software_factory/core/doctrine.md) |
 | New providers, custom adapters, plugins | [WRITING_A_PLUGIN.md](WRITING_A_PLUGIN.md) |
 | The rules the loop is built on | [`core/conventions.md`](../software_factory/core/conventions.md) |

@@ -16,7 +16,6 @@ from software_factory.adapters.reference import (  # noqa: F401
     claude_code,
     docker,
     github,
-    local_file,
     memory,
     postgres,
     schedulers,

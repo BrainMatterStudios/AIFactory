@@ -8,36 +8,21 @@ Security issues in these areas are taken seriously.
 
 ## Security and authority model
 
-Version 0.3 separates three writable surfaces:
+The factory never holds the authority to release. Its loop code has no merge or
+deploy capability (the source adapter exposes `open_pr`, never `merge`), and
+`core.governance.assert_within_ceiling` refuses any action that targets a
+configured production ref.
 
-- the agent worktree, which is untrusted runner output;
-- controller state, which holds exact approvals and digest-chained decision
-  events outside all repository worktrees; and
-- the public candidate, which must pass current-tree and history-range content
-  inspection before publication.
+Agents run as separate processes with their own shells, so the real ceiling
+must be enforced outside this package:
 
-Contract v2 is frozen and hashed before implementation. Contract, Design, and
-compatibility-plan approvals bind exact SHA-256 digests; a Design or plan also
-binds the exact parent Contract digest. Under `findings_v2`, model reviewers emit typed observations against an
-exact artifact fingerprint, while deterministic code owns the disposition.
-Missing, unreadable, stale, malformed, mismatched, or corrupt authority evidence
-fails closed.
-
-For an adopted T2 Design workflow, the exact Contract selects a sticky protocol,
-then Design IR v1 binds that parent, the configuration, required capabilities,
-repository fingerprint, and bounded analyzer evidence. A deterministic gate can
-pass only those exact inputs. Human approval then binds the exact Design digest
-and parent Contract digest; any identity-bearing Design change requires new
-approval, while changed evidence requires a fresh gate.
-
-These controls narrow authority; they are not containment. A state directory on
-an unrestricted shared host is not an OS security boundary. Run agents in a
-sandbox that cannot read controller state or release credentials, grant
-least-privilege provider scopes, and enforce protected `main` at the hosting
-provider. The reference runner's command filters are pattern matching, not a
-sandbox. Approval identity is a controller attestation, not a cryptographic
-signature, and digest-chained events are tamper-evident rather than an external
-transparency log.
+- protect `main` with a hosting-provider ruleset that requires CI and human
+  approval and rejects direct pushes;
+- give agents credentials that cannot merge, administer, or deploy;
+- run agents in their native sandbox with least-privilege provider scopes;
+- deny release verbs in the agent's permission settings. The reference Claude
+  runner adds a deny list on every turn, which is pattern matching, not a
+  sandbox.
 
 The secret and public-content scanners are backstops. They may miss a novel
 credential shape, private fact, or licensing problem, so every release also
@@ -45,28 +30,9 @@ requires a clean history-range scan and human review of the exact diff and
 tracked-file manifest. See [PUBLIC_CONTENT_POLICY.md](docs/PUBLIC_CONTENT_POLICY.md)
 and [RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md).
 
-## Analyzer and inspection boundaries
-
-Installed analyzers are trusted code, like installed plugins. Normalized
-analyzer evidence does not sandbox installed analyzer code. The fork broker
-suppresses output and applies descriptor, byte, frame, time, encoding, schema,
-and cleanup bounds; the controller fingerprints the repository before and after
-execution. This detects persistent workspace mutation but cannot prove there was
-no transient workspace mutation or external side effect. The broker supports
-the release's macOS/Linux environments; a runtime without `fork`, including
-native Windows, fails unavailable.
-
-Ordinary current macOS APFS volumes cannot prove no-atime reads. The required
-harness analyzer fails closed with high-security evidence for every present
-supported harness file rather than content-opening it. Use a verifiable no-atime
-volume or environment. Restoring metadata is another mutation and is not a safe
-workaround; disabling a required analyzer does not preserve Design authority.
-
-The four Design inspection commands, `factory status`, and `factory doctor` do
-not write or repair lifecycle authority. Status is a linearizable "as observed"
-projection, not a filesystem snapshot or repository lock. Logical read-only
-claims exclude access time because portable no-atime reads are not universally
-available, and inspection does not restore timestamps.
+Agent transcripts and telemetry collected for analytics may contain source
+code and secrets the agent read. They are redacted before storage, kept in
+private encrypted storage, and never committed to this repository.
 
 ## Reporting a vulnerability
 
@@ -87,11 +53,7 @@ there and wait for a private channel to be established.
 - Secret or credential exposure through error paths, logs, or output
 - Prompt injection that causes the agent to cross the prod boundary
 - Bypass of the governance ceiling (`assert_within_ceiling`) or kill switch
-- Bypass of exact Contract/Plan/Design approval, artifact immutability,
-  capability non-elevation, deterministic Design gating, findings-only review
-  authority, or decision-chain verification
-- Analyzer output, descriptor, process, path, size, timeout, redaction, or
-  workspace-fingerprint boundary bypasses
+- Transcript redaction bypasses that let a secret reach analytics storage
 - Public-boundary scanner bypasses involving current content, intermediate Git
   history, links, binaries, or provenance
 - Shell injection through config values or adapter inputs
