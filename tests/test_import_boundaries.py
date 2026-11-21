@@ -1,106 +1,52 @@
-"""Cold-process import-order regressions for public package APIs."""
+"""Cold-process import checks for the kept package surface.
+
+Each module is imported in a fresh interpreter so import-order cycles that
+pytest's own collection order would hide still show up. The retired 0.x
+subsystems must stay gone: nothing may import them.
+"""
 
 from __future__ import annotations
 
+import pkgutil
 import subprocess
 import sys
-from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+import pytest
 
+import software_factory
 
-def test_the_design_contract_api_imports_cold_before_the_build_api() -> None:
-    """Eager build re-exports must not make Design IR import order-dependent."""
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "from software_factory.core.design import validate_design_report; "
-            "print(validate_design_report.__name__)",
-        ],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "validate_design_report"
-
-
-def test_core_provider_api_imports_when_lima_and_leash_are_unavailable() -> None:
-    """Optional execution integrations must stay outside the core import path."""
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            """import sys
-
-class BlockOptional:
-    def find_spec(self, fullname, path=None, target=None):
-        if (
-            fullname == \"lima\"
-            or fullname.startswith(\"lima.\")
-            or fullname == \"leash\"
-            or fullname.startswith(\"leash.\")
-        ):
-            raise ModuleNotFoundError(fullname)
-
-sys.meta_path.insert(0, BlockOptional())
-from software_factory.core.design import (
-    CapabilityContext,
-    ProviderCapabilityDeclaration,
-    ProviderRole,
+RETIRED = (
+    "software_factory.build",
+    "software_factory.execution",
+    "software_factory.analyzers",
+    "software_factory.trace",
+    "software_factory.core.design",
+    "software_factory.core.contracts",
+    "software_factory.core.personas",
+    "software_factory.core.approvals",
 )
-from software_factory.core.design.provider_registry import register_capability_provider
-print(ProviderRole.EXECUTOR.value)
-""",
-        ],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
+
+MODULES = sorted(
+    m.name
+    for m in pkgutil.walk_packages(software_factory.__path__, prefix="software_factory.")
+)
+
+
+@pytest.mark.parametrize("module", MODULES)
+def test_module_imports_in_a_cold_process(module):
+    result = subprocess.run(
+        [sys.executable, "-c", f"import {module}"], capture_output=True, text=True
     )
-
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "executor"
+    assert result.returncode == 0, result.stderr
 
 
-def test_provider_guidance_states_the_optional_import_boundary() -> None:
-    """The plugin guide must keep optional providers from becoming core dependencies."""
-    guide = " ".join((REPO_ROOT / "docs" / "WRITING_A_PLUGIN.md").read_text().split())
-
-    assert "no third-party imports at module import time" in guide
-    assert "Lima and Leash remain optional" in guide
-
-
-def test_documented_executor_example_rejects_an_invalid_policy_digest() -> None:
-    """The minimal plugin example must reject invalid policy evidence early."""
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            """from pathlib import Path
-
-text = Path("docs/WRITING_A_PLUGIN.md").read_text()
-code = text.split("# mycompany_factory/executor.py" + chr(10), 1)[1]
-code = code.split(chr(10) + chr(96) * 3, 1)[0]
-namespace = {}
-exec(compile(code, "executor.py", "exec"), namespace)
-provider = namespace["build_executor"]({"execution_policy_digest": "a" * 64})
-assert provider.capability_declaration().source == "example-executor"
-try:
-    namespace["build_executor"]({"execution_policy_digest": "not-a-digest"})
-except ValueError as error:
-    assert str(error) == "execution_policy_digest must be a lowercase SHA-256 digest"
-else:
-    raise AssertionError("example accepted an invalid execution policy digest")
-""",
-        ],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert completed.returncode == 0, completed.stderr
+def test_no_retired_subsystem_is_present_or_importable():
+    for name in MODULES:
+        assert not name.startswith(RETIRED), name
+    script = "import sys, software_factory.cli; print([m for m in sys.modules if m.startswith({!r})])"
+    for retired in RETIRED:
+        result = subprocess.run(
+            [sys.executable, "-c", script.format(retired)], capture_output=True, text=True
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "[]", (retired, result.stdout)

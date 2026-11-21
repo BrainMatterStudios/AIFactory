@@ -14,30 +14,8 @@ from typing import Any
 _Builder = Callable[[Mapping[str, Any]], Any]
 
 VALID_KINDS = frozenset(
-    {"source", "runner", "observe", "data", "alert", "scheduler", "workspace"}
+    {"source", "runner", "observe", "data", "alert", "scheduler"}
 )
-
-
-class _ValidatedWorkspaceFactory:
-    def __init__(self, factory: Any, source: str) -> None:
-        self._factory = factory
-        self._source = source
-
-    def create(self, request: Any) -> Any:
-        from software_factory.build.workspace import (
-            Workspace,
-            require_configured_workspace_identity,
-        )
-
-        workspace = self._factory.create(request)
-        if not isinstance(workspace, Workspace):
-            raise RuntimeError("workspace factory returned an invalid Workspace")
-        require_configured_workspace_identity(
-            workspace,
-            self._source,
-            error_type=RuntimeError,
-        )
-        return workspace
 
 
 class AdapterRegistry:
@@ -60,29 +38,13 @@ class AdapterRegistry:
                 f"no {kind} adapter named {name!r} registered; "
                 f"available: {sorted(builders) or '(none)'}"
             )
-        adapter = builders[name](config)
-        if kind != "workspace":
-            return adapter
-        from software_factory.adapters.base import WorkspaceFactory
-
-        if not isinstance(adapter, WorkspaceFactory):
-            raise RuntimeError("workspace adapter must satisfy WorkspaceFactory")
-        return _ValidatedWorkspaceFactory(adapter, name)
+        return builders[name](config)
 
     def names(self, kind: str) -> list[str]:
         return sorted(self._builders.get(kind, {}))
 
 
 _REGISTRY = AdapterRegistry()
-
-
-def _build_git_worktree_factory(config: Mapping[str, Any]) -> Any:
-    from software_factory.build.workspace import GitWorktreeFactory
-
-    return GitWorktreeFactory(config)
-
-
-_REGISTRY.register("workspace", "git-worktree", _build_git_worktree_factory)
 
 
 def get_registry() -> AdapterRegistry:

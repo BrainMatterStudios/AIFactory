@@ -115,7 +115,7 @@ def _security_control_approval(
         "object_type": "blob",
         "sha256": sha256((REPO_ROOT / relative_path).read_bytes()).hexdigest(),
         "license": "Apache-2.0",
-        "source": "project-original:validation-cell-security-controls-v1",
+        "source": "project-original:retired-security-controls",
         "rule_ids": rule_ids,
     }
 
@@ -973,109 +973,16 @@ def test_synthetic_fixture_approval_provenance_is_canonical(tmp_path: Path) -> N
         load_publication_policy(_write_policy(tmp_path, document))
 
 
-def test_reviewed_security_control_content_approval_is_accepted(tmp_path: Path) -> None:
+def test_content_allowlist_rejects_any_path_but_the_synthetic_fixture(tmp_path: Path) -> None:
     document = _policy_document()
     approvals = _retain_only_synthetic_fixture_approval(document)
     approvals.append(
-        _security_control_approval(
-            "software_factory/execution/bridge.py",
-            ["private.absolute-path", "private.hostname"],
-        )
+        _security_control_approval("software_factory/cli.py", ["private.hostname"])
     )
-    approvals.sort(key=lambda item: str(item["path"]))
-
-    policy = load_publication_policy(_write_policy(tmp_path, document))
-
-    assert {approval.path for approval in policy.content_allowlist} == {
-        "software_factory/execution/bridge.py",
-        "tests/fixtures/synthetic_sensitive_values.py",
-    }
-
-
-def test_reviewed_security_control_accepts_multiple_exact_historical_blobs(
-    tmp_path: Path,
-) -> None:
-    document = _policy_document()
-    approvals = _retain_only_synthetic_fixture_approval(document)
-    current = _security_control_approval(
-        "software_factory/execution/bridge.py",
-        ["private.absolute-path", "private.hostname"],
-    )
-    historical = {**current, "sha256": "0" * 64}
-    approvals.extend((current, historical))
-    approvals.sort(key=lambda item: (str(item["path"]), str(item["sha256"])))
-
-    policy = load_publication_policy(_write_policy(tmp_path, document))
-
-    bridge_approvals = [
-        approval
-        for approval in policy.content_allowlist
-        if approval.path == "software_factory/execution/bridge.py"
-    ]
-    assert {approval.sha256 for approval in bridge_approvals} == {
-        current["sha256"],
-        historical["sha256"],
-    }
-
-
-@pytest.mark.parametrize(
-    ("field", "value"),
-    [
-        ("path", "docs/private-example.md"),
-        ("git_mode", "100755"),
-        ("license", "MIT"),
-        ("source", "project-original"),
-        ("rule_ids", ["private.hostname"]),
-        ("rule_ids", ["private.account-id", "private.hostname"]),
-    ],
-)
-def test_security_control_content_approval_cannot_broaden_authority(
-    tmp_path: Path, field: str, value: object
-) -> None:
-    document = _policy_document()
-    approvals = _retain_only_synthetic_fixture_approval(document)
-    approval = _security_control_approval(
-        "software_factory/execution/bridge.py",
-        ["private.absolute-path", "private.hostname"],
-    )
-    approval[field] = value
-    approvals.append(approval)
     approvals.sort(key=lambda item: str(item["path"]))
 
     with pytest.raises(PublicationPolicyError):
         load_publication_policy(_write_policy(tmp_path, document))
-
-
-def test_content_approvals_must_be_in_canonical_path_order(tmp_path: Path) -> None:
-    document = _policy_document()
-    approvals = _retain_only_synthetic_fixture_approval(document)
-    approvals.append(
-        _security_control_approval(
-            "software_factory/execution/bridge.py",
-            ["private.absolute-path", "private.hostname"],
-        )
-    )
-
-    with pytest.raises(PublicationPolicyError):
-        load_publication_policy(_write_policy(tmp_path, document))
-
-
-def test_security_control_approval_requires_exact_blob_and_mode(tmp_path: Path) -> None:
-    relative_path = "software_factory/execution/bridge.py"
-    fixture = REPO_ROOT / relative_path
-    repo = _repo(tmp_path)
-    path = _track(repo, relative_path, fixture.read_bytes())
-
-    assert scan_public_tree(repo, DEFAULT_POLICY) == ()
-
-    path.write_bytes(fixture.read_bytes() + b"\n")
-    _git(repo, "add", "--", relative_path)
-    assert {"private.absolute-path", "private.hostname"} <= _rules(repo)
-
-    path.write_bytes(fixture.read_bytes())
-    path.chmod(0o755)
-    _git(repo, "add", "--chmod=+x", relative_path)
-    assert {"private.absolute-path", "private.hostname"} <= _rules(repo)
 
 
 def test_cli_exits_nonzero_and_prints_secret_safe_findings(tmp_path: Path) -> None:

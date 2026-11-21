@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "software-factory"
-version = "0.3.0"
-description = "A reusable, extensible, resilient AI software factory — orchestrate doctrine + observe→fix→verify loop, behind swappable provider adapters."
+version = "0.4.0.dev0"
+description = "A lean AI software factory: observe → queue → one agent session per issue → PR, behind swappable provider adapters."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -13,12 +13,12 @@ license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 authors = [{ name = "BrainMatterStudios" }]
 keywords = ["ai", "software-factory", "agents", "orchestration", "devops"]
 
-# The core (doctrine, helpers, loop, governance) has ZERO hard third-party deps —
+# The core (loop, governance, adapters) has ZERO hard third-party deps —
 # it is pure-Python and adapter-driven. Providers pull their own extras.
 dependencies = []
 
 [project.optional-dependencies]
-yaml = ["PyYAML>=6"]                 # config manifest + persona catalog parsing
+yaml = ["PyYAML>=6"]                 # config manifest parsing
 github = ["PyYAML>=6"]              # github source/board adapter (uses `gh` CLI; yaml for forms)
 postgres = ["psycopg[binary]>=3.1"] # postgres data adapter
 dev = ["pytest>=7", "PyYAML>=6", "ruff==0.16.0"]
@@ -75,21 +75,14 @@ ignore = [
 
 [project.scripts]
 factory = "software_factory.cli:main"
-aifactory-execution-bridge = "software_factory.execution.bridge:main"
-aifactory-validation-cell-guest = "software_factory.execution.cell:guest_main"
 
 [tool.setuptools.packages.find]
 include = ["software_factory*"]
 
-# Ship the non-Python data files (doctrine/conventions .md, persona catalog + packs
-# .yaml, and the dependency-free built-in catalog fallback) inside the wheel.
-# Without this a non-editable install cannot run `factory doctor`/`personas`.
+# Ship the doctrine and conventions markdown inside the wheel.
 [tool.setuptools.package-data]
-software_factory = ["**/*.md", "**/*.yaml", "**/*.yml", "execution/assets/*.cedar", "core/personas/catalog.json"]
+software_factory = ["**/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-markers = [
-  "integration: requires an explicitly selected live validation cell",
-]

@@ -21,11 +21,11 @@ adapter exposes `open_pr` but never a merge capability (`adapters/base.py`), and
 auto-merger simply never targets `main`. When `governance.require_branch_protection`
 is true, `init`/`doctor` flag the absence of real protection as a blocker.
 
-**Plan-approval gate (doctrine §4):** a **complex feature (tier T2)** additionally
-halts **after planning** — its research + plan are presented for human approval
-*before* any implementation. This is a second human gate, upstream of the prod
-boundary. Bugs / chores / tech-debt (T0/T1) have no plan gate (their plan is the
-issue's expected-outcome) and still cannot reach prod without a human.
+**Scope gate (doctrine §1):** a **large feature (tier T2)** posts a short plan and
+halts until a human approves scope, *before* any implementation. This is a second
+human gate, upstream of the prod boundary. Bugs / chores / tech-debt have no scope
+gate (their plan is the issue's expected-outcome) and still cannot reach prod
+without a human.
 
 ## 2. The work-queue — one board, one Ready column
 The factory operates from a single board exposed by the **configured source
@@ -43,8 +43,8 @@ reads from.
 ## 3. CI is the factory standard; it enforces the ceiling
 Every line has a CI gate (lint + tests) on PRs/pushes. Branch protection (require CI
 green, no bot self-merge) is how the ceiling is **enforced by the host** rather than
-by convention alone. A line earns an **autonomous build loop** (cron pulls a `Ready`
-issue → builds → PR, unattended) only once CI enforces the gate for that line — so
+by convention alone. A line earns **unattended dispatch** (one agent session per
+`Ready` issue → PR) only once CI enforces the gate for that line — so
 "which line gets more autonomy" is principled, not arbitrary. All lines keep the same
 ceiling regardless (§1).
 
@@ -87,11 +87,10 @@ the bug it prevents). The observe pass also degrades a single flaky collector to
 Each line writes its collectors and commands **native to its language** (the
 data-quality / ops logic is repo-specific regardless). What is shared verbatim is the
 factory's **conventions**: this severity scale, the label taxonomy, the queue and its
-columns, the closed verify-loop, the safety rails, and the orchestration doctrine.
+columns, the closed verify-loop, the safety rails, and the doctrine.
 Per-instance identity lives entirely in the config manifest, not in find/replace
 templating — the core reads the manifest and builds the adapter bundle from the
-registry (`core/config.py`). A domain persona pack plugs in as a separate YAML under
-`core/personas/packs/` without editing the core catalog.
+registry (`core/config.py`).
 
 ## 10. Secrets and honesty
 Never write a secret (API key, token, password, DSN) into a committed file,
@@ -103,23 +102,3 @@ citation, not assumption.
 ---
 *Lines must not diverge from this file silently. Propose a change here before
 instantiating a different convention in a line.*
-
-## Quality machinery
-
-Four upgrades raise the judge from "looks done" to evidence-backed grading. They
-are deterministic, pure, and live in code so they can't be forgotten by a model.
-
-- **Calibrated rubrics (`core/rubrics/`).** Per-dimension standards with real
-  labelled examples; the judge grades by analogy and cites the example via the
-  `cited_rubric` contract. Examples are inert (S1, enforced by
-  `tests/test_rubrics_inert.py`) and subordinate to `judge.md` (S2).
-- **Pre-build contracts (`core/contracts/`).** Granular acceptance criteria
-  negotiated and committed before implementation; the judge grades by criterion id
-  and a goalpost moved mid-build is a BLOCK. A prompt-injection guard keeps injected
-  directives out of criteria strings.
-- **RESTART verdict (`core/orchestrate.decide_restart`).** An architectural
-  dead-end BLOCK is re-dispatched once to a fresh worker against the same contract
-  before escalating to a human. The security veto is never restartable.
-- **Trace review (`trace/`).** Factory runs persist redacted traces (secrets
-  scrubbed at write time); an advisory observer flags divergence — a judge that
-  passed without exercising the artifact, a self-contradiction, a thrashing persona.

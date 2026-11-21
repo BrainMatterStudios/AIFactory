@@ -8,47 +8,43 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_release_documentation_matches_the_current_public_surface() -> None:
+def test_documentation_describes_the_current_public_surface() -> None:
     readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     adopting = (REPO_ROOT / "docs" / "ADOPTING.md").read_text(encoding="utf-8")
     operating = (REPO_ROOT / "docs" / "OPERATING.md").read_text(encoding="utf-8")
-    known = (REPO_ROOT / "KNOWN_ISSUES.md").read_text(encoding="utf-8")
-    security = (REPO_ROOT / "SECURITY.md").read_text(encoding="utf-8")
-    release = (REPO_ROOT / "docs" / "releases" / "0.3.0.md").read_text(encoding="utf-8")
 
-    for command in (
-        "factory design validate <file>",
-        "factory design gate <file>",
-        "factory analyze <adapter>",
-        "factory capabilities",
-        "factory status [issue]",
-        "factory doctor",
-    ):
+    for command in ("factory doctor", "factory demo", "factory observe", "factory pickup"):
         assert command in readme
         assert command in adopting or command in operating
 
-    combined = "\n".join((readme, adopting, operating, known, security, release))
-    normalized_release = " ".join(release.split())
-    for required_claim in (
-        "ordinary current macOS APFS",
-        "installed analyzers are trusted code",
-        "transient or external side effects",
-        'linearizable "as observed"',
-        "not a cryptographic signature",
-        "not an OS sandbox",
-    ):
-        assert required_claim.lower() in normalized_release.lower()
+    retired = (
+        "factory build",
+        "factory approve",
+        "factory design",
+        "factory analyze",
+        "factory capabilities",
+        "factory status",
+        "factory release readiness",
+        "factory personas",
+    )
+    documents = {
+        path: path.read_text(encoding="utf-8")
+        for path in (
+            REPO_ROOT / "docs" / "ADOPTING.md",
+            REPO_ROOT / "docs" / "OPERATING.md",
+            REPO_ROOT / "docs" / "WRITING_A_PLUGIN.md",
+            REPO_ROOT / "SECURITY.md",
+            REPO_ROOT / "software_factory" / "core" / "doctrine.md",
+            REPO_ROOT / "software_factory" / "core" / "conventions.md",
+            REPO_ROOT / "factory.config.example.yaml",
+        )
+    }
+    for path, text in documents.items():
+        for command in retired:
+            assert command not in text, (path, command)
 
-    for stale_claim in (
-        "**Status:** 0.2.0",
-        "0.2 release-candidate note",
-        "There is no separate general design gate",
-        "Version 0.2 separates three writable surfaces",
-    ):
-        assert stale_claim not in combined
 
-
-def test_release_documentation_local_links_resolve() -> None:
+def test_documentation_local_links_resolve() -> None:
     documents = (
         REPO_ROOT / "README.md",
         REPO_ROOT / "CHANGELOG.md",
@@ -57,7 +53,9 @@ def test_release_documentation_local_links_resolve() -> None:
         REPO_ROOT / "docs" / "ADOPTING.md",
         REPO_ROOT / "docs" / "OPERATING.md",
         REPO_ROOT / "docs" / "RELEASE_CHECKLIST.md",
-        REPO_ROOT / "docs" / "releases" / "0.3.0.md",
+        REPO_ROOT / "docs" / "ROADMAP.md",
+        REPO_ROOT / "docs" / "REVIEW-2026-11.md",
+        REPO_ROOT / "docs" / "WRITING_A_PLUGIN.md",
     )
     pattern = re.compile(r"(?<!!)\[[^]]+\]\(([^)]+)\)")
 

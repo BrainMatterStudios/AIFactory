@@ -1,346 +1,132 @@
 # BrainMatter Software Factory
 
-**A doctrine for governing AI-agent development — and the working machinery that
-enforces it.**
-
-The doctrine is one rule and the gates that make it hold:
+**A lean factory for AI-agent development: observe, queue, one agent session per
+issue, and a human at the release boundary.**
 
 > **The human owns what cannot be undone.** Production releases, scope, and
 > policy are human decisions, every time. Everything else runs unattended — and
 > is *made* safe to run unattended by gates that are code rather than intentions.
 > If you need to review every diff, the gates are too weak. Fix the gates.
 
-That is not a philosophy statement. It is enforced here by an installable Python
-package you point at your project: it watches your codebase, diagnoses what is
-wrong, queues it, builds fixes with a team of agent personas under an independent
-judge, and opens pull requests — and stops there. **No loop code can merge or
-deploy:** `core/governance.assert_within_ceiling` refuses a prod ref, and the
-`SourceAdapter` protocol has no `merge` method to call. The agent the loop spawns
-is a separate process with its own shell; the reference runner refuses the
-release verbs on every turn, which narrows that surface without sealing it — see
-[the ceiling](#the-loop-and-the-ceiling) for exactly what each layer covers.
-
 ```bash
 pipx install "software-factory[yaml,github] @ git+https://github.com/BrainMatterStudios/AIFactory@main"
 cd ~/my-project && factory init && factory doctor && factory demo
 ```
 
-`factory demo` runs the observe half of the loop offline in a few seconds —
-verify, harvest, then select the next Ready issue — with no services and no
-config — the fastest way to see whether this is for you.
+**Status:** 0.4.0.dev0, being rebuilt. The 0.x autonomous builder (persona
+teams, judge panels, Contract v2, Design IR, digest approvals, Lima/Leash
+validation cells) was retired in November 2026 because it was too slow with
+current frontier models. It is preserved in the `v0.3-archive` branch. See
+[docs/REVIEW-2026-11.md](docs/REVIEW-2026-11.md) for why and
+[docs/ROADMAP.md](docs/ROADMAP.md) for what comes next.
 
-**It is provider-agnostic by construction.** The engine talks to six small adapter
-interfaces, so the same loop runs on GitHub or GitLab, one agent runner or
-another, Postgres or Snowflake, Slack or Telegram. Adopting it is configuration
-and adapters, not a rewrite. The core has zero hard dependencies and ships a
-complete offline adapter set, so the whole loop runs in your tests and your CI.
+## The loop
 
-**Status:** 0.3.0, CI on Python 3.10 and 3.12–3.13, Apache-2.0. The
-observe→diagnose→queue→verify loop and deterministic gate helpers are generalized
-from a factory used against a production system, where passes are invoked on
-demand. The *autonomous* build loop (`factory build`) is newer, remains
-experimental, and is not scientifically or production validated. See
-[KNOWN_ISSUES.md](KNOWN_ISSUES.md) and §Provenance for the exact boundary.
+```
+Observe(🤖) → Diagnose(🤖) → Queue(🤖) → Triage(🧑) → one agent session → PR(🤖)
+      → CI + independent review(🤖) → Merge + deploy(🧑) → Observe again ↺
+```
 
-> **macOS compatibility:** new scaffolds require the harness analyzer for Design
-> IR, and the analyzer must read harness files without changing their access
-> time. In the 0.3.0 release, ordinary macOS APFS volumes could not prove that,
-> so any supported harness file blocked the Design gate. `main` now reads a
-> copy-on-write clone of each file on APFS and verifies the original's access
-> time is unchanged; when cloning is unavailable (for example on a non-APFS
-> external volume) the analyzer still fails closed. Preview with
-> `factory analyze harness`. See [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+| Stage | What does it | In this package |
+|---|---|---|
+| Observe | Scheduled checks over runs, logs and data | `loop/verify.py`, `loop/collectors.py`, the observe and data adapters |
+| Diagnose and queue | Findings become issues, deduplicated by fingerprint (open *and* closed), recurrences counted instead of refiled | `loop/harvester.py` |
+| Triage | A human adds the `ready` label | your issue board |
+| Build | **One** agent session per issue plans, implements, tests and commits in an isolated worktree. A large feature posts a plan and waits for scope approval | `factory dispatch`, `core/doctrine.md` |
+| Hand-off | The dispatcher re-runs `verify_cmd`, scans the diff for secrets, checks the ceiling, pushes, and opens the PR | `dispatch.py` |
+| Gate | CI runs tests and the secret/public-content scan; one review from a different model | your CI; `core/publication.py` |
+| Release | A human merges to `main` and deploys | your hosting provider and deploy tool |
+
+Transcript analytics (roadmap phases A1–A3) collects every agent session and
+feeds weekly findings back into the factory's own configuration.
+
+## Install and try it
+
+```bash
+factory demo                     # the observe half of the loop, offline, in seconds
+cd ~/my-project
+factory init                     # writes factory.config.yaml (detects your GitHub repo)
+factory doctor                   # config, providers, kill switch, ceiling checks
+factory observe --target dev     # plan findings (add --apply to file issues)
+factory pickup                   # the next Ready issue
+factory dispatch --dry-run       # what one agent session would work on
+factory dispatch                 # run it and open a PR into the dev branch
+factory schedule render          # preview the unattended observe schedule
+```
+
+The core has zero hard dependencies. The `[yaml]` extra is needed to read a YAML
+manifest. Real (non-offline) use needs `gh` authenticated and your providers'
+secrets in environment variables named by the manifest.
+
+| | `0` | `1` | `2` |
+|---|---|---|---|
+| `observe` | PASS or WARN | overall FAIL | the board could not be searched — nothing filed |
+| `doctor` | healthy | a check failed | — |
+| `pickup` | issue printed, or queue empty | — | a stop-switch halted the loop |
+| `dispatch` | PR opened, plan posted, or nothing eligible | issue blocked or a stop engaged | another dispatch is running |
+
+## The ceiling
+
+No loop code can merge or deploy: the source adapter has no `merge` method, and
+`core.governance.assert_within_ceiling` refuses any action that targets a
+production ref. Agents are separate processes, so the real ceiling is enforced
+by the platform:
+
+- a ruleset on `main` that requires CI and human approval;
+- agent credentials that cannot merge, administer, or deploy;
+- the agent's native sandbox and permission settings, with release verbs denied
+  (the reference Claude runner adds a deny list; that is pattern matching, not
+  a sandbox).
+
+## The shape
+
+```
+software_factory/
+  core/
+    doctrine.md        ← the brief one agent session follows
+    conventions.md     ← the portable rules the loop is built on
+    governance.py      ← kill switch · budget caps · the prod-boundary ceiling
+    publication.py     ← secret and public-content scanner (current tree + history)
+    orchestrate/       ← classify_tier: which work needs a scope gate
+    config.py          ← the per-instance manifest loader
+  adapters/
+    base.py            ← source / runner / observe / data / alert / scheduler protocols
+    registry.py        ← name → builder, the extension point
+    reference/         ← github, claude_code, docker, postgres, slack/telegram,
+                         cron/launchd/gh-actions, and an offline set
+  loop/                ← verify, harvester, collectors, ratchet, security, pickup
+  dispatch.py          ← one agent session per Ready issue → verified PR
+  cli.py               ← init · doctor · demo · observe · pickup · dispatch · schedule
+```
 
 ## Documentation
 
 | | |
 |---|---|
-| **[Adopting the factory](docs/ADOPTING.md)** | The working guide: install → your first collector → running a build under the doctrine. **Start here.** |
-| **[Operating it](docs/OPERATING.md)** | Scheduling it unattended, arming a dead-man's switch, and the ways an observe loop lies to you. |
-| **[0.3.0 release notes](docs/releases/0.3.0.md)** | Design authority, migration, macOS compatibility, threat model, and explicit non-claims. |
-| [0.2.0 release notes](docs/releases/0.2.0.md) | Architecture-first compatibility history and provenance. |
-| [Public content policy](docs/PUBLIC_CONTENT_POLICY.md) | What may enter the public package and how current and historical content is inspected. |
-| [Release checklist](docs/RELEASE_CHECKLIST.md) | Local verification, protected `main`, provenance, and separate publication approvals. |
-| [Model tiering](docs/MODEL_TIERING.md) | Which model each role runs on, why the gate has a floor, and how to re-derive it for your repo. |
-| [Writing a plugin](docs/WRITING_A_PLUGIN.md) | New providers and custom adapters, without forking. |
-| [The doctrine](software_factory/core/doctrine.md) | The orchestration procedure itself — the artifact with production behind it. |
-| [Conventions](software_factory/core/conventions.md) | The portable rules the loop is built on. |
-| [Known issues](KNOWN_ISSUES.md) | Honest status by subsystem, including what eight review panels found. |
+| [Adopting the factory](docs/ADOPTING.md) | Install → first collector → triage → one session per issue |
+| [Operating it](docs/OPERATING.md) | Scheduling, the dead-man's switch, exit codes, failure modes |
+| [Writing a plugin](docs/WRITING_A_PLUGIN.md) | New providers and collectors without forking |
+| [Roadmap](docs/ROADMAP.md) | Lean factory and transcript analytics, in parallel |
+| [Review, November 2026](docs/REVIEW-2026-11.md) | Why the 0.x machinery was retired |
+| [Known issues](KNOWN_ISSUES.md) | Honest status by subsystem |
+| [Public content policy](docs/PUBLIC_CONTENT_POLICY.md) · [Release checklist](docs/RELEASE_CHECKLIST.md) | What may be published and how |
 
----
-
-## The shape
-
-```
-software_factory/            ← the product (installable Python package)
-  core/
-    contracts/               ← Contract v1 compatibility + strict Contract v2,
-                               intent policy, and canonical artifact digests
-    approvals.py             ← exact contract/plan/design authority outside worktrees
-    design/                  ← strict Design IR, capabilities, and deterministic gate
-    publication.py           ← current-tree and history-range public scanner
-    orchestrate/             ← classify_tier + combine — the gate rules that
-                               MUST be code, not an LLM remembering them
-    doctrine.md              ← the orchestration doctrine (orchestrator→tier→
-                               team→judge), engine-agnostic
-    conventions.md           ← the portable conventions spec (the ceiling, the
-                               queue, the verify-loop, the taxonomy)
-    personas/                ← the team roster: catalog.yaml + 5 lean-core
-                               persona files + the drift check
-      tiers.py               ← the model-tier POLICY: the frontier floor, the
-                               thoroughness minimum, the built-in pins — code,
-                               so editing the catalog can't lower the gate
-    config.py                ← the per-instance manifest loader (no find/replace)
-    governance.py            ← kill switch · budget caps · the prod-boundary ceiling
-  adapters/
-    base.py                  ← the six Protocols (source/runner/observe/data/
-                               alert/scheduler) + the value types
-    registry.py              ← name → builder, the extension point
-    reference/               ← working impls: github, claude_code, postgres,
-                               slack/telegram, cron/launchd/gh-actions, and a
-                               full OFFLINE set (memory/echo/null/dict/stdout)
-  loop/
-    verify.py                ← L1 observe: deterministic pass/fail, per-error
-                               log signatures, per-target fail-isolation
-    harvester.py             ← L2 diagnose+queue: fingerprint dedup (open AND
-                               closed) + recurrence-not-refile + the mandatory
-                               expected-outcome field
-    pickup.py                ← L3 fix (selection): top Ready issue, stop-switches
-    collectors.py            ← the generic {name, verdict, evidence} observe contract
-                               + ratio / floor / delta verdict helpers
-    ratchet.py               ← net-new-only checks against a committed baseline
-    security.py              ← scheduled posture: secret scan, dependency audit,
-                               least-privilege
-    spend.py                 ← where the factory's own token budget goes, and
-                               how much of it is re-routable
-  analyzers/                 ← bounded execution, SARIF import, harness posture
-  cli.py                     ← lifecycle + read-only Design/capability/status inspection
-
-  build/                     ← experimental Contract→sticky protocol→Design→gate→
-                               exact approval→implementation/review lifecycle
-  trace/decisions.py         ← redacted, digest-chained controller evidence
-
-scripts/ci-local.sh          ← every CI job, locally, with CI's pinned toolchain
-factory.config.example.yaml  ← copy to factory.config.yaml and fill in
-```
-
-## Adopt it on your project (start here)
-
-The factory is a **tool you install once and point at a project** — like `ruff` or
-`pytest`. You do **not** copy its source into your repo, and you do **not** run it from
-a second clone. The only thing that lives in your project is a `factory.config.yaml`.
-
-```bash
-# 1. install the `factory` command (not on PyPI yet — install from git)
-pipx install "software-factory[yaml,github] @ git+https://github.com/BrainMatterStudios/AIFactory@main"
-#   the [yaml] extra is REQUIRED to read a YAML manifest — without it every
-#   command that loads factory.config.yaml fails. Core itself has zero hard deps.
-
-# 2. from INSIDE your own project, scaffold a config (auto-detects your GitHub repo)
-cd ~/my-project
-factory init                     # writes factory.config.yaml; edit repo / verify_cmd
-
-# 3. validate, then drive the loop — all run from your project dir
-factory doctor                   # checks config, builds every adapter, governance posture
-factory demo                     # watch the whole loop run offline, no services needed
-factory observe --target dev     # plan findings (add --apply to file issues)
-factory pickup                   # the next Ready issue a build loop would take
-```
-
-**Then build the fix.** Two paths, and the difference matters:
-
-* **The doctrine path — recommended, and the one with production behind it.**
-  Point your agent tool at `software_factory/core/doctrine.md` and work the issue
-  `factory pickup` chose. The agent classifies the tier, forms a persona team,
-  and submits to an independent judge; you are at the controls. This is how the
-  factory this package came from actually runs.
-* **`factory build 42` — autonomous, and experimental.** Contract v2 freezes
-  declared intent before code; exact digest approvals bind human-owned Contracts
-  and Designs (or plans for compatibility-mode parents); `findings_v2` reviewers
-  report observations while deterministic code owns disposition. It is still the only major subsystem with no production
-  provenance. Read [KNOWN_ISSUES.md](KNOWN_ISSUES.md) before pointing it at a repo
-  you care about, and do not schedule it unattended.
-
-```bash
-factory build 42                 # experimental — see KNOWN_ISSUES.md
-```
-
-**Read-only inspection**, before you authorize or run anything:
-
-```bash
-factory doctor
-factory design validate <file>
-factory design gate <file>
-factory analyze <adapter>
-factory capabilities
-factory status [issue]
-```
-
-The four Design inspection commands (`design validate`, `design gate`,
-`analyze`, and `capabilities`) plus `status` support versioned `--json` output.
-They do not repair, approve, migrate, refresh, or persist evidence. `doctor`
-previews the configured protocol, analyzers, and capability gaps without running
-models or analyzers. Status reports `ready`, `approval_pending`, `blocked`,
-`degraded`, `unavailable`, or `complete`, with conservative precedence from
-unreadable authority and integrity blocks through exact approval, optional
-degradation, readiness, and replay-bound completion. It is a linearizable "as
-observed" result, not a repository snapshot or cooperative lock.
-
-**Exit codes**, so a scheduler can see a bad night:
-
-| | `0` | `1` | `2` |
-|---|---|---|---|
-| `observe` | PASS or WARN | overall FAIL | the board could not be searched — nothing filed |
-| `build` | shipped; deprecated compatibility plan-pending also returns 0 | specification/approval pending, deterministic BLOCK/REVISE, tests red, secrets found, budget, ceiling, or kill switch | another build holds the lock, controller state cannot be isolated, or a canonical repository identity is missing |
-| inspection/status | successful passing inspection; status ready, degraded, or complete | runtime/authority unavailable, non-passing gate, or status not ready | invalid invocation, input, or configuration |
-
-An engaged kill switch stops `observe` with exit **0** (nothing ran, nothing is
-wrong) and `build` with exit **1** (the requested work did not happen).
-
-Only one `factory build` runs per repo at a time. Safety controls — the halt file
-and the run lock — resolve against your **manifest's** directory, not the process
-working directory, so a cron entry that never `cd`s into the repo still honours
-`factory/STOP`.
-
-The `factory` command finds your `factory.config.yaml` by walking up from the current
-directory, so run it from anywhere inside your project. Real (non-offline) use needs
-`gh` authenticated and your providers' secrets in env vars named by the manifest.
-
-`factory build` classifies the tier and, for T1/T2 work, gives a Contract author
-one writable path. Deterministic intent policy must accept Contract v2 before the
-controller checkpoints it. For an adopted T2 Design workflow, a sticky protocol
-selection then leads through runner capability preflight, Design IR v1, bounded
-analyzer evidence, a deterministic gate, and approval of the exact Design digest
-and parent Contract digest. Only then does an implementer run. Objective
-verification, frozen `findings_v2` reports, deterministic review routing,
-re-verification, a refreshed exact Design gate, and the objective secret scan
-must pass before a PR can be opened into the configured development branch. It
-never merges. Compatibility-mode parents keep the legacy opaque-plan path.
-
-The build prints the exact approval command when authority is required. That
-command is directly copyable when Git has `user.email` or `user.name`; otherwise
-add `--approver <operator-identity>`. Issue labels are informational only. For
-example, using deliberately synthetic digests:
-
-```bash
-factory approve contract demo-42 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-  --approver demo-operator --reason "synthetic intent review"
-factory approve plan demo-42 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
-  --parent aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-  --approver demo-operator --reason "synthetic plan review"
-factory approve design demo-42 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
-  --parent aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-  --approver demo-operator --reason "synthetic design review"
-```
-
-An approval-pending contract is persisted as an exact controller record. A later
-run materializes those same bytes without dispatching the contract author and
-re-checks current approval. Once accepted, the exact record is retained and the
-approval is still checked on every run: deleting approval returns the same digest
-to `APPROVAL_PENDING`, while replacing it with a different digest blocks.
-
-Approval and decision state must resolve outside the repository and registered
-worktrees. Pending/accepted Contract records plus Plan, immutable Design, gate,
-and sticky protocol records are controller-owned ignored local state associated
-with the canonical checkout, outside disposable runner worktrees. Back up and
-restore the external and canonical controller roots as one lifecycle set; never
-hand-edit, truncate, or auto-repair authority. Directory separation is not an OS
-sandbox. See
-[ADOPTING.md](docs/ADOPTING.md) for migration and
-[OPERATING.md](docs/OPERATING.md) for precedence, backup, and recovery.
-
-## Develop the factory itself (contributors)
+## Develop the factory itself
 
 ```bash
 git clone https://github.com/BrainMatterStudios/AIFactory && cd AIFactory
-pip install -e ".[dev]"          # core has zero hard deps; this adds pytest + ruff + yaml
-python -m pytest -q              # deterministic core + full offline loop
+pip install -e ".[dev]"
+python -m pytest -q
 ./scripts/ci-local.sh            # every CI job, with CI's pinned toolchain
 ```
 
-`ci-local.sh` builds its own environment rather than trusting your PATH, because
-the linter version is part of the contract: an unpinned one turns "CI is green"
-into a statement about what shipped this week rather than about the code.
+## Provenance
 
-## The loop, and the ceiling
+The observe→diagnose→queue→verify loop, the harvester and its dedup, the
+collectors and ratchets, and the governance rails are generalized from a
+production factory (ElBasket `TheScraperEngine`). The single-session build
+model replaces an autonomous builder that never reached production; its full
+history, including eight adversarial review rounds, is in the `v0.3-archive`
+branch.
 
-```
-Observe(🤖) → Diagnose(🤖) → Queue(🤖) → Triage(🧑) → Fix+PR(🤖) → Merge(🤖 dev / 🧑 main) → Verify(🤖) ↺
-```
-
-The autonomy ceiling holds **by construction and by check**: the loop exposes no
-merge/deploy capability (the Source adapter has no `merge`), and
-`core.governance.assert_within_ceiling` refuses any action that targets a prod
-ref. A complex feature (tier **T2**) additionally halts after planning for human
-approval.
-
-**What that does and does not cover**, layer by layer, because the difference is
-where people get hurt:
-
-| Layer | Covers | Does not cover |
-|---|---|---|
-| Loop code | Cannot merge, deploy, or target a prod ref. Structural — there is no method to call. | Says nothing about the agent process, and the workspace shells out to `git` directly for branch, commit and push. |
-| Runner deny list | The reference Claude runner refuses `git push`, `git merge`, `git tag`, `gh pr merge`, `gh release`, `gh workflow run` on **every** turn. | Pattern matching, not a sandbox: a script or an unmatched invocation reaches the same effect. |
-| Frozen intent | Contract v2 is validated, gated, separately committed, and digest-checked after later turns. | Schema conformance does not prove the declared intent is true or complete. |
-| Exact approval | Controller records bind repository, issue, artifact digest, and plan parent digest. | The local operator identity is not a cryptographic signature. |
-| Findings-only review | Models emit typed observations bound to the reviewed fingerprint; deterministic code owns disposition. | A model may still miss a defect or report a false positive. |
-| Design gate | Exact Contract, Design, configuration, capability and analyzer identities are replayable. | Schema validity is not design correctness; the gate cannot prove omitted facts or sensor completeness. |
-| Analyzer boundary | Time, bytes, frames, descriptors, output and persistent workspace fingerprints are bounded. | Installed analyzers are trusted code; normalized evidence is not a sandbox and cannot disprove transient or external side effects. |
-| Re-verify and objective secret scan | Tests are rerun and produced Git blobs are checked for high-signal secret shapes before a PR. | This is not the full public-content policy; CI, history-range scanning, protected `main`, and human release review remain separate requirements. |
-
-Unattended operation still needs a sandboxed runner and least-privilege
-credentials, which are yours to supply. What changed is that ignoring that advice
-now costs you a layer rather than all of them.
-
-## Extending it
-
-* **New provider** — implement the relevant Protocol in `adapters/base.py`,
-  `@register("source", "gitlab")` it, and select it in the manifest. No core change.
-* **New persona** — add a prompt-persona to `core/personas/catalog.yaml`; promote
-  it to an authored `<name>.md` once it earns its keep (the drift check enforces
-  the contract).
-* **Domain pack** — drop a `core/personas/packs/<industry>.yaml`; the loader merges it.
-* **New check** — implement the `Collector` contract over your tables.
-
-Your custom modules are loaded via the manifest's `plugins:` list or a
-`software_factory.plugins` entry point — so you extend the factory for your own tools
-without forking it. Full recipe (a Dokploy connector, end to end): **[docs/WRITING_A_PLUGIN.md](docs/WRITING_A_PLUGIN.md)**.
-
-## Provenance — what is proven and what is not
-
-Being precise about this, because "generalized from a production system" is easy
-to over-claim and the distinction changes how much you should trust each part.
-
-**Generalized from a production factory** (ElBasket `TheScraperEngine`, which runs
-this loop against a live system, invoked on demand rather than on a schedule):
-the observe→diagnose→queue→verify loop, the harvester and its dedup, the
-collectors and ratchets, the orchestration doctrine, the persona catalog and tier
-policy, the deterministic gate helpers (`classify_tier`, `combine`,
-`decide_restart`), the contract validator, and the governance rails.
-
-**Written fresh for this package, and NOT production-proven:** `factory build`
-(`software_factory/build/`) — including the v0.2 Contract v2 lifecycle,
-hash-bound approvals, decision log, and findings-only review routing. The origin
-system builds with a **human-supervised agent session** following the doctrine,
-which is why the doctrine is the proven artifact and the autonomous builder is
-not. Adversarial review has found serious defects in successive build-loop
-iterations; [KNOWN_ISSUES.md](KNOWN_ISSUES.md) preserves that history and the
-current limits.
-
-The v0.2 design adapts ideas from Stanislav Rumega's 2026
-[*Tell Your Coding Agent to Work as an Architect First*](https://github.com/styrumg/Architect-First-Article):
-declare intent and design before code, use deterministic gates and existing code
-scanners, and keep a decision diary. Rumega's paper and examples are CC BY 4.0.
-AIFactory adapts ideas, not source implementation; its implementation code and
-fixtures are original Apache-2.0 work. See the
-[0.2.0 release notes](docs/releases/0.2.0.md) for the licensing boundary and the
-parts deliberately deferred.
-
-The 0.3 operator lifecycle was conceptually informed by
-[Everything Claude Code](https://github.com/affaan-m/ecc) at commit
-`649def769bd860512e5fce86e30aa05c8119259f`: explicit capability visibility,
-analyzer-style harness inspection, review-oriented presentation, managed
-lifecycle planning, and portable context. This is influence, not a vendored
-dependency or copied implementation; no ECC source or assets are included.
-
-Maintainer: BrainMatterStudios.
+Apache-2.0. Maintainer: BrainMatterStudios.

@@ -1,204 +1,241 @@
 # AIFactory roadmap
 
-**Last updated:** 2026-10-23
+**Last updated:** 2026-11-20
+**Supersedes:** the 2026-10-23 roadmap (0.3.1 → 0.8.0), which remains in git
+history. The analysis behind this revision is in
+[REVIEW-2026-11.md](REVIEW-2026-11.md).
 
-This roadmap records the intended sequence after the public 0.3.0 release. It
-is an ordering and dependency document, not a promise of dates. A release enters
-implementation only after its own design is approved, its predecessor satisfies
-the relevant exit criteria, and an implementation plan is reviewed.
+## Direction
 
-## Release principles
+The 0.x factory relayed each issue through a chain of persona agents, schemas,
+gates and digest-bound approvals. That design suited weaker models. With
+current frontier models it is slow, and it is no longer used. The new
+direction:
 
-- Human authority always binds to exact artifact digests.
-- Models, runners, analyzers, memories, dashboards, and labels remain sensors or
-  projections; none may create approval.
-- Required evidence that is missing, stale, malformed, or unavailable fails
-  closed.
-- Required quality evidence must prove that the asserted check executed and was
-  capable of observing failure. Agent-authored or agent-reported test results
-  are context, not authority.
-- The factory's own outcomes are measured, not asserted. Every workflow stage
-  must be able to show, on a held-out task suite, that it improves reliability,
-  cost, or review burden enough to justify itself. A stage that cannot is a
-  candidate for removal, and stages are re-measured when the configured model
-  tiers change, because a stage that compensated for one model's weakness may
-  not be needed by the next.
-- Each release must preserve replay, migration, rollback, public-boundary, and
-  zero-hard-dependency expectations unless a later design explicitly changes
-  them.
-- Operator experience is built over authoritative artifacts. It does not become
-  a second state store.
-- Runtime enforcement belongs to optional execution backends. The core states
-  capability requirements and gates on observed capabilities; it does not
-  depend on one particular sandbox.
-- Future releases are promoted by evidence, not merely by reaching a date.
+1. **Go lean now.** Retire the 0.x machinery straight away, with no
+   head-to-head comparison (decided 2026-11-20). Build a lean factory: one
+   strong agent session per issue, gates enforced by the platform (CI, branch
+   rulesets, native agent permissions), one independent review, and a human
+   merge and deploy.
+2. **Measure in parallel.** Collect every agent session (Claude Code, Codex,
+   CI), find where agents struggle, and track throughput and SDLC KPIs. Build
+   this as a standalone analytics module in this repository: the factory's
+   self-improvement loop. The lean factory and analytics are built side by
+   side, and neither waits for the other.
+3. **Close the loop.** Weekly findings become small changes to the factory's
+   configuration (CLAUDE.md, AGENTS.md, skills, hooks, settings), and the next
+   weeks' data confirms or refutes each one.
 
-## Release sequence
+## Principles (kept, restated)
 
-| Release | Theme | Primary result | Depends on | Status |
-|---|---|---|---|---|
-| 0.2.0 | Architecture before code | Contract v2, exact approvals, findings-only sensors, deterministic routing | — | Released |
-| 0.3.0 | Design authority and capability honesty | Design IR v1, deterministic design gate, runner capability contracts, analyzer adapters, status projection | 0.2.0 | Released 2026-08-29 |
-| 0.3.1 | Platform paths and factory evaluation | macOS no-atime harness reads, actionable diagnostics, a standard sandbox backend, `factory eval` with a held-out task suite and pass^k reporting, package publication | 0.3.0 | Next; brief approved for detailed design |
-| 0.4.0 | Quality evidence core | Quality obligations, non-vacuous run records, held-out acceptance scenarios, deterministic quality routing, one scripted browser journey and one API journey | 0.3.1 evidence satisfying the 0.4.0 entry gate | Roadmap brief |
-| 0.4.1 | Independent verification | Fresh-context exploratory tester, cross-vendor verification option, judge calibration controls, post-delivery observations | 0.4.0 | Roadmap brief |
-| 0.5.0 | Human review and evidence UX | Digest-bound Review Canvas, anchored feedback, quality-evidence views, approval handoff, notifications | Stable 0.4 quality artifacts and recorded review needs | Roadmap brief |
-| 0.6.0 | Managed adoption and harness posture | Plan/apply lifecycle, ownership, drift, repair/uninstall, harness analyzers, context/tool budgets | 0.3 contracts and 0.5 review UX | Roadmap brief |
-| 0.7.0 | Governed evolution | Code-to-design sensing, design-drift detection, improvement proposals, replay evaluation, human admission | 0.3 authority and 0.6 ownership | Roadmap brief |
-| 0.8.0 | Portable knowledge and ecosystem | Provenance-bearing handoffs, cross-runner context, curated capability packs, optional read-only dashboard | 0.5 review, 0.6 lifecycle, 0.7 promotion controls | Roadmap brief |
+- **The human owns what cannot be undone:** production releases, scope of
+  large features, and policy. Everything else may run unattended.
+- **Gates are code, but preferably someone else's code.** Use CI, branch
+  rulesets, CODEOWNERS and agent permission settings before writing our own
+  enforcement.
+- **Every stage must earn its place in the data.** A stage that does not
+  measurably improve reliability, cost, or human attention is removed. Every
+  stage is re-checked when models change.
+- **Analytics is an observer with no authority.** It never approves, blocks, or
+  merges. It files or updates issues, and humans decide.
+- **Lean by default.** A one-page brief beats a 2,000-line plan. One session
+  beats a relay of handoffs. If a design document needs more than two pages,
+  the scope is too big.
 
-Containment backends are developed on a parallel track (below). They supply
-capabilities that releases may require, but no release waits on one specific
-backend.
+## Sequence
 
-### Why the sequence changed on 2026-10-23
+Two tracks run in parallel after phase 0. Week targets are approximate and
+come from scope estimates, not commitments.
 
-The previous gate made 0.4.0 detailed design wait on a corrected kernel-level
-filesystem-enforcement backend passing a live, digest-bound field trial.
-Several weeks of field trials improved that backend and its diagnostics, but
-they did not produce evidence about the question 0.4.0 exists to answer:
-whether the factory can tell an executed check from a vacuous one. Two further
-problems were visible from the outside:
+| Phase | Track | Theme | Primary result | Exit criterion | Target |
+|---|---|---|---|---|---|
+| **0** | — | Start | Retention raised, telemetry on, history backed up, `v0.3-archive` branch created | Both machines exporting OTel to Grafana Cloud | **This week** |
+| **L1** | Lean | Retire | Old machinery removed from `main`; slim CLI | `main` holds only kept modules; CI green | **Done on branch, awaiting merge** |
+| **L2** | Lean | Lean factory v1 | One-session-per-issue dispatcher, platform gates, cross-vendor review, human merge | First 5 real issues through it end to end | **In progress:** `factory dispatch` built |
+| **A1** | Analytics | Collect | Redacted transcripts from both machines and both agents land in the bucket every night | 7 consecutive days with ≥99% of sessions archived (reconciled against OTel `session.count`) | Weeks 1–2 |
+| **A2** | Analytics | Extract and join | Deterministic signals, Parquet/DuckDB store, session↔PR↔CI↔deploy joins, KPI dashboard | Dashboard shows the core KPIs; 10 spot-checked joins correct | Weeks 2–4 |
+| **A3** | Analytics | Diagnose | Calibrated rubric pass (batch), weekly synthesis report and deduped issues | Rubric meets the calibration bar; first weekly report filed | Weeks 4–6 |
+| **L3** | Both | Closed loop | Weekly proposals become config PRs, with each change's KPI effect tracked | 3 changes shipped with measured before/after | From week 6, ongoing |
 
-- The default Design path blocked on the primary operator platform, because
-  ordinary macOS volumes could not prove a no-atime read.
-- The project had no measurement of its own outcomes. The release criteria
-  asked for a field-evaluation record, but no tool existed to produce one.
+Every session from day one is collected, including those run through the
+lean factory. The first weeks of data are therefore the lean factory's own
+baseline. No separate comparison against the old factory is planned.
 
-Current practice for agentic development also moved in a direction that makes
-the narrower path safe. Coding-agent products now isolate agents with
-operating-system sandboxes, deny network egress by default, keep credentials
-outside the sandbox, and stop a headless run on the first out-of-policy action
-([Anthropic: Claude Code sandboxing](https://www.anthropic.com/engineering/claude-code-sandboxing),
-[Factory: Droid Exec](https://docs.factory.com/cli/droid-exec/overview)).
-Guidance on evaluating agents recommends private task suites, code-based
-graders, and pass^k reliability rather than single-run anecdotes
-([Anthropic: Demystifying evals for AI agents](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents)).
+## Phase 0: stop the bleeding (this week)
 
-The revision therefore:
+- [ ] **Raise transcript retention now** on both machines: `cleanupPeriodDays`
+      (the default deletes sessions after 30 days). Then copy
+      `~/.claude/projects` and `~/.codex/sessions` to the bucket or an
+      encrypted disk as-is. These are the history that the first analytics
+      runs work from.
+- [ ] Enable Claude Code OTel to Grafana Cloud through **Enterprise managed
+      settings**, not a repo `.claude/settings.json`, where the variables are
+      ignored. Turn on metrics and logs, set
+      `OTEL_METRICS_INCLUDE_REPOSITORY=true`, and leave content flags off.
+- [ ] Enable Codex OTel export (verify the `[otel]` config against OpenAI's
+      docs first).
+- [ ] Create an Enterprise Analytics API key (primary owner) and request
+      Compliance API access, so A1 can compare it with laptop sync.
+- [ ] Agree the privacy rules: redaction before storage, a client-repository
+      exclusion list, mutual read access, and KPIs that are not a personal
+      leaderboard.
+- [x] Create the `v0.3-archive` branch at `main` (`00fe2d1`), done
+      2026-11-21. It is the only copy of the 0.x machinery after L1. Consider
+      protecting it so it cannot be deleted or force-pushed.
+- [ ] Set up the lean factory's bot identity: a GitHub App or fine-grained
+      token with contents and PR write access, no merge or admin rights.
+      Protect `main` with a ruleset that requires CI and a human approval.
 
-1. inserts 0.3.1 to fix the platform path and to build the evaluation tool
-   that the 0.4.0 entry gate needs;
-2. lets a standard sandbox backend satisfy the runner-capability criterion, and
-   moves the kernel-level backend to the parallel containment track;
-3. splits the former 0.4.0 scope into a quality-evidence core (0.4.0) and
-   independent verification (0.4.1), so the first can ship without waiting on
-   the exploratory tester; and
-4. adds held-out acceptance scenarios, judge calibration, and a cross-vendor
-   verification option, which address the remaining ways a builder can satisfy
-   its own checks.
+## L1: retire the old machinery (week 1)
 
-Authority boundaries are unchanged. No backend, evaluation run, or score can
-create approval.
+- In one PR, remove `build/`, `execution/`, `core/design/`,
+  `core/contracts/`, `core/approvals.py`, `analyzers/`, `trace/`, the persona
+  catalog, release readiness, and their tests and docs (including
+  `docs/superpowers/`).
+- Keep:
+  - `loop/` (verify, harvester, collectors, ratchet, security, spend);
+  - `adapters/`;
+  - `core/governance.py` (kill switch, budget, prod-ref ceiling);
+  - `core/publication.py` (secret and public-content scanner);
+  - `core/config.py`;
+  - `core/orchestrate/classify_tier`.
+- Slim `cli.py` to `init`, `doctor`, `observe`, `pickup`, `schedule`, and the
+  new `dispatch`.
+- Rewrite README and KNOWN_ISSUES for the new shape. Keep the candour, drop the
+  machinery history; the archive branch holds it.
+- Expected result: roughly 6 to 8K source lines, down from about 66K.
+- Follow-up after the L1 PR merges: remove the retired security-control
+  exemptions from `public-content-policy.json` and `core/publication.py`. They
+  stay until then because the PR's history-range scan still sees the deleted
+  files in earlier commits.
 
-## The 0.4.0 entry gate
+## L2: lean factory v1 (weeks 2–3)
 
-`factory release readiness 0.4.0` projects this gate into a deterministic
-operator preflight. It accepts only a redacted public-safe evidence summary and
-fails closed when that summary is absent, incomplete, vacuous, unavailable, or
-unsafe. A ready preflight authorizes only the next design activity; it is not a
-version bump, release approval, publication approval, or substitute for the
-later detailed design and implementation reviews.
+**Status (2026-11-21):** `factory dispatch` is implemented and tested against
+real git. Remaining: deploy it on the VPS, the `main` ruleset and bot identity
+(phase 0 items), the cross-vendor review workflow, and the first 5 real issues.
 
-The criterion identifiers are unchanged. What satisfies each one:
+- **Intake:** observe loops (production through the fleet agent, the factory
+  through analytics) file deduped issues. A human adds the `ready` label.
+- **Dispatch:** `factory dispatch` runs on the VPS through Dokploy, or as a
+  GitHub Action. It starts **one** agent session per ready issue in the
+  agent's native sandbox, with the bot identity's least-privilege
+  credentials. The agent plans, implements, runs tests, and opens a PR into
+  the dev branch. Claude Code headless is the default; Codex `exec` is a
+  configuration choice.
+- **Scope gate:** when `classify_tier` says "large feature", the agent posts a
+  short plan and waits for a human approval label. That is the only pause.
+- **Gates:**
+  - CI runs tests, lint, and the secret and public-content scan;
+  - one independent review by the other vendor's model, through the Claude
+    Code GitHub Action or Codex review;
+  - the `main` ruleset;
+  - the bot cannot merge, administer, or deploy.
+- **Release:** a human merges to `main` and triggers the Dokploy deploy. The
+  ceiling is unchanged.
+- **Telemetry from day one:** dispatched sessions export OTel and upload their
+  transcripts, so analytics sees them like any interactive session.
+- **Per-repository config:** CLAUDE.md, AGENTS.md, skills and hooks are the
+  factory's tunable surface, and the closed loop edits them.
 
-| Criterion | Satisfied when recorded evidence shows |
-|---|---|
-| `representative-t2-lifecycle` | At least three held-out evaluation tasks of T2 size completed the full Contract -> Design IR -> gate -> exact approval -> implementation -> judge path on a supported backend. Failed runs are recorded, not discarded. |
-| `non-toy-runner-capabilities` | One supported execution backend declared and observed every capability a representative T2 workflow requires, including bounded writable paths, default-deny network egress with an explicit allowlist, credentials held outside the agent's environment, and refusal of merge and deployment. The standard sandbox backend may satisfy this; the kernel-level backend is not required. |
-| `operator-platform-paths` | Both macOS and Linux have a supported path through the default Design gate, with no high-severity fail-closed harness evidence caused by the platform alone. Windows may be documented as unsupported. |
-| `field-evaluation-record` | `factory eval` produced a retained report over the held-out suite with at least three trials per task, including pass@1, pass^k, cost, wall-clock time, human interventions, gate blocks, judge verdicts against seeded defects, and every capability gap, unavailable analyzer, or vacuous check observed. |
-| `quality-scope-minima` | The evaluation evidence names the minimum useful 0.4.0 obligations, evidence states, and provider capabilities, and the minimum useful 0.5.0 review views. It must not justify a second approval language. |
-| `nonvacuous-quality-control` | At least one intentionally empty, skipped, or unavailable control was run and failed closed, and at least one seeded defect was caught by a check that also passed on the corrected candidate. |
+## A1: Collect
 
-Repository-specific field trials are deliberately outside this roadmap's
-implementation deliverables. An operator may run one only as a separately
-approved, rollbackable activity using controller-owned inputs and private
-evidence storage. The held-out task suite, its target repositories, transcripts,
-and raw evaluation evidence stay private; only the redacted summary enters the
-readiness preflight.
+- Package `insights/` (Python `aif_insights`, its own `pyproject.toml` in a uv
+  workspace). It must **not** import `software_factory`, enforced by an
+  import-boundary test.
+- Sources, in order of preference:
+  1. Claude Code, from the **Compliance API** if its fidelity matches local
+     JSONL (subagent sidechains and tool results included). Otherwise from a
+     laptop agent.
+  2. A laptop agent for Codex, and for Claude Code if needed. Run a nightly
+     sweep through launchd or cron, upload anything new or changed, and keep a
+     manifest of uploaded files with their hashes. A `SessionEnd` hook is only
+     a fast path.
+  3. CI and headless runs: upload `~/.claude/projects` as a workflow artifact or
+     straight to the bucket at job end. Cloud sessions are captured where
+     possible; document what is out of reach.
+- Redact before storage. Reuse the secret patterns in `core/publication.py`
+  plus an entropy check. Count every redaction, and never drop a whole record
+  silently.
+- Bucket layout and Grafana cardinality rules: REVIEW §3.3.
+- Reconciliation job: compare sessions archived against OTel `session.count`
+  per user per day and alert on gaps.
 
-## Parallel track: containment backends
+## A2: Extract and join
 
-AIFactory owns capability requirements, normalized observations, deterministic
-gating, and exact approval. Backends own enforcement. This track is ordered by
-value to operators, not by release number:
+- `normalize()` turns each agent's format into one `Session` schema. Parsers
+  are version-tolerant: unknown record types are counted and reported.
+- `extract()` computes deterministic signals: interrupts, corrections, tool
+  errors by class, retry and test loops, test outcomes, shape, cost, and
+  subagent share.
+- `Joiner` stores session ↔ commit ↔ PR ↔ CI run ↔ Dokploy deploy as weighted
+  edges. KPIs are computed from the edges.
+- Outputs:
+  - Parquet under `derived/`, queryable with DuckDB;
+  - metrics to Grafana Cloud;
+  - per-session log lines to Loki.
+- **Core KPIs:**
+  - cost per merged PR (token-equivalent);
+  - first-pass CI rate;
+  - rework rate;
+  - correction loops per session;
+  - human attention per merged PR;
+  - abandoned-session rate;
+  - autonomy span;
+  - DORA (lead time, deploy frequency, change-fail rate, MTTR), as trends.
 
-1. **Standard sandbox backend.** Run the agent under an operating-system
-   sandbox (Seatbelt on macOS, bubblewrap or a container on Linux) with
-   bounded writable paths, a default-deny egress proxy, and credentials
-   injected outside the sandbox. Required by 0.3.1.
-2. **Graduated autonomy levels.** Express runner permissions as explicit
-   levels (read, edit, local commit, push to a factory branch) that a run
-   declares up front, and stop the run with a non-zero exit on the first
-   action above its level. Merge and deployment remain unexposed at every
-   level.
-3. **Headless authentication.** Validation cells and unattended runs
-   authenticate with scoped, revocable, non-interactive credentials supplied
-   by the controller. Interactive login inside a cell is not a supported
-   path.
-4. **Command validation by parsing.** Replace name-pattern deny lists with
-   parsed-command validation where the runner exposes commands, and treat
-   repository files, issue text, plugins, and tool descriptions as untrusted
-   input.
-5. **Kernel-level filesystem enforcement.** The corrected Linux/aarch64
-   backend remains an optional, advanced validation dependency with its
-   existing digest-bound admission. Upstream Leash v1.1.7 remains available
-   only for historical replay.
-6. **Package boundary.** Move the validation-cell and backend code out of the
-   core package into an optional distribution once two backends share a stable
-   interface, so a core-only installation does not carry backend code.
+  Definitions are in REVIEW §4.1.
+- Run it as a scheduled container on the VPS through Dokploy, the same pattern
+  as the fleet-monitoring agent.
 
-## Canonical release documents
+## A3: Diagnose
 
-- [0.3.0 design authority design](superpowers/specs/2026-08-10-aifactory-0.3.0-design-authority-design.md)
-- [0.3.1 platform paths and factory evaluation brief](superpowers/specs/2026-10-23-aifactory-0.3.1-platform-evaluation-brief.md)
-- [`factory eval` design](superpowers/specs/2026-10-23-factory-eval-design.md)
-- [0.4.0 quality evidence and 0.4.1 independent verification brief](superpowers/specs/2026-09-26-aifactory-0.4.0-quality-verification-brief.md)
-- [0.5.0 human review and evidence brief](superpowers/specs/2026-08-10-aifactory-0.5.0-human-review-brief.md)
-- [0.6.0 managed adoption and harness posture brief](superpowers/specs/2026-08-10-aifactory-0.6.0-managed-adoption-brief.md)
-- [0.7.0 governed evolution brief](superpowers/specs/2026-08-10-aifactory-0.7.0-governed-evolution-brief.md)
-- [0.8.0 portable knowledge and ecosystem brief](superpowers/specs/2026-08-10-aifactory-0.8.0-portable-knowledge-brief.md)
+- `digest()` builds a compact session timeline. The LLM never sees raw
+  transcripts.
+- The rubric v0 is in REVIEW §4.2. It returns structured JSON through
+  `output_config.format`, sent through the Message Batches API.
+- **Calibration before trust:** hand-label 30 sessions and compare Haiku 5.5,
+  Sonnet 5.5 and Opus 5.5. Pick the cheapest model with ≥90% agreement on
+  outcome and ≥75% on primary struggle category. Default to Sonnet 5.5 until
+  then. At this volume the difference is about $2 versus $40 versus $80 a
+  month, so accuracy decides.
+- Weekly synthesis runs on Opus 5.5 (or Fable 5.2) over DuckDB aggregates. It
+  produces:
+  - a report;
+  - 3 to 5 proposals, each naming the KPI it should move;
+  - findings in the `{name, verdict, evidence}` collector shape, filed through
+    the existing harvester, so a recurring struggle updates one issue instead
+    of creating a new one.
+- Weekly spot check: a human reads 5 random sessions against their tags.
 
-The 0.3.0 document records the approved design that shipped in the public
-release. The 0.3.1 through 0.8.0 documents are design-grade briefs: they
-preserve objectives, boundaries, dependencies, non-goals, risks, and promotion
-criteria without inventing file-level work against APIs that do not exist yet.
+## L3: closed loop (from week 6)
 
-## Promotion rules
+- Each accepted weekly proposal becomes a small config PR: CLAUDE.md,
+  AGENTS.md, a skill, a hook, a settings change, or a dispatcher tweak.
+- Each PR names the KPI it should move. The weekly report tracks before and
+  after for every shipped change, and reverts changes that don't help.
 
-A release may begin detailed design when:
+## Not doing (explicitly retired)
 
-1. Its predecessor has shipped or the required predecessor interfaces are
-   otherwise frozen and verified.
-2. The roadmap brief's entry criteria are satisfied with recorded evidence.
-3. Known production or adoption evidence does not invalidate the proposed
-   scope.
-4. Authority and rollback boundaries are explicitly approved.
-5. When a release builds over an operational workflow, at least one supported
-   end-to-end path has been exercised on representative real work; shipped
-   schemas alone are insufficient evidence.
-6. When a release claims verification or quality evidence, at least one
-   intentionally failing, empty, skipped, or unavailable control demonstrates
-   that the relevant gate cannot pass vacuously.
-7. When a release adds a workflow stage, the evaluation suite records its
-   effect on reliability, cost, and review burden before the stage becomes a
-   default.
+- Any head-to-head comparison against the old factory (decided 2026-11-20).
+- 0.3.1 sandbox backend, `factory eval`, PyPI publication under a new name.
+- 0.4.0/0.4.1 quality obligations, exploratory tester, judge calibration.
+- 0.5.0 Review Canvas. 0.6.0 managed adoption. 0.7.0 governed evolution, now
+  replaced by L3. 0.8.0 portable knowledge.
+- The containment track (Lima, Leash, pnpm staging, graduated autonomy
+  levels). Native agent sandboxes and platform permissions cover it.
 
-A release may ship only when its own adversarial exit criteria pass. Push, pull
-request, merge, tag, GitHub release, and registry publication remain separately
-approved shared-state actions.
+These can return only if the analytics data shows a specific problem that the
+lean design fails to handle.
 
-## Research horizon after 0.8.0
+## Open decisions
 
-The following remain research candidates rather than numbered commitments:
-
-- organization-level policy distribution;
-- hosted multi-project coordination;
-- a curated capability-pack registry;
-- public, comparative workflow and runner benchmarks beyond the private
-  evaluation suite;
-- privacy-preserving aggregate learning across installations.
-
-They receive release numbers only after operational evidence establishes a
-specific user problem, a safe authority model, and a bounded implementation.
+1. **Compliance API or laptop sync for Claude Code.** Decide after the A1
+   fidelity check.
+2. **Bucket provider and region.** Any S3-compatible store works. Pick one
+   close to the VPS.
+3. **Which vendor implements and which reviews?** Start with Claude Code
+   implementing and Codex reviewing. Revisit after 4 weeks of A2 data on
+   rework and first-pass CI.
+4. **Whether to keep the repository public.** The analytics module and rubric
+   are fine to publish. Transcripts and derived data never are.

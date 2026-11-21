@@ -20,26 +20,30 @@ factory:
   #    up automatically and need not be listed here. See docs/WRITING_A_PLUGIN.md.
   plugins: []                 # e.g. [mycompany_factory.adapters]
 
-  # Optional: project-local persona packs (extra roles for your domain).
-  personas:
-    packs: []                 # e.g. [factory-personas]  (dirs of *.yaml, relative to this file)
-
   # 1. SOURCE — VCS + the issue board that is the work queue.
   source:
     provider: github          # reference: github (gh CLI) | memory (offline)
     repo: my-org/my-repo
-    ready_label: ready        # the only label/column a build loop pulls from
+    ready_label: ready        # the only label/column dispatch pulls from
     # board columns are advisory here; on the free plan the github adapter
     # mirrors columns onto col:<name> labels (see github.py).
 
-  # 2. RUNNER — spawns agents at a model tier. Tier names map to concrete ids
-  #    here, so the doctrine never hardcodes a vendor model id in prose.
+  # 2. RUNNER — runs one agent session. Tier names map to concrete model ids
+  #    here, so nothing in the code hardcodes a vendor model id.
   runner:
     provider: claude_code     # reference: claude_code | echo (offline)
     models:
-      opus: claude-opus-4-8
-      sonnet: claude-sonnet-4-6
-      haiku: claude-haiku-4-5-20251001
+      opus: claude-opus-5-5
+      sonnet: claude-sonnet-5-5
+      haiku: claude-haiku-5-5
+    # Headless sessions need permission to edit and run commands without a
+    # prompt. Inside a container or VM sandbox with least-privilege credentials:
+    #   extra_args: ["--dangerously-skip-permissions"]
+    # Outside one, allow edits and only the commands your tests need:
+    #   extra_args: ["--permission-mode", "acceptEdits",
+    #                "--allowedTools", "Bash(git add:*),Bash(git commit:*),Bash(pytest:*)"]
+    # The release verbs (git push, gh pr merge, gh release, …) are always denied.
+    # timeout_s: 3600
 
   # 3. OBSERVE — read-only run status + logs. Swap for your platform.
   observe:
@@ -69,41 +73,28 @@ factory:
     command: "factory observe --target prod --apply --alert"
     repo_dir: .               # github_actions: where to write the workflow file
 
-  # ── how the L3 build loop turns an issue into a PR (`factory build <id>`) ───
+  # ── where agent work lands ─────────────────────────────────────────────
   build:
-    dev_branch: develop       # the ONLY base the loop may target — never a prod ref
+    dev_branch: develop       # the ONLY base agent PRs may target — never a prod ref
     verify_cmd: "pytest -q"   # YOUR project's test/lint gate; must pass before a PR
-    workspace_root: .factory-worktrees
-    max_revise: 2             # bounded deterministic review revisions
-    # Current guidance: freeze Contract v2 intent before implementation and use
-    # findings-only sensors. verdict_v1 is deprecated v0.x compatibility only.
-    require_contract: true
-    review_protocol: findings_v2
-    # New 0.3 projects use immutable Design IR authority. Existing projects can
-    # retain `design_protocol: legacy_plan`; an in-progress Contract keeps the
-    # protocol first recorded for that exact parent even if this config changes.
-    design_protocol: design_ir_v1
-    design_author_role: design-author
-    design_analyzers:
-      - name: harness
-        required: true
-    contracts_dir: contracts
-    contract_author_role: contract-author
-    # Controller approvals/decision events must resolve outside this repository
-    # and every worktree. If set, this overrides FACTORY_STATE_DIR; if both are
-    # absent, the controller default is used. Exact pending/accepted contracts
-    # and stored plans are separate ignored controller state under .factory in
-    # the canonical checkout, outside disposable agent worktrees.
-    # state_dir: null
-    # This legacy status label is compatibility-only and deprecated as authority.
-    # Current T2 approval uses the exact plan digest plus parent contract digest.
+
+  # ── factory dispatch: one agent session per Ready issue ─────────────────
+  dispatch:
+    model: opus               # a runner tier name or a concrete model id
+    branch_prefix: factory/
+    # worktree_root: ~/.software-factory-state/worktrees/my-project
+    verify_timeout_s: 1800
+    feature_labels: [type:feature, feature, enhancement]   # these get the plan gate
+    plan_pending_label: plan-pending
     plan_approved_label: plan-approved
+    pr_open_label: pr-open
+    blocked_label: blocked
 
   # ── policy ────────────────────────────────────────────────────────────────
   routing:
     thresholds:               # what counts as "large" (floors a task at T2)
       large_files: 5
-      large_lines: 150
+      large_lines: 150         # a T2 feature waits for human scope approval
 
   # Spend caps. `monthly_usd` is enforced across runs via a small state file
   # outside the repo (FACTORY_STATE_DIR, default ~/.software-factory-state), so a
@@ -121,8 +112,6 @@ factory:
     # have server-side branch protection on the prod ref — a convention-only
     # gate is not enough. `factory doctor` flags this.
     require_branch_protection: true
-    # The agent must never be able to read the gate it is measured against.
-    eval_gate_path: evals/
     # Branch names the ceiling refuses to open a PR into. The built-in defaults
     # are main / master / production / prod, compared after normalizing
     # `refs/heads/…` and `origin/…`. Add yours if you release from something else

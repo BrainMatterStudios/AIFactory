@@ -1,34 +1,9 @@
-"""Deterministic gate-rule helpers for the orchestration doctrine.
+"""Deterministic tier routing.
 
-The doctrine's *behaviour* is procedural (the orchestrate skill + persona files
-under core/personas/ and the rendered doctrine in core/doctrine.md). These
-helpers encode only the parts that must be enforced by code, not by an LLM
-remembering a rule:
-
-  * which tier a task floors at (routing.classify_tier),
-  * how a panel of judge verdicts combines — majority + revise cap + the
-    security veto (verdict.combine), and
-  * whether a BLOCK is a restartable dead-end or a human call
-    (verdict.decide_restart).
-
-Pure functions, no I/O, no third-party deps. Ported and generalized from the
-proven ElBasket implementation (TheScraperEngine/factory/orchestrate).
+`classify_tier` decides how much ceremony a task gets. In the lean factory the
+only tier-dependent behaviour is the scope gate: a large feature posts a plan
+and waits for human approval before implementation.
 """
-from software_factory.core.orchestrate.routing import Tier, classify_tier
-from software_factory.core.orchestrate.verdict import (
-    RESTART_CAP,
-    REVISE_CAP,
-    Verdict,
-    combine,
-    decide_restart,
-)
+from software_factory.core.orchestrate.routing import Thresholds, Tier, classify_tier
 
-__all__ = [
-    "RESTART_CAP",
-    "REVISE_CAP",
-    "Tier",
-    "Verdict",
-    "classify_tier",
-    "combine",
-    "decide_restart",
-]
+__all__ = ["Thresholds", "Tier", "classify_tier"]
