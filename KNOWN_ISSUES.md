@@ -13,10 +13,19 @@ analyzers, decision log, Lima/Leash validation cells) were removed in November
 production, and successive adversarial review rounds kept finding defects in
 it. See [docs/REVIEW-2026-11.md](docs/REVIEW-2026-11.md).
 
-Until `factory dispatch` lands (roadmap phase L2), the build stage is an agent
-session you start yourself: run `factory pickup`, then give the issue and
-[`core/doctrine.md`](software_factory/core/doctrine.md) to Claude Code or
-Codex.
+`factory dispatch` replaces it: one agent session per Ready issue, with the
+dispatcher re-running the tests, scanning the diff, and opening the PR. It is
+new. Run it by hand on low-risk issues before scheduling it, and keep these in
+mind:
+
+- **The dispatcher trusts the configured runner's sandbox.** It isolates the
+  agent in a worktree and denies release verbs, but a headless agent with
+  broad permissions can still read anything its user can. Run it in a
+  container or VM with least-privilege credentials.
+- **Plan approval is a label, not a signature.** Anyone who can label issues
+  can approve a plan. Restrict who can add `plan-approved` if that matters.
+- **Labels accumulate.** The dispatcher adds `pr-open`, `plan-pending` and
+  `blocked` but never removes them. Remove `blocked` by hand to retry an issue.
 
 ---
 

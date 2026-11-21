@@ -109,7 +109,7 @@ def _build_memory_source(config: Mapping[str, Any]) -> MemorySource:
 # Runner — echoes the prompt back; deterministic, no model call
 # --------------------------------------------------------------------------- #
 class EchoRunner:
-    def run_agent(self, prompt, *, model, system=None, tools=None, cwd=None) -> RunResult:
+    def run_agent(self, prompt, *, model, system=None, tools=None, cwd=None, env=None) -> RunResult:
         return RunResult(ok=True, output=f"[echo:{model}] {prompt[:200]}", model=model)
 
 

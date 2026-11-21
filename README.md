@@ -32,7 +32,8 @@ Observe(🤖) → Diagnose(🤖) → Queue(🤖) → Triage(🧑) → one agent 
 | Observe | Scheduled checks over runs, logs and data | `loop/verify.py`, `loop/collectors.py`, the observe and data adapters |
 | Diagnose and queue | Findings become issues, deduplicated by fingerprint (open *and* closed), recurrences counted instead of refiled | `loop/harvester.py` |
 | Triage | A human adds the `ready` label | your issue board |
-| Build | **One** Claude Code or Codex session per issue plans, implements, tests, and opens a PR into the dev branch. A large feature posts a plan and waits for scope approval | `core/doctrine.md`; `factory dispatch` arrives in roadmap phase L2 |
+| Build | **One** agent session per issue plans, implements, tests and commits in an isolated worktree. A large feature posts a plan and waits for scope approval | `factory dispatch`, `core/doctrine.md` |
+| Hand-off | The dispatcher re-runs `verify_cmd`, scans the diff for secrets, checks the ceiling, pushes, and opens the PR | `dispatch.py` |
 | Gate | CI runs tests and the secret/public-content scan; one review from a different model | your CI; `core/publication.py` |
 | Release | A human merges to `main` and deploys | your hosting provider and deploy tool |
 
@@ -48,6 +49,8 @@ factory init                     # writes factory.config.yaml (detects your GitH
 factory doctor                   # config, providers, kill switch, ceiling checks
 factory observe --target dev     # plan findings (add --apply to file issues)
 factory pickup                   # the next Ready issue
+factory dispatch --dry-run       # what one agent session would work on
+factory dispatch                 # run it and open a PR into the dev branch
 factory schedule render          # preview the unattended observe schedule
 ```
 
@@ -60,6 +63,7 @@ secrets in environment variables named by the manifest.
 | `observe` | PASS or WARN | overall FAIL | the board could not be searched — nothing filed |
 | `doctor` | healthy | a check failed | — |
 | `pickup` | issue printed, or queue empty | — | a stop-switch halted the loop |
+| `dispatch` | PR opened, plan posted, or nothing eligible | issue blocked or a stop engaged | another dispatch is running |
 
 ## The ceiling
 
@@ -91,7 +95,8 @@ software_factory/
     reference/         ← github, claude_code, docker, postgres, slack/telegram,
                          cron/launchd/gh-actions, and an offline set
   loop/                ← verify, harvester, collectors, ratchet, security, pickup
-  cli.py               ← init · doctor · demo · observe · pickup · schedule
+  dispatch.py          ← one agent session per Ready issue → verified PR
+  cli.py               ← init · doctor · demo · observe · pickup · dispatch · schedule
 ```
 
 ## Documentation

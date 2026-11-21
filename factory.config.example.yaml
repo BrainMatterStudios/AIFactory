@@ -36,6 +36,14 @@ factory:
       opus: claude-opus-5-5
       sonnet: claude-sonnet-5-5
       haiku: claude-haiku-5-5
+    # Headless sessions need permission to edit and run commands without a
+    # prompt. Inside a container or VM sandbox with least-privilege credentials:
+    #   extra_args: ["--dangerously-skip-permissions"]
+    # Outside one, allow edits and only the commands your tests need:
+    #   extra_args: ["--permission-mode", "acceptEdits",
+    #                "--allowedTools", "Bash(git add:*),Bash(git commit:*),Bash(pytest:*)"]
+    # The release verbs (git push, gh pr merge, gh release, …) are always denied.
+    # timeout_s: 3600
 
   # 3. OBSERVE — read-only run status + logs. Swap for your platform.
   observe:
@@ -69,6 +77,18 @@ factory:
   build:
     dev_branch: develop       # the ONLY base agent PRs may target — never a prod ref
     verify_cmd: "pytest -q"   # YOUR project's test/lint gate; must pass before a PR
+
+  # ── factory dispatch: one agent session per Ready issue ─────────────────
+  dispatch:
+    model: opus               # a runner tier name or a concrete model id
+    branch_prefix: factory/
+    # worktree_root: ~/.software-factory-state/worktrees/my-project
+    verify_timeout_s: 1800
+    feature_labels: [type:feature, feature, enhancement]   # these get the plan gate
+    plan_pending_label: plan-pending
+    plan_approved_label: plan-approved
+    pr_open_label: pr-open
+    blocked_label: blocked
 
   # ── policy ────────────────────────────────────────────────────────────────
   routing:

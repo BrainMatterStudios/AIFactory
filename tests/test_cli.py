@@ -249,3 +249,15 @@ def test_schedule_without_adapter_is_a_configuration_error(tmp_path, capsys):
     assert rc == 2
     assert "no scheduler adapter configured" in out
     assert "Traceback" not in out
+
+
+def test_example_config_loads_without_retired_keys():
+    yaml = pytest.importorskip("yaml")
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "factory.config.example.yaml"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        cfg = FactoryConfig.from_dict(yaml.safe_load(path.read_text(encoding="utf-8")))
+    assert cfg.dispatch.plan_approved_label == "plan-approved"
+    assert cfg.build_cfg.dev_branch == "develop"

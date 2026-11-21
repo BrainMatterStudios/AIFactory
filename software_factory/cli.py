@@ -8,6 +8,7 @@ Subcommands:
               adapters — no config, no external services.
   observe     run L1 verify + L2 harvest against the configured adapters.
   pickup      print the next Ready issue.
+  dispatch    run one agent session on the next Ready issue and open a PR.
   schedule    render/install/uninstall the unattended observe schedule.
   version     print the version.
 
@@ -477,6 +478,19 @@ def cmd_pickup(args) -> int:
     return 0
 
 
+def cmd_dispatch(args) -> int:
+    from pathlib import Path
+
+    from software_factory.dispatch import dispatch, format_result
+
+    cfg = _load_config(args.config)
+    repo = Path(args.repo) if args.repo else resolve_repo_root(cfg)
+    result = dispatch(cfg, repo=repo, issue_id=args.issue, dry_run=args.dry_run)
+    for line in format_result(result):
+        print(line)
+    return result.exit_code
+
+
 # --------------------------------------------------------------------------- #
 # parser
 # --------------------------------------------------------------------------- #
@@ -519,6 +533,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     pk = sub.add_parser("pickup", help="print the next Ready issue")
     pk.set_defaults(func=cmd_pickup)
+
+    dp = sub.add_parser(
+        "dispatch", help="run one agent session on the next Ready issue and open a PR"
+    )
+    dp.add_argument("--issue", help="dispatch this issue instead of the next Ready one")
+    dp.add_argument("--repo", help="path to the target repository (default: manifest root)")
+    dp.add_argument(
+        "--dry-run", action="store_true", help="show what would be dispatched; start nothing"
+    )
+    dp.set_defaults(func=cmd_dispatch)
 
     sc = sub.add_parser("schedule", help="render/install/uninstall the unattended observe schedule")
     sc.add_argument("action", choices=["render", "install", "uninstall"])

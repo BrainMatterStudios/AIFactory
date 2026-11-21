@@ -187,24 +187,35 @@ right several times.
 ## 5. Building the fix: one agent session
 
 ```bash
-factory pickup      # prints the next Ready issue, highest priority first
+factory pickup                # the next Ready issue, highest priority first
+factory dispatch --dry-run    # what dispatch would do with it
+factory dispatch              # run one agent session on it and open a PR
 ```
 
-Give that issue to one agent session in your repository, interactively or
-headless. The [doctrine](../software_factory/core/doctrine.md) is the short
-brief for that session:
+`factory dispatch` gives the issue to **one** agent session in an isolated git
+worktree on a fresh `factory/issue-<id>-…` branch from your dev branch. The
+[doctrine](../software_factory/core/doctrine.md) is the session's brief:
 
 1. **Read the issue in full**, including its Expected outcome field.
-2. **Size it** with `classify_tier`. A large feature posts a short plan as an
-   issue comment and waits for a human to approve scope. Everything else
-   proceeds.
-3. **Plan, implement and test in the same session**, failing test first,
-   until `verify_cmd` passes.
-4. **Open a PR into the dev branch.** Never merge, tag, release or deploy.
+2. **Size it** with `classify_tier`. A feature without an approved plan runs in
+   plan-or-build mode: if it is T2, the agent writes a plan and changes no
+   code. Dispatch posts the plan on the issue and labels it `plan-pending`.
+   Add `plan-approved` and the next dispatch builds against that plan.
+3. **Plan, implement and test in the same session**, failing test first, and
+   commit. The agent never pushes.
+
+When the session ends, the dispatcher re-runs `verify_cmd` itself, scans the
+added lines for secrets, checks the PR base against the production refs, then
+pushes the branch and opens the PR. Any failure labels the issue `blocked` with
+the reason and pushes nothing.
 
 CI runs the tests and the secret and public-content scan. One review from a
 different model (for example Codex reviewing Claude Code's PR) adds an
 independent read. A human merges to `main` and deploys.
+
+Every dispatch appends a line to `<state dir>/dispatch/<project>.jsonl` and tags
+the session's telemetry with `factory.issue` and `factory.branch`, so analytics
+can join sessions to issues and PRs.
 
 ### Make the agent's environment do the enforcing
 

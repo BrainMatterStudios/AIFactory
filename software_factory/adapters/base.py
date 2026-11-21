@@ -179,7 +179,10 @@ class RunnerAdapter(Protocol):
         system: str | None = None,
         tools: Sequence[str] | None = None,
         cwd: str | None = None,
-    ) -> RunResult: ...
+        env: Mapping[str, str] | None = None,
+    ) -> RunResult:
+        """Run one agent session. `env` adds variables to the inherited
+        environment (for example OTel resource attributes)."""
 
 
 # --------------------------------------------------------------------------- #

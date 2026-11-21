@@ -45,6 +45,10 @@ scheduler:
   command: "factory observe --target prod --apply --alert"
 ```
 
+Dispatch is scheduled the same way, as a second entry, once observe and triage
+are working: for example `factory dispatch` every hour on the VPS. One
+dispatch runs per repository at a time; an overlapping run exits `2`.
+
 Two things about that command:
 
 - **`--apply` files issues.** Without it the pass plans and prints, which is the
@@ -125,6 +129,7 @@ Schedule the command so these are visible, not swallowed.
 | `observe` | PASS or WARN | overall FAIL | the board could not be searched — **nothing was filed** |
 | `doctor` | healthy | a check failed (kill switch engaged, manifest not loaded, provider broken, placeholder repo) | — |
 | `pickup` | a Ready issue was printed, or the queue is empty | — | a stop-switch halted the loop |
+| `dispatch` | PR opened, plan posted, dry run, or nothing eligible | issue blocked, kill switch, budget, or production dev branch | another dispatch holds the lock |
 
 Exit `2` from `observe` deserves attention: it means dedup could not be trusted,
 so the pass deliberately filed nothing rather than duplicating every open ticket.

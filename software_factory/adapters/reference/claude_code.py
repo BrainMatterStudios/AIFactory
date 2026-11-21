@@ -8,6 +8,7 @@ and not only the loop that spawned it.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -68,7 +69,7 @@ class ClaudeCodeRunner:
         # Accept either a tier name ("opus") or a concrete id.
         return self.models.get(model, model)
 
-    def run_agent(self, prompt, *, model, system=None, tools=None, cwd=None) -> RunResult:
+    def run_agent(self, prompt, *, model, system=None, tools=None, cwd=None, env=None) -> RunResult:
         model_id = self.resolve_model(model)
         args = [self.claude_bin, "-p", prompt, "--model", model_id]
         # Ask for JSON so the run reports its real cost. Without this every
@@ -87,7 +88,8 @@ class ClaudeCodeRunner:
 
         try:
             proc = subprocess.run(args, capture_output=True, text=True, cwd=cwd,
-                                  timeout=self.timeout_s)
+                                  timeout=self.timeout_s,
+                                  env=None if env is None else {**os.environ, **env})
         except FileNotFoundError:
             # A missing/misnamed CLI is a configuration problem, and it is the
             # first thing a new adopter hits. It must arrive as a failed run the
@@ -133,6 +135,8 @@ class ClaudeCodeRunner:
         cost = data.get("total_cost_usd", data.get("cost_usd"))
         text = data.get("result", data.get("output", stdout))
         meta = {"cost_known": cost is not None}
+        if isinstance(data.get("session_id"), str):
+            meta["session_id"] = data["session_id"]
         if data.get("usage"):
             meta["usage"] = data["usage"]
         return (text if isinstance(text, str) else stdout), float(cost or 0.0), meta

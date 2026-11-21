@@ -150,6 +150,26 @@ class BuildConfig:
 
 
 @dataclass(frozen=True)
+class DispatchConfig:
+    """How `factory dispatch` runs one agent session per Ready issue.
+
+    The agent works in an isolated worktree and never pushes. The dispatcher
+    re-runs `verify_cmd`, scans the added lines for secrets, checks the ceiling,
+    then pushes the branch and opens the PR.
+    """
+
+    model: str = "opus"                        # runner tier name or concrete model id
+    branch_prefix: str = "factory/"
+    worktree_root: str | None = None           # default: <state dir>/worktrees/<project>
+    verify_timeout_s: float = 1800.0
+    feature_labels: tuple[str, ...] = ("type:feature", "feature", "enhancement")
+    plan_pending_label: str = "plan-pending"
+    plan_approved_label: str = "plan-approved"
+    pr_open_label: str = "pr-open"
+    blocked_label: str = "blocked"
+
+
+@dataclass(frozen=True)
 class GovernanceConfig:
     killswitch_env: str = "KILL_FACTORY"
     # An unattended loop must not rely on convention alone. When True, doctor
@@ -167,6 +187,7 @@ class FactoryConfig:
     budget: BudgetConfig = BudgetConfig()
     governance: GovernanceConfig = GovernanceConfig()
     build_cfg: BuildConfig = BuildConfig()
+    dispatch: DispatchConfig = DispatchConfig()
     plugins: tuple[str, ...] = ()
     raw: Mapping[str, Any] = field(default_factory=dict)
     source_path: Path | None = None
@@ -246,6 +267,19 @@ class FactoryConfig:
             verify_cmd=bd.get("verify_cmd", "pytest -q"),
         )
 
+        dp = f.get("dispatch") or {}
+        if not isinstance(dp, Mapping):
+            raise ValueError("factory.dispatch must be a mapping")
+        unknown = sorted(set(dp) - set(DispatchConfig.__dataclass_fields__))
+        if unknown:
+            raise ValueError(f"factory.dispatch has unknown fields: {unknown!r}")
+        dispatch_values: dict[str, Any] = dict(dp)
+        if "feature_labels" in dispatch_values:
+            dispatch_values["feature_labels"] = tuple(dispatch_values["feature_labels"])
+        if "verify_timeout_s" in dispatch_values:
+            dispatch_values["verify_timeout_s"] = float(dispatch_values["verify_timeout_s"])
+        dispatch = DispatchConfig(**dispatch_values)
+
         return cls(
             name=f["name"],
             adapters=adapters,
@@ -253,6 +287,7 @@ class FactoryConfig:
             budget=budget,
             governance=governance,
             build_cfg=build,
+            dispatch=dispatch,
             plugins=tuple(f.get("plugins") or ()),
             raw=dict(f),
             source_path=source_path,

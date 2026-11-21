@@ -50,8 +50,8 @@ come from scope estimates, not commitments.
 | Phase | Track | Theme | Primary result | Exit criterion | Target |
 |---|---|---|---|---|---|
 | **0** | — | Start | Retention raised, telemetry on, history backed up, `v0.3-archive` tagged | Both machines exporting OTel to Grafana Cloud | **This week** |
-| **L1** | Lean | Retire | Old machinery removed from `main`; slim CLI | `main` holds only kept modules; CI green | Week 1 |
-| **L2** | Lean | Lean factory v1 | One-session-per-issue dispatcher, platform gates, cross-vendor review, human merge | First 5 real issues through it end to end | Weeks 2–3 |
+| **L1** | Lean | Retire | Old machinery removed from `main`; slim CLI | `main` holds only kept modules; CI green | **Done on branch, awaiting merge** |
+| **L2** | Lean | Lean factory v1 | One-session-per-issue dispatcher, platform gates, cross-vendor review, human merge | First 5 real issues through it end to end | **In progress:** `factory dispatch` built |
 | **A1** | Analytics | Collect | Redacted transcripts from both machines and both agents land in the bucket every night | 7 consecutive days with ≥99% of sessions archived (reconciled against OTel `session.count`) | Weeks 1–2 |
 | **A2** | Analytics | Extract and join | Deterministic signals, Parquet/DuckDB store, session↔PR↔CI↔deploy joins, KPI dashboard | Dashboard shows the core KPIs; 10 spot-checked joins correct | Weeks 2–4 |
 | **A3** | Analytics | Diagnose | Calibrated rubric pass (batch), weekly synthesis report and deduped issues | Rubric meets the calibration bar; first weekly report filed | Weeks 4–6 |
@@ -109,6 +109,10 @@ baseline. No separate comparison against the old factory is planned.
   files in earlier commits.
 
 ## L2: lean factory v1 (weeks 2–3)
+
+**Status (2026-11-21):** `factory dispatch` is implemented and tested against
+real git. Remaining: deploy it on the VPS, the `main` ruleset and bot identity
+(phase 0 items), the cross-vendor review workflow, and the first 5 real issues.
 
 - **Intake:** observe loops (production through the fleet agent, the factory
   through analytics) file deduped issues. A human adds the `ready` label.
