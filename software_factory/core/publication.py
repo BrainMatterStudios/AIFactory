@@ -117,7 +117,21 @@ _SYNTHETIC_FIXTURE_RULES = (
     "secret.credentialed-dsn",
     "secret.private-key",
 )
-
+_SECURITY_CONTROL_APPROVAL_SOURCE = (
+    "project-original:validation-cell-security-controls-v1"
+)
+_SECURITY_CONTROL_APPROVAL_RULES = {
+    "software_factory/execution/assets/leash.cedar": ("private.hostname",),
+    "software_factory/execution/bridge.py": (
+        "private.absolute-path",
+        "private.hostname",
+    ),
+    "tests/test_execution_bridge.py": ("private.hostname",),
+    "tests/test_validation_cell_assets.py": (
+        "private.hostname",
+        "private.internal-url",
+    ),
+}
 
 
 def _object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -275,11 +289,19 @@ def _load_provenance(value: Any, where: str) -> tuple[_Provenance, ...]:
                 "content_allowlist differs from the canonical synthetic fixture approval"
             )
         for entry in loaded:
-            if entry.path != _SYNTHETIC_FIXTURE_PATH:
-                # The only content exemption is the synthetic test fixture. Any
-                # other entry would let real private content through the gate.
+            if entry.path == _SYNTHETIC_FIXTURE_PATH:
+                continue
+            expected_rules = _SECURITY_CONTROL_APPROVAL_RULES.get(entry.path)
+            if (
+                expected_rules is None
+                or entry.git_mode != "100644"
+                or entry.object_type != "blob"
+                or entry.license != "Apache-2.0"
+                or entry.source != _SECURITY_CONTROL_APPROVAL_SOURCE
+                or entry.rule_ids != expected_rules
+            ):
                 raise PublicationPolicyError(
-                    "content_allowlist may only exempt the synthetic test fixture"
+                    "content_allowlist contains an unapproved security-control authority"
                 )
     return loaded
 

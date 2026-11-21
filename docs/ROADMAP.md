@@ -103,6 +103,10 @@ baseline. No separate comparison against the old factory is planned.
 - Rewrite README and KNOWN_ISSUES for the new shape. Keep the candour, drop the
   machinery history; the archive tag holds it.
 - Expected result: roughly 6 to 8K source lines, down from about 66K.
+- Follow-up after the L1 PR merges: remove the retired security-control
+  exemptions from `public-content-policy.json` and `core/publication.py`. They
+  stay until then because the PR's history-range scan still sees the deleted
+  files in earlier commits.
 
 ## L2: lean factory v1 (weeks 2–3)
 

@@ -33,7 +33,6 @@ The lean-factory reset. See `docs/REVIEW-2026-11.md` and `docs/ROADMAP.md`.
 - Retired `factory.build` keys (`design_protocol`, `review_protocol`,
   `require_contract`, `max_revise`, and the rest) are ignored with a
   deprecation warning, so older manifests still load for observe and pickup.
-- The content allowlist accepts only the synthetic test fixture.
 - Default Claude model ids are `claude-opus-5-5`, `claude-sonnet-5-5`, and
   `claude-haiku-5-5`.
 
