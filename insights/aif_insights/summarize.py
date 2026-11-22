@@ -37,6 +37,8 @@ class Summary:
     parser: str = "ok"                    # "ok" | "unverified" (Codex)
     title: str | None = None
     cwd: str | None = None
+    #: Every working directory the file mentions; exclusions check all of them.
+    cwds: list[str] = field(default_factory=list)
     git_branches: list[str] = field(default_factory=list)
     agent_version: str | None = None
     entrypoint: str | None = None
@@ -109,6 +111,7 @@ def _claude_record(s: Summary, r: dict, unknown: Counter, seen: set[str]) -> Non
     _ts(s, r.get("timestamp"))
     if s.cwd is None and isinstance(r.get("cwd"), str):
         s.cwd = r["cwd"]
+    _add_unique(s.cwds, r.get("cwd"))
     _add_unique(s.git_branches, r.get("gitBranch"))
     if s.agent_version is None and isinstance(r.get("version"), str):
         s.agent_version = r["version"]
@@ -166,6 +169,8 @@ def _codex_record(s: Summary, r: dict, unknown: Counter) -> None:
         unknown[str(kind)] += 1
     _ts(s, r.get("timestamp"))
     payload = r.get("payload") if isinstance(r.get("payload"), dict) else {}
+    if kind in ("session_meta", "turn_context"):
+        _add_unique(s.cwds, payload.get("cwd"))
     if kind == "session_meta":
         if isinstance(payload.get("cwd"), str):
             s.cwd = payload["cwd"]

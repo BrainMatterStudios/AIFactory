@@ -1,6 +1,6 @@
 # AIFactory roadmap
 
-**Last updated:** 2026-11-20
+**Last updated:** 2026-11-22
 **Supersedes:** the 2026-10-23 roadmap (0.3.1 → 0.8.0), which remains in git
 history. The analysis behind this revision is in
 [REVIEW-2026-11.md](REVIEW-2026-11.md).
@@ -50,7 +50,7 @@ come from scope estimates, not commitments.
 | Phase | Track | Theme | Primary result | Exit criterion | Target |
 |---|---|---|---|---|---|
 | **0** | — | Start | Retention raised, telemetry on, history backed up, `v0.3-archive` branch created | Both machines exporting OTel to Grafana Cloud | **This week** |
-| **L1** | Lean | Retire | Old machinery removed from `main`; slim CLI | `main` holds only kept modules; CI green | **Done on branch, awaiting merge** |
+| **L1** | Lean | Retire | Old machinery removed from `main`; slim CLI | `main` holds only kept modules; CI green | **Done** (merged in #18) |
 | **L2** | Lean | Lean factory v1 | One-session-per-issue dispatcher, platform gates, cross-vendor review, human merge | First 5 real issues through it end to end | **In progress:** `factory dispatch` built |
 | **A1** | Analytics | Collect | Redacted transcripts from both machines and both agents land in the bucket every night | 7 consecutive days with ≥99% of sessions archived (reconciled against OTel `session.count`) | **In progress:** collector built (`insights/`) |
 | **A2** | Analytics | Extract and join | Deterministic signals, Parquet/DuckDB store, session↔PR↔CI↔deploy joins, KPI dashboard | Dashboard shows the core KPIs; 10 spot-checked joins correct | Weeks 2–4 |
@@ -64,7 +64,8 @@ baseline. No separate comparison against the old factory is planned.
 ## Phase 0: stop the bleeding (this week)
 
 - [ ] **Raise transcript retention now** on both machines: `cleanupPeriodDays`
-      (the default deletes sessions after 30 days). Then copy
+      (the default deletes sessions after 30 days). Set to 3650 on Ahmed's
+      machine as of 2026-11-22; the second machine is unconfirmed. Then copy
       `~/.claude/projects` and `~/.codex/sessions` to the bucket or an
       encrypted disk as-is. These are the history that the first analytics
       runs work from.
@@ -80,11 +81,12 @@ baseline. No separate comparison against the old factory is planned.
       exclusion list, mutual read access, and KPIs that are not a personal
       leaderboard.
 - [x] Create the `v0.3-archive` branch at `main` (`00fe2d1`), done
-      2026-11-21. It is the only copy of the 0.x machinery after L1. Consider
-      protecting it so it cannot be deleted or force-pushed.
+      2026-11-21. It is the only copy of the 0.x machinery after L1, and an
+      active ruleset protects it.
+- [x] Protect `main` with an active ruleset.
 - [ ] Set up the lean factory's bot identity: a GitHub App or fine-grained
       token with contents and PR write access, no merge or admin rights.
-      Protect `main` with a ruleset that requires CI and a human approval.
+- [ ] Protect `develop`, the branch agent PRs target. It has no protection yet.
 
 ## L1: retire the old machinery (week 1)
 
@@ -110,8 +112,9 @@ baseline. No separate comparison against the old factory is planned.
 ## L2: lean factory v1 (weeks 2–3)
 
 **Status (2026-11-21):** `factory dispatch` is implemented and tested against
-real git. Remaining: deploy it on the VPS, the `main` ruleset and bot identity
-(phase 0 items), the cross-vendor review workflow, and the first 5 real issues.
+real git. Remaining: deploy it on the VPS, the bot identity and `develop`
+protection (phase 0 items), the cross-vendor review workflow, and the first 5
+real issues.
 
 - **Intake:** observe loops (production through the fleet agent, the factory
   through analytics) file deduped issues. A human adds the `ready` label.
@@ -146,17 +149,16 @@ per-session index, append-only upload. Remaining: the R2 bucket and tokens,
 installing it on both laptops and the VPS, verifying the Codex parser on a real
 file, the Compliance API backfill, and the reconciliation job.
 
-- Package `insights/` (Python `aif_insights`, its own `pyproject.toml` in a uv
-  workspace). It must **not** import `software_factory`, enforced by an
-  import-boundary test.
-- Sources, in order of preference:
-  1. Claude Code, from the **Compliance API** if its fidelity matches local
-     JSONL (subagent sidechains and tool results included). Otherwise from a
-     laptop agent.
-  2. A laptop agent for Codex, and for Claude Code if needed. Run a nightly
-     sweep through launchd or cron, upload anything new or changed, and keep a
-     manifest of uploaded files with their hashes. A `SessionEnd` hook is only
-     a fast path.
+- Package `insights/` (Python `aif_insights`, with its own `pyproject.toml`,
+  installed separately). It must **not** import `software_factory`, enforced by
+  an import-boundary test.
+- Sources:
+  1. A machine agent for Claude Code and Codex is the primary source. It runs on
+     a schedule through launchd or cron, uploads anything new or changed, and
+     keeps a manifest of uploaded files with their hashes. A `SessionEnd` hook
+     is only a fast path.
+  2. The **Compliance API** backfills older Claude Code history and checks
+     completeness weekly.
   3. CI and headless runs: upload `~/.claude/projects` as a workflow artifact or
      straight to the bucket at job end. Cloud sessions are captured where
      possible; document what is out of reach.

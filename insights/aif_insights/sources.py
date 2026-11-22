@@ -29,6 +29,8 @@ class TranscriptFile:
     session_id: str
     #: "session" for a main transcript, "agent-<id>" for a subagent sidechain.
     part: str = "session"
+    #: The main transcript of a subagent, which decides its exclusion.
+    parent: Path | None = None
 
     @property
     def is_subagent(self) -> bool:
@@ -52,9 +54,12 @@ def discover_claude(root: Path | None = None) -> Iterator[TranscriptFile]:
     for project in sorted(p for p in root.iterdir() if p.is_dir()):
         for main in sorted(project.glob("*.jsonl")):
             yield TranscriptFile(CLAUDE, main, main.stem)
-        for sub in sorted(project.glob("*/subagents/*.jsonl")):
-            session_id = sub.parent.parent.name
-            yield TranscriptFile(CLAUDE, sub, session_id, part=sub.stem)
+        # Workflow subagents sit deeper: subagents/workflows/<id>/agent-<id>.jsonl.
+        for sub in sorted(project.glob("*/subagents/**/*.jsonl")):
+            session_id = sub.relative_to(project).parts[0]
+            nested = sub.relative_to(project / session_id / "subagents").with_suffix("")
+            yield TranscriptFile(CLAUDE, sub, session_id, part="-".join(nested.parts),
+                                 parent=project / f"{session_id}.jsonl")
 
 
 def discover_codex(root: Path | None = None) -> Iterator[TranscriptFile]:

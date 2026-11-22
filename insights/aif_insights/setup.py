@@ -3,14 +3,16 @@
 It asks for the R2 details and keys, then:
 
 1. stores the keys in the login Keychain (or reuses keys already there);
-2. writes `~/.config/aif-insights/config.toml`, which holds no secrets;
+2. asks which folders must never be uploaded, then writes
+   `~/.config/aif-insights/config.toml`, which holds no secrets;
 3. sets `cleanupPeriodDays` in `~/.claude/settings.json`, so Claude Code stops
    deleting transcripts after 30 days;
 4. checks the R2 connection with a tiny test upload under `health/`;
 5. installs the hourly launchd job and starts it. Its first run begins straight
    away and uploads the existing history in the background.
 
-Re-running it is safe: every step overwrites its own previous result.
+Re-running it is safe: settings it does not ask about are kept, and it stops
+rather than replace a config file it cannot read.
 """
 from __future__ import annotations
 
@@ -20,6 +22,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tomllib
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -53,10 +56,15 @@ def plist(exe: str, log: Path) -> str:
 
 
 def _toml_config(user: str, account_id: str, bucket: str, quiet: float,
-                 exclude: list[str]) -> str:
+                 exclude: list[str], previous: dict | None = None) -> str:
+    """Render the config, keeping optional settings from `previous`."""
+    previous = previous or {}
     # JSON string and array syntax is valid TOML for these simple values.
-    return (
-        f"user = {json.dumps(user)}\n"
+    text = f"user = {json.dumps(user)}\n"
+    for key in ("machine", "state_dir", "claude_root", "codex_root"):
+        if isinstance(previous.get(key), str):
+            text += f"{key} = {json.dumps(previous[key])}\n"
+    text += (
         'store = "r2"\n'
         f"quiet_minutes = {quiet:g}\n"
         f"exclude_cwd = {json.dumps(exclude)}\n"
@@ -64,6 +72,34 @@ def _toml_config(user: str, account_id: str, bucket: str, quiet: float,
         f"account_id = {json.dumps(account_id)}\n"
         f"bucket = {json.dumps(bucket)}\n"
     )
+    endpoint = (previous.get("r2") or {}).get("endpoint")
+    if isinstance(endpoint, str):
+        text += f"endpoint = {json.dumps(endpoint)}\n"
+    local_dir = (previous.get("local") or {}).get("dir")
+    if isinstance(local_dir, str):
+        text += f"\n[local]\ndir = {json.dumps(local_dir)}\n"
+    return text
+
+
+def _exclusion_pattern(value: str, home: Path) -> str:
+    """`~/clients/acme` or `acme` becomes a pattern for that folder and below."""
+    if value == "~" or value.startswith("~/"):
+        value = str(home) + value[1:]
+    if any(ch in value for ch in "*?["):
+        return value
+    value = value.rstrip("/")
+    return f"{value}/*" if value.startswith("/") else f"*/{value}/*"
+
+
+def _ask_exclusions(ask: Callable[[str], str], current: list[str], home: Path) -> list[str]:
+    shown = ", ".join(current) if current else "none"
+    answer = ask("Folders to never upload, comma-separated, such as ~/clients/acme "
+                 f"(Enter keeps: {shown}; 'none' clears): ").strip()
+    if not answer:
+        return list(current)
+    if answer.lower() == "none":
+        return []
+    return [_exclusion_pattern(p.strip(), home) for p in answer.split(",") if p.strip()]
 
 
 def _ask(ask: Callable[[str], str], prompt: str, default: str | None = None) -> str:
@@ -96,11 +132,16 @@ def run_setup(
 
     config_path = Path(str(DEFAULT_CONFIG).replace("~", str(home), 1))
     existing = None
+    previous: dict = {}
     if config_path.is_file():
         try:
-            existing = load(config_path)
-        except Exception:
-            existing = None
+            previous = tomllib.loads(config_path.read_text(encoding="utf-8"))
+            existing = from_dict(previous)
+        except Exception as exc:
+            # Replacing it could silently drop the exclusion list.
+            out(f"✗ could not read the config at {config_path} ({type(exc).__name__}). "
+                "It was not changed. Fix or remove it, then run setup again.")
+            return 1
 
     out(f"aif-insights {__version__} setup\n")
     user = slug(_ask(ask, "Your name (used in archive paths)",
@@ -126,16 +167,17 @@ def run_setup(
         out("✓ using the keys already in your Keychain")
 
     # 2. config
+    exclude = _ask_exclusions(ask, list(existing.exclude_cwd) if existing else [], home)
     cfg_text = _toml_config(
         user, account_id, bucket,
         existing.quiet_minutes if existing else 30.0,
-        list(existing.exclude_cwd) if existing else [],
+        exclude, previous,
     )
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(cfg_text, encoding="utf-8")
-    cfg = from_dict({"user": user, "store": "r2",
-                     "r2": {"account_id": account_id, "bucket": bucket}})
+    cfg = load(config_path)
     out(f"✓ config written to {config_path}")
+    out("✓ never uploading: " + (", ".join(exclude) if exclude else "no folders excluded"))
 
     # 3. keep Claude Code transcripts
     settings = home / ".claude" / "settings.json"

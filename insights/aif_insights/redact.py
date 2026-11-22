@@ -34,11 +34,18 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("sendgrid-key", r"\bSG\.[A-Za-z0-9_-]{16,64}\.[A-Za-z0-9_-]{16,64}"),
         ("cloudflare-token", r"\b(?:cf|CF)[A-Za-z0-9_]{0,8}[_-](?:token|TOKEN)\s*[:=]\s*[A-Za-z0-9_-]{30,64}"),
         ("jwt", r"\beyJ[A-Za-z0-9_-]{8,4096}\.[A-Za-z0-9_-]{8,4096}\.[A-Za-z0-9_-]{8,4096}"),
-        ("dsn-password", r"\b[a-z][a-z0-9+.-]{1,20}://[^\s:/@]{1,256}:[^\s@/]{1,256}@"),
+        ("dsn-password", r"\b[a-z][a-z0-9+.-]{1,20}://[^\s:/@]{0,256}:[^\s@/]{1,256}@"),
         ("bearer", r"(?i)\b(?:authorization\s*:\s*)?bearer\s+[A-Za-z0-9._~+/=-]{16,4096}"),
+        ("auth-header", r"(?i)\b(?:proxy-)?authorization\s*[:=]\s*[\"']?(?:basic|token|digest|negotiate)\s+[^\s\"']{4,4096}"),
+        ("cookie-header", r"(?i)\b(?:set-)?cookie\s*:\s*[^\r\n]{1,4096}"),
+        ("cli-credentials", r"(?<![\w-])(?:-u|--user)[ =]+[\"']?[^\s:\"']{1,128}:[^\s\"']{1,256}"),
+        ("cli-secret-flag", r"(?i)(?<![\w-])--?(?:[a-z0-9]{1,20}-){0,4}(?:password|passwd|passphrase|token|secret|api-?key|access-?key)(?:=| +)[\"']?[^\s\"'`]{1,512}"),
         # KEY=value / "key": "value" for secret-looking names, quoted or not
-        # (dotenv files are the most common thing an agent cats).
-        ("assigned-secret", r"(?i)(?<![A-Za-z0-9])[A-Za-z0-9_.-]{0,40}(?:password|passwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token|access[_-]?token|private[_-]?key|client[_-]?secret)[A-Za-z0-9_.-]{0,40}[\"']?\s{0,3}[:=]{1,2}\s{0,3}[\"']?[^\s\"'`,;]{8,512}"),
+        # (dotenv files are the most common thing an agent cats). Backslashes
+        # cover JSON that was encoded again inside a string. `token` and `pass`
+        # must end the name, so `max_tokens` and `bypass` are left alone. `PWD`
+        # is deliberately absent: it is the working directory.
+        ("assigned-secret", r"(?i)(?<![A-Za-z0-9])[A-Za-z0-9_.-]{0,40}(?:(?:password|passwd|passphrase|secret|api[_-]?key|access[_-]?key|private[_-]?key|credential)[A-Za-z0-9_.-]{0,40}|token|(?<=[_.-])pass)[\\\"']{0,6}\s{0,3}[:=]{1,2}\s{0,3}[\\\"']{0,6}[^\s\\\"'`,;]{8,512}"),
     )
 )
 
@@ -48,6 +55,12 @@ _MEDIA_TYPES = frozenset({"image", "document"})
 #: Opaque model-internal blobs (thinking signatures, encrypted reasoning). They
 #: carry nothing analysable and would otherwise dominate the entropy counts.
 _OPAQUE_KEYS = frozenset({"signature", "encrypted_content"})
+#: Structured fields whose whole value is a secret. A parsed record holds the
+#: name and the value separately, so the `KEY=value` pattern cannot see them.
+_SECRET_FIELD = re.compile(
+    r"(?i)password|passwd|passphrase|secret|api[_-]?key|access[_-]?key|private[_-]?key"
+    r"|credential|cookie|authorization|token$|(?:^|[_-])pass$"
+)
 
 
 @dataclass
@@ -98,6 +111,20 @@ def redact_text(text: str, stats: RedactionStats) -> str:
     return _HIGH_ENTROPY.sub(_entropy_sub, text)
 
 
+def _scrub(value, stats: RedactionStats):
+    """Replace every string under a secret-named field."""
+    if isinstance(value, str):
+        if not value:
+            return value
+        stats.counts["secret-field"] += 1
+        return "[REDACTED:secret-field]"
+    if isinstance(value, list):
+        return [_scrub(v, stats) for v in value]
+    if isinstance(value, dict):
+        return {k: _scrub(v, stats) for k, v in value.items()}
+    return value
+
+
 def _redact_value(value, stats: RedactionStats):
     if isinstance(value, str):
         return redact_text(value, stats)
@@ -120,6 +147,8 @@ def _redact_value(value, stats: RedactionStats):
             if k in _OPAQUE_KEYS and isinstance(v, str) and len(v) > 64:
                 stats.counts["opaque-omitted"] += 1
                 out[k] = f"[OMITTED:{k} {len(v)} chars]"
+            elif isinstance(k, str) and _SECRET_FIELD.search(k):
+                out[k] = _scrub(v, stats)
             else:
                 out[k] = _redact_value(v, stats)
         return out

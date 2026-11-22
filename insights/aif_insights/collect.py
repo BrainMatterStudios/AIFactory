@@ -22,9 +22,10 @@ import hashlib
 import json
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from functools import lru_cache
 from pathlib import Path
 
 from aif_insights import __version__
@@ -75,8 +76,47 @@ class Manifest:
         tmp.replace(self.path)
 
 
-def _excluded(cwd: str | None, patterns: tuple[str, ...]) -> bool:
-    return bool(cwd) and any(fnmatch.fnmatch(cwd, p) for p in patterns)
+def _excluded(cwds: Iterable[str], patterns: tuple[str, ...]) -> bool:
+    """True if any directory matches. `*/acme/*` also covers `/x/acme` itself.
+
+    With an exclusion list in force, a file whose location is unknown is held
+    back: it cannot be shown to be outside the excluded folders.
+    """
+    if not patterns:
+        return False
+    known = [c for c in cwds if c]
+    if not known:
+        return True
+    return any(
+        fnmatch.fnmatch(c, p) or fnmatch.fnmatch(c.rstrip("/") + "/", p)
+        for c in known for p in patterns
+    )
+
+
+def _split_lines(text: str) -> list[str]:
+    """Split on newlines only. `str.splitlines` also breaks on characters such
+    as U+2028, which are legal unescaped inside a JSON string."""
+    lines = text.split("\n")
+    if lines and not lines[-1]:
+        lines.pop()
+    return lines
+
+
+@lru_cache(maxsize=32)
+def _parent_cwds(file: TranscriptFile, mtime_ns: int) -> tuple[str, ...]:
+    text = file.path.read_text(encoding="utf-8", errors="replace")
+    return tuple(summarize(file, _split_lines(text)).cwds)
+
+
+def _cwds_with_parent(file: TranscriptFile, lines: list[str]) -> list[str]:
+    cwds = list(summarize(file, lines).cwds)
+    if file.parent is not None:
+        parent = TranscriptFile(file.agent, file.parent, file.session_id)
+        try:
+            cwds.extend(_parent_cwds(parent, file.parent.stat().st_mtime_ns))
+        except OSError:
+            pass  # parent gone: the subagent's own directories still apply
+    return cwds
 
 
 def _date_parts(first_ts: str | None, mtime: float) -> tuple[str, str, str]:
@@ -156,14 +196,17 @@ def _collect_one(cfg: Config, store: Store, manifest: Manifest, file: Transcript
         return
 
     text = file.path.read_text(encoding="utf-8", errors="replace")
-    redacted, stats = redact_lines(text.splitlines())
-    # Summarise the REDACTED text, so nothing in the index can carry a secret.
-    summary = summarize(file, redacted.splitlines())
-    if _excluded(summary.cwd, cfg.exclude_cwd):
+    lines = _split_lines(text)
+    # Checked on the original text: redaction could rewrite a directory name.
+    if cfg.exclude_cwd and _excluded(_cwds_with_parent(file, lines), cfg.exclude_cwd):
         manifest.entries[path_key] = {"size": st.st_size, "mtime_ns": st.st_mtime_ns,
                                       "excluded": True}
         report.excluded += 1
         return
+
+    redacted, stats = redact_lines(lines)
+    # Summarise the REDACTED text, so nothing in the index can carry a secret.
+    summary = summarize(file, redacted.split("\n"))
 
     payload = redacted.encode("utf-8")
     digest = hashlib.sha256(payload).hexdigest()[:16]

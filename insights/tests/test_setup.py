@@ -33,7 +33,8 @@ class FakeSystem:
 
 def _answers(*values):
     it = iter(values)
-    return lambda _prompt: next(it)
+    # Prompts past the scripted answers get Enter, which accepts the default.
+    return lambda _prompt: next(it, "")
 
 
 def _setup(tmp_path, system, ask, secrets=("", ""), store_dir=None, fail_store=False):

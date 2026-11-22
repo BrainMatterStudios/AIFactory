@@ -32,8 +32,9 @@ Every JSONL line is parsed and every string is redacted before upload:
 - embedded base64 images and documents, and opaque thinking signatures, are
   dropped.
 
-Sessions whose working directory matches `exclude_cwd` are never uploaded. The
-per-session index is built from the redacted text, so it can't carry a secret
+Sessions that touch a folder matching `exclude_cwd` are never uploaded, and
+neither are their subagents. While an exclusion list is set, a file with no
+known working directory is held back too. The per-session index is built from the redacted text, so it can't carry a secret
 either. Redaction is broad but pattern-based, so treat the bucket as sensitive
 anyway: private, and readable only by the worker and the two of you.
 
@@ -60,8 +61,9 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/BrainMatterStudios/AIFac
 ```
 
 The script installs pipx (via Homebrew) if needed, installs `aif-insights`, and
-runs `aif-insights setup`. Setup asks for your name, account ID, bucket and the
-two keys (typed hidden), and then:
+runs `aif-insights setup`. Setup asks for your name, account ID, bucket, the two
+keys (typed hidden), and the folders that must never be uploaded. Have that list
+ready, because the first upload starts as soon as setup finishes. It then:
 
 - stores the keys in your login Keychain. They never go in a file;
 - writes `~/.config/aif-insights/config.toml` (no secrets);
@@ -79,8 +81,10 @@ If you already have `aif-insights` installed, `aif-insights setup` alone does
 the same. To preview what would be uploaded without touching R2:
 `aif-insights collect --local ~/aif-insights-preview`.
 
-To exclude confidential repositories, add patterns to `exclude_cwd` in the
-config, for example `exclude_cwd = ["*/clients/acme/*"]`.
+To change the exclusions later, re-run setup or edit `exclude_cwd` in the config,
+for example `exclude_cwd = ["*/clients/acme/*"]`. That pattern covers the folder
+itself and everything below it. Adding a pattern does not delete what was already
+uploaded.
 
 On Linux or the VPS, put the keys in `AIF_R2_ACCESS_KEY_ID` and
 `AIF_R2_SECRET_ACCESS_KEY` and use `aif-insights schedule cron`.
