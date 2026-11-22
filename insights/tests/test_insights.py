@@ -281,3 +281,21 @@ def test_package_does_not_import_the_factory():
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "[]"
+
+
+def test_a_preview_destination_does_not_mark_files_uploaded_elsewhere(tmp_path, homes):
+    cfg = _cfg(tmp_path, homes)
+    preview = collect(cfg, LocalStore(tmp_path / "preview"))
+    real = collect(cfg, LocalStore(tmp_path / "real"))
+    assert preview.uploaded == 3
+    assert real.uploaded == 3, "the preview must not make the real run skip files"
+
+
+def test_progress_is_reported_per_processed_file(tmp_path, homes):
+    cfg = _cfg(tmp_path, homes)
+    messages: list[str] = []
+    collect(cfg, LocalStore(cfg.local_dir), progress=messages.append)
+    assert sum(m.startswith("uploaded") for m in messages) == 3
+    messages.clear()
+    collect(cfg, LocalStore(cfg.local_dir), progress=messages.append)
+    assert messages == [], "unchanged files are skipped quietly"

@@ -14,7 +14,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from aif_insights import __version__
-from aif_insights.collect import Manifest, collect
+from aif_insights.collect import Manifest, collect, manifest_path
 from aif_insights.config import load
 from aif_insights.store import LocalStore
 
@@ -24,8 +24,9 @@ LAUNCHD_LABEL = "com.brainmatter.aif-insights"
 def cmd_collect(args) -> int:
     cfg = load(args.config)
     store = LocalStore(args.local) if args.local else cfg.open_store()
-    print(f"collecting for {cfg.user}@{cfg.machine} into {store.describe()}")
-    report = collect(cfg, store)
+    print(f"collecting for {cfg.user}@{cfg.machine} into {store.describe()}", flush=True)
+    print("the first run processes your whole history and can take several minutes", flush=True)
+    report = collect(cfg, store, progress=lambda m: print(m, flush=True))
     for line in report.lines():
         print(line)
     return report.exit_code
@@ -33,11 +34,12 @@ def cmd_collect(args) -> int:
 
 def cmd_status(args) -> int:
     cfg = load(args.config)
-    manifest = Manifest(cfg.state_path / "manifest.json")
+    store = LocalStore(args.local) if args.local else cfg.open_store()
+    manifest = Manifest(manifest_path(cfg, store))
     entries = manifest.entries.values()
     uploaded = sum(1 for e in entries if e.get("raw_key"))
     excluded = sum(1 for e in entries if e.get("excluded"))
-    print(json.dumps({"user": cfg.user, "machine": cfg.machine, "store": cfg.store,
+    print(json.dumps({"user": cfg.user, "machine": cfg.machine, "store": store.describe(),
                       "files_uploaded": uploaded, "files_excluded": excluded}, indent=1))
     return 0
 
@@ -87,6 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.set_defaults(func=cmd_collect)
     s = sub.add_parser("status", help="show what has been collected from this machine")
     s.add_argument("--config")
+    s.add_argument("--local", help="report on a local preview directory instead")
     s.set_defaults(func=cmd_status)
     sc = sub.add_parser("schedule", help="print a launchd plist or cron line")
     sc.add_argument("kind", choices=["launchd", "cron"])

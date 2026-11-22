@@ -22,6 +22,7 @@ import hashlib
 import json
 import time
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -85,7 +86,16 @@ def _date_parts(first_ts: str | None, mtime: float) -> tuple[str, str, str]:
     return f"{d.year:04d}", f"{d.month:02d}", f"{d.day:02d}"
 
 
-def collect(cfg: Config, store: Store, *, now: float | None = None) -> CollectReport:
+def manifest_path(cfg: Config, store: Store) -> Path:
+    """One manifest per destination, so a `--local` preview never marks files as
+    uploaded to R2."""
+    tag = hashlib.sha256(store.describe().encode("utf-8")).hexdigest()[:12]
+    return cfg.state_path / f"manifest-{tag}.json"
+
+
+def collect(cfg: Config, store: Store, *, now: float | None = None,
+            progress: Callable[[str], None] | None = None,
+            save_every_s: float = 30.0) -> CollectReport:
     report = CollectReport()
     state = cfg.state_path
     state.mkdir(parents=True, exist_ok=True)
@@ -96,18 +106,41 @@ def collect(cfg: Config, store: Store, *, now: float | None = None) -> CollectRe
             report.errors.append("another collect run holds the lock")
             report.failed += 1
             return report
-        manifest = Manifest(state / "manifest.json")
+        manifest = Manifest(manifest_path(cfg, store))
         now = time.time() if now is None else now
         claude = Path(cfg.claude_root).expanduser() if cfg.claude_root else None
         codex = Path(cfg.codex_root).expanduser() if cfg.codex_root else None
-        for file in discover(claude, codex):
-            try:
-                _collect_one(cfg, store, manifest, file, now, report)
-            except Exception as exc:  # one bad file must not stop the run
-                report.failed += 1
-                report.errors.append(f"{file.path.name}: {type(exc).__name__}: {exc}")
-        manifest.save()
+        last_save = time.monotonic()
+        try:
+            for file in discover(claude, codex):
+                before = (report.uploaded, report.excluded)
+                started = time.monotonic()
+                try:
+                    _collect_one(cfg, store, manifest, file, now, report)
+                except Exception as exc:  # one bad file must not stop the run
+                    report.failed += 1
+                    report.errors.append(f"{file.path.name}: {type(exc).__name__}: {exc}")
+                    _say(progress, f"failed   {file.agent} {file.path.name}: {type(exc).__name__}")
+                    continue
+                if (report.uploaded, report.excluded) != before:
+                    status = "uploaded" if report.uploaded != before[0] else "excluded"
+                    size = file.path.stat().st_size / 1e6
+                    _say(progress, f"{status} {file.agent} {file.session_id[:8]}/{file.part} "
+                                   f"{size:.1f} MB in {time.monotonic() - started:.1f}s "
+                                   f"(total {report.uploaded} uploaded)")
+                # Save progress regularly so an interrupted first run (which
+                # can take a while on a large history) does not start over.
+                if time.monotonic() - last_save >= save_every_s:
+                    manifest.save()
+                    last_save = time.monotonic()
+        finally:
+            manifest.save()
     return report
+
+
+def _say(progress: Callable[[str], None] | None, message: str) -> None:
+    if progress is not None:
+        progress(message)
 
 
 def _collect_one(cfg: Config, store: Store, manifest: Manifest, file: TranscriptFile,
