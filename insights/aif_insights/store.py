@@ -7,7 +7,6 @@ an R2 bucket lock on `raw/` expects.
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Protocol
 
@@ -38,9 +37,8 @@ class LocalStore:
 class R2Store:
     """Cloudflare R2 through its S3-compatible API.
 
-    Credentials come from the environment, never from the config file:
-    `AIF_R2_ACCESS_KEY_ID` and `AIF_R2_SECRET_ACCESS_KEY` (falling back to the
-    standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`).
+    Credentials never come from the config file: see `aif_insights.keychain`
+    (environment first, then the macOS Keychain).
     """
 
     def __init__(self, *, account_id: str, bucket: str, endpoint: str | None = None) -> None:
@@ -48,11 +46,13 @@ class R2Store:
             import boto3  # type: ignore
         except ImportError as exc:  # pragma: no cover - environment dependent
             raise RuntimeError("the R2 store needs boto3: pip install 'aif-insights[r2]'") from exc
-        key_id = os.environ.get("AIF_R2_ACCESS_KEY_ID") or os.environ.get("AWS_ACCESS_KEY_ID")
-        secret = os.environ.get("AIF_R2_SECRET_ACCESS_KEY") or os.environ.get("AWS_SECRET_ACCESS_KEY")
+        from aif_insights.keychain import credentials
+
+        key_id, secret = credentials()
         if not key_id or not secret:
             raise RuntimeError(
-                "R2 credentials missing: set AIF_R2_ACCESS_KEY_ID and AIF_R2_SECRET_ACCESS_KEY"
+                "R2 credentials missing: run `aif-insights setup`, or set "
+                "AIF_R2_ACCESS_KEY_ID and AIF_R2_SECRET_ACCESS_KEY"
             )
         self.bucket = bucket
         self.endpoint = endpoint or f"https://{account_id}.r2.cloudflarestorage.com"

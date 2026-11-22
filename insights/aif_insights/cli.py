@@ -1,5 +1,6 @@
 """`aif-insights`: collect agent transcripts from this machine into the archive.
 
+    aif-insights setup                       (macOS: one-time, interactive)
     aif-insights collect [--config PATH] [--local DIR]
     aif-insights status  [--config PATH]
     aif-insights schedule launchd|cron [--config PATH]
@@ -16,9 +17,8 @@ from pathlib import Path
 from aif_insights import __version__
 from aif_insights.collect import Manifest, collect, manifest_path
 from aif_insights.config import load
+from aif_insights.setup import plist, run_setup
 from aif_insights.store import LocalStore
-
-LAUNCHD_LABEL = "com.brainmatter.aif-insights"
 
 
 def cmd_collect(args) -> int:
@@ -47,36 +47,21 @@ def cmd_status(args) -> int:
 def cmd_schedule(args) -> int:
     exe = shutil.which("aif-insights") or "aif-insights"
     config = str(Path(args.config).expanduser()) if args.config else None
-    argv = [exe, "collect"] + (["--config", config] if config else [])
     if args.kind == "cron":
+        argv = [exe, "collect"] + (["--config", config] if config else [])
         # Hourly; the collector skips files still being written.
         print("17 * * * * " + " ".join(argv) + " >> ~/.local/state/aif-insights/cron.log 2>&1")
         return 0
-    program = "\n".join(f"    <string>{a}</string>" for a in argv)
-    print(f"""<?xml version="1.0" encoding="UTF-8"?>
-<!-- Save as ~/Library/LaunchAgents/{LAUNCHD_LABEL}.plist, then:
-     launchctl load ~/Library/LaunchAgents/{LAUNCHD_LABEL}.plist
-     Put AIF_R2_ACCESS_KEY_ID / AIF_R2_SECRET_ACCESS_KEY under EnvironmentVariables. -->
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>{LAUNCHD_LABEL}</string>
-  <key>ProgramArguments</key>
-  <array>
-{program}
-  </array>
-  <key>StartInterval</key><integer>3600</integer>
-  <key>RunAtLoad</key><true/>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>AIF_R2_ACCESS_KEY_ID</key><string>REPLACE_ME</string>
-    <key>AIF_R2_SECRET_ACCESS_KEY</key><string>REPLACE_ME</string>
-  </dict>
-  <key>StandardOutPath</key><string>/tmp/aif-insights.log</string>
-  <key>StandardErrorPath</key><string>/tmp/aif-insights.log</string>
-</dict>
-</plist>""")
+    print(plist(exe, Path.home() / "Library" / "Logs" / "aif-insights.log"), end="")
     return 0
+
+
+def cmd_setup(_args) -> int:
+    try:
+        return run_setup()
+    except (KeyboardInterrupt, EOFError):
+        print("\nsetup cancelled")
+        return 130
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -91,6 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--config")
     s.add_argument("--local", help="report on a local preview directory instead")
     s.set_defaults(func=cmd_status)
+    st = sub.add_parser("setup", help="set up this Mac: keys, config, hourly job (interactive)")
+    st.set_defaults(func=cmd_setup)
     sc = sub.add_parser("schedule", help="print a launchd plist or cron line")
     sc.add_argument("kind", choices=["launchd", "cron"])
     sc.add_argument("--config")

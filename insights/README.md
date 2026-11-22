@@ -49,52 +49,41 @@ summary (title, working directory, branches, models, prompts, tool calls and
 errors, interrupts, tokens, cost, lines changed), the redaction counts, and the
 machine and user it came from.
 
-## Set up a laptop
+## Set up a Mac (one step)
 
-1. Install it (Python 3.11 or later):
+Have ready: your R2 account ID, the bucket name, and the Access Key ID and
+Secret Access Key of an R2 API token scoped to that bucket with "Object Read &
+Write". Then paste:
 
-   ```bash
-   pipx install "aif-insights[r2] @ git+https://github.com/BrainMatterStudios/AIFactory@main#subdirectory=insights"
-   ```
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/BrainMatterStudios/AIFactory/main/insights/install.sh)"
+```
 
-2. Keep local transcripts longer than the 30-day default, so nothing is deleted
-   before it is collected. In `~/.claude/settings.json`:
+The script installs pipx (via Homebrew) if needed, installs `aif-insights`, and
+runs `aif-insights setup`. Setup asks for your name, account ID, bucket and the
+two keys (typed hidden), and then:
 
-   ```json
-   { "cleanupPeriodDays": 3650 }
-   ```
+- stores the keys in your login Keychain. They never go in a file;
+- writes `~/.config/aif-insights/config.toml` (no secrets);
+- sets `cleanupPeriodDays` in `~/.claude/settings.json`, so Claude Code stops
+  deleting transcripts after 30 days;
+- checks the R2 connection with a small test upload under `health/`;
+- installs an hourly launchd job and starts it. The first run uploads your
+  existing history in the background, which can take a while.
 
-3. Write `~/.config/aif-insights/config.toml`:
+Progress is in `~/Library/Logs/aif-insights.log`; `aif-insights status` shows
+the totals. Re-running setup is safe, and keys already in the Keychain are
+reused.
 
-   ```toml
-   user = "ahmed"
-   store = "r2"
-   quiet_minutes = 30
-   exclude_cwd = []            # e.g. ["*/clients/confidential-*/*"]
+If you already have `aif-insights` installed, `aif-insights setup` alone does
+the same. To preview what would be uploaded without touching R2:
+`aif-insights collect --local ~/aif-insights-preview`.
 
-   [r2]
-   account_id = "<cloudflare account id>"
-   bucket = "agent-transcripts"
-   ```
+To exclude confidential repositories, add patterns to `exclude_cwd` in the
+config, for example `exclude_cwd = ["*/clients/acme/*"]`.
 
-4. Try it against a local folder first, and look at what would be uploaded:
-
-   ```bash
-   aif-insights collect --local ~/aif-insights-preview
-   ```
-
-5. Run it hourly. The R2 credentials go in the scheduler's environment, never
-   in the config file:
-
-   ```bash
-   aif-insights schedule launchd > ~/Library/LaunchAgents/com.brainmatter.aif-insights.plist
-   # edit the two REPLACE_ME values, then:
-   launchctl load ~/Library/LaunchAgents/com.brainmatter.aif-insights.plist
-   ```
-
-   On Linux, or on the VPS for dispatch sessions: `aif-insights schedule cron`.
-
-`aif-insights status` shows how many files this machine has uploaded.
+On Linux or the VPS, put the keys in `AIF_R2_ACCESS_KEY_ID` and
+`AIF_R2_SECRET_ACCESS_KEY` and use `aif-insights schedule cron`.
 
 ## Development
 
