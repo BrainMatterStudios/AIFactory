@@ -18,6 +18,7 @@ import re
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from itertools import pairwise
 
 # (rule id, pattern). Patterns are linear: bounded runs, no nested quantifiers.
 _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
@@ -49,7 +50,16 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     )
 )
 
-_HIGH_ENTROPY = re.compile(r"(?<![A-Za-z0-9_+=-])[A-Za-z0-9_+=-]{32,512}(?![A-Za-z0-9_+=-])")
+#: One unbroken run, `/` included, with no upper limit: a limit would let the
+#: longest encoded strings skip the check entirely.
+_ENCODED_RUN = re.compile(r"(?<![A-Za-z0-9_+/=-])[A-Za-z0-9_+/=-]{32,}")
+_MIN_RANDOM_LENGTH = 32
+_MIN_CLASS_CHANGE_RATE = 0.4
+#: Tool-call ids link a call to its result. Only this exact shape is kept, and
+#: only in the fields that hold these ids.
+_TOOL_ID = re.compile(r"(?:srv)?toolu_[A-Za-z0-9]{20,40}")
+_TOOL_ID_FIELDS = frozenset({"tool_use_id", "parent_tool_use_id"})
+_TOOL_BLOCK_TYPES = frozenset({"tool_use", "server_tool_use"})
 _HEXISH = re.compile(r"^[0-9a-fA-F-]+$")
 _MEDIA_TYPES = frozenset({"image", "document"})
 #: Opaque model-internal blobs (thinking signatures, encrypted reasoning). They
@@ -95,20 +105,57 @@ def _looks_random(token: str) -> bool:
     return _entropy(token) >= 4.2
 
 
+def _char_class(char: str) -> str:
+    if char.isdigit():
+        return "digit"
+    return "upper" if char.isupper() else "lower"
+
+
+def _looks_encoded(token: str) -> bool:
+    """Base64 and similar text, where `/` is data rather than a path separator.
+
+    Random text changes between lowercase, uppercase and digits on most
+    characters. Paths and identifiers are made of words, so they rarely do.
+    """
+    compact = token.replace("/", "")
+    if len(compact) < _MIN_RANDOM_LENGTH or not _looks_random(compact):
+        return False
+    # Judge the pieces that are not already random on their own, so a normal
+    # path with one random folder keeps its readable parts.
+    rest = "".join(
+        part for part in token.split("/")
+        if len(part) < _MIN_RANDOM_LENGTH or not _looks_random(part)
+    )
+    if not rest:
+        return True
+    chars = [c for c in rest if c.isascii() and c.isalnum()]
+    changes = sum(_char_class(a) != _char_class(b) for a, b in pairwise(chars))
+    return changes / max(len(chars) - 1, 1) >= _MIN_CLASS_CHANGE_RATE
+
+
 def redact_text(text: str, stats: RedactionStats) -> str:
     for rule, pattern in _PATTERNS:
         text, n = pattern.subn(f"[REDACTED:{rule}]", text)
         if n:
             stats.counts[rule] += n
 
-    def _entropy_sub(match: re.Match[str]) -> str:
-        token = match.group(0)
-        if _looks_random(token):
+    def _redact_part(part: str) -> str:
+        if len(part) >= _MIN_RANDOM_LENGTH and _looks_random(part):
             stats.counts["high-entropy"] += 1
             return "[REDACTED:high-entropy]"
-        return token
+        return part
 
-    return _HIGH_ENTROPY.sub(_entropy_sub, text)
+    def _entropy_sub(match: re.Match[str]) -> str:
+        token = match.group(0)
+        if "/" not in token:
+            return _redact_part(token)
+        if _looks_encoded(token):
+            stats.counts["encoded-blob"] += 1
+            return "[REDACTED:encoded-blob]"
+        # An ordinary path or URL: keep it, but still catch a random segment.
+        return "/".join(_redact_part(part) for part in token.split("/"))
+
+    return _ENCODED_RUN.sub(_entropy_sub, text)
 
 
 def _scrub(value, stats: RedactionStats):
@@ -123,6 +170,15 @@ def _scrub(value, stats: RedactionStats):
     if isinstance(value, dict):
         return {k: _scrub(v, stats) for k, v in value.items()}
     return value
+
+
+def _is_tool_id(record: dict, key, value) -> bool:
+    if not isinstance(value, str) or not _TOOL_ID.fullmatch(value):
+        return False
+    if key in _TOOL_ID_FIELDS:
+        return True
+    block_type = record.get("type")
+    return key == "id" and isinstance(block_type, str) and block_type in _TOOL_BLOCK_TYPES
 
 
 def _redact_value(value, stats: RedactionStats):
@@ -147,6 +203,8 @@ def _redact_value(value, stats: RedactionStats):
             if k in _OPAQUE_KEYS and isinstance(v, str) and len(v) > 64:
                 stats.counts["opaque-omitted"] += 1
                 out[k] = f"[OMITTED:{k} {len(v)} chars]"
+            elif _is_tool_id(value, k, v):
+                out[k] = v
             elif isinstance(k, str) and _SECRET_FIELD.search(k):
                 out[k] = _scrub(v, stats)
             else:
