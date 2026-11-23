@@ -98,3 +98,17 @@ jobs:
           from software_factory.loop.harvester import harvest         # noqa: F401
           print("tier:", classify_tier(source="feature", files_changed=8, lines_changed=300))
           PY
+
+  insights:
+    # The transcript collector is a separate package with its own tests.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1    # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: pip install -e "insights[dev]"
+      - run: ruff check insights/aif_insights insights/tests
+      - name: Tests
+        working-directory: insights
+        run: python -m pytest -q
