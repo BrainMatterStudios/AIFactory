@@ -117,13 +117,19 @@ def _looks_encoded(token: str) -> bool:
     Random text changes between lowercase, uppercase and digits on most
     characters. Paths and identifiers are made of words, so they rarely do.
     """
+    parts = token.split("/")
+    random_parts = sum(len(p) >= _MIN_RANDOM_LENGTH and _looks_random(p) for p in parts)
+    # Two random segments mean encoded data, even if it has plain stretches.
+    # Removing them one by one would leave the pieces between them readable.
+    if random_parts >= 2:
+        return True
     compact = token.replace("/", "")
     if len(compact) < _MIN_RANDOM_LENGTH or not _looks_random(compact):
         return False
     # Judge the pieces that are not already random on their own, so a normal
     # path with one random folder keeps its readable parts.
     rest = "".join(
-        part for part in token.split("/")
+        part for part in parts
         if len(part) < _MIN_RANDOM_LENGTH or not _looks_random(part)
     )
     if not rest:
