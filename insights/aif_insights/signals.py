@@ -20,7 +20,8 @@ and listed here so a spot check can test them against the transcript:
 - autonomy span: for each human intervention (prompt or interrupt), minutes
   until the agent's last activity before the next one. The session value is
   the median.
-- outcome: a commit, push or `gh pr create` command that did not fail. A
+- outcome: a commit, push or `gh pr create` that a command actually runs (not
+  one it only mentions, as in `rg 'git commit'`) and that did not fail. A
   session with none is counted as abandoned.
 """
 from __future__ import annotations
@@ -35,7 +36,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from aif_insights.normalize import Command, Part, is_test
+from aif_insights.normalize import Command, Part, is_test, runs
 from aif_insights.sources import CLAUDE
 
 IDLE_GAP_S = 300
@@ -54,9 +55,9 @@ _TEST_PASSED = re.compile(
     r"\b\d+ passed\b|^ok\s|test result: ok|Tests?:\s+\d+ passed|^PASS\b", re.M)
 #: "no" right after the agent asked a question is an answer, not a correction.
 _ANSWER = re.compile(r"^(?:no|nope)\b", re.I)
-_COMMIT = re.compile(r"\bgit\s+(?:-C\s+\S+\s+)?commit\b")
-_PUSH = re.compile(r"\bgit\s+(?:-C\s+\S+\s+)?push\b")
-_PR = re.compile(r"\bgh\s+pr\s+create\b")
+_COMMIT = re.compile(r"git\s+(?:-C\s+\S+\s+)?commit\b")
+_PUSH = re.compile(r"git\s+(?:-C\s+\S+\s+)?push\b")
+_PR = re.compile(r"gh\s+pr\s+create\b")
 _HEADLESS = re.compile(r"^sdk|exec|^codex_sdk", re.I)
 _WORKTREE = re.compile(r"/\.(?:claude|codex)?/?worktrees/[^/]+(?:/.*)?$|/\.worktrees/[^/]+(?:/.*)?$")
 _CODEX_WORKTREE = re.compile(r"/\.codex/worktrees/[^/]+/([^/]+)")
@@ -234,9 +235,9 @@ def extract(session: Session) -> dict:
         "subagent_token_share": round(sub_tokens / total_tokens, 4) if total_tokens else None,
         "cache_hit_ratio": round(tokens["cache_read_tokens"] / prompt_side, 4) if prompt_side else None,
         "cost_usd": _cost(session),
-        "committed": any(_COMMIT.search(c) for c in succeeded),
-        "pushed": any(_PUSH.search(c) for c in succeeded),
-        "pr_opened": any(_PR.search(c) for c in succeeded),
+        "committed": any(runs(c, _COMMIT) for c in succeeded),
+        "pushed": any(runs(c, _PUSH) for c in succeeded),
+        "pr_opened": any(runs(c, _PR) for c in succeeded),
     }
     row["abandoned"] = not (row["committed"] or row["pushed"] or row["pr_opened"])
     return row

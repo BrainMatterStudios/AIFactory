@@ -70,18 +70,30 @@ _HEREDOC = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n.*?(?:\n\1\b|\Z)", re.S)
 _QUOTED = re.compile(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"")
 
 
-def is_test(command: str) -> bool:
-    # Heredoc bodies and quoted strings are data, not commands: drop them
-    # before splitting, so `rg "a|test"` or a heredoc script isn't a test run.
+def segments(command: str) -> list[str]:
+    """The commands a shell line runs, each with environment assignments,
+    wrappers (`npx`, `uv run`, ...) and a leading path removed. Heredoc bodies
+    and quoted strings are data, not commands, so they are dropped first:
+    `rg "a|test"`, `echo 'git commit'` or a heredoc script run nothing."""
     command = _QUOTED.sub("''", _HEREDOC.sub("", command))
+    out = []
     for raw in _SEGMENT.split(command):
         segment = _LEAD.sub("", raw.strip())
         first, _, rest = segment.partition(" ")
         if "/" in first:  # ./node_modules/.bin/vitest, .venv/bin/pytest
             segment = f"{first.rsplit('/', 1)[1]} {rest}"
-        if _TEST_RUNNER.match(segment):
-            return True
-    return False
+        if segment:
+            out.append(segment)
+    return out
+
+
+def runs(command: str, pattern: re.Pattern) -> bool:
+    """True if some command the line runs starts with `pattern`."""
+    return any(pattern.match(segment) for segment in segments(command))
+
+
+def is_test(command: str) -> bool:
+    return runs(command, _TEST_RUNNER)
 
 
 _RUNNING = re.compile(r"Process running with session ID (\d+)")
@@ -357,10 +369,12 @@ def _codex_item(p: Part, item: dict, ts: str | None, state: dict) -> None:
         elif call is not None:
             call.ok = True  # the tool returned; whether a command inside it worked is unknown
         commands = state.get(f"cmds:{call_id}", [])
-        for command in commands:
-            command.output = _keep(command, text)
-            if code is not None and len(commands) == 1:
-                command.exit_code, command.ok = code, code == 0
+        if len(commands) == 1:
+            commands[0].output = _keep(commands[0], text)
+            if code is not None:
+                commands[0].exit_code, commands[0].ok = code, code == 0
+        # Several commands in one script print one combined output; which
+        # result belongs to which is unknown, so none of them gets it.
         # A long command returns a session id and finishes in a later
         # `write_stdin` poll, under another call id: carry the result back.
         running = _RUNNING.search(text)

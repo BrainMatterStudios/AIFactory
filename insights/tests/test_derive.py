@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import gzip
 import json
+import re
 
 import pytest
 
 from aif_insights.cli import main
 from aif_insights.derive import build, kpis, latest_parts
-from aif_insights.normalize import Command, error_class, is_test, parse_part
+from aif_insights.normalize import Command, error_class, is_test, parse_part, runs
 from aif_insights.signals import extract, fold, project
 from aif_insights.signals import test_outcome as outcome
 from aif_insights.sources import CLAUDE, CODEX
@@ -354,3 +355,28 @@ def test_an_empty_archive_builds_nothing_and_does_not_crash(tmp_path):
                    cache=tmp_path / "cache", workers=1)
     assert report.sessions == 0 and not report.failed
     assert not (tmp_path / "derived" / "sessions").exists()
+
+
+def test_outcomes_count_only_commands_that_run():
+    lines = [
+        _prompt(0, "look around"),
+        _assistant(1, "o1", _bash("x1", "rg 'git commit' README.md && echo 'gh pr create'")),
+        _result(1, "x1", "README.md: run git commit"),
+    ]
+    [session] = fold([("ahmed", parse_part(CLAUDE, "s", "session", lines))])
+    row = extract(session)
+    assert not row["committed"] and not row["pr_opened"] and row["abandoned"]
+    assert runs("cd repo && git -C . commit -qm x", re.compile(r"git\s+(?:-C\s+\S+\s+)?commit\b"))
+
+
+def test_a_script_running_several_commands_leaves_their_results_unknown():
+    lines = [
+        _codex("session_meta", 0, id="r", cwd="/w/shop", originator="Codex Desktop"),
+        _codex("response_item", 1, type="custom_tool_call", name="exec", call_id="s",
+               input='await tools.exec_command({cmd: "pytest a"}); await tools.exec_command({cmd: "pytest b"})'),
+        _codex("response_item", 2, type="custom_tool_call_output", call_id="s",
+               output=[{"type": "input_text", "text": "Script completed\n1 passed\n2 failed"}]),
+    ]
+    [session] = fold([("h", parse_part(CODEX, "r", "session", lines))])
+    row = extract(session)
+    assert (row["test_runs"], row["test_failures"], row["test_unknown"]) == (2, 0, 2)
