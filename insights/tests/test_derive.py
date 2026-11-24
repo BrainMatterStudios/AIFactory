@@ -380,3 +380,33 @@ def test_a_script_running_several_commands_leaves_their_results_unknown():
     [session] = fold([("h", parse_part(CODEX, "r", "session", lines))])
     row = extract(session)
     assert (row["test_runs"], row["test_failures"], row["test_unknown"]) == (2, 0, 2)
+
+
+def test_escaped_newlines_in_script_commands_are_decoded():
+    lines = [
+        _codex("session_meta", 0, id="r", cwd="/w/shop", originator="Codex Desktop"),
+        _codex("response_item", 1, type="custom_tool_call", name="exec", call_id="s",
+               input='await tools.exec_command({"cmd": "cd insights\\npytest -q"})'),
+        _codex("response_item", 2, type="custom_tool_call_output", call_id="s",
+               output=[{"type": "input_text", "text": "Script completed\n3 failed"}]),
+    ]
+    [session] = fold([("h", parse_part(CODEX, "r", "session", lines))])
+    row = extract(session)
+    assert (row["test_runs"], row["test_failures"]) == (1, 1)
+
+
+def test_a_fork_that_repeats_its_parents_command_counts_it_once():
+    run = [
+        _codex("response_item", 1, type="function_call", name="exec_command", call_id="p1",
+               arguments=json.dumps({"cmd": "pytest -q"})),
+        _codex("response_item", 1, type="function_call_output", call_id="p1",
+               output="Process exited with code 1\n1 failed"),
+    ]
+    parent = [_codex("session_meta", 0, id="root", cwd="/w/shop", originator="Codex Desktop"), *run]
+    forks = [[_codex("session_meta", 0, id=f"k{i}", cwd="/w/shop", parent_thread_id="root",
+                     forked_from_id="root"), *run] for i in (1, 2)]
+    parts = [("h", parse_part(CODEX, "root", "session", parent))] + [
+        ("h", parse_part(CODEX, f"k{i}", "session", lines)) for i, lines in zip((1, 2), forks, strict=True)]
+    [session] = fold(parts)
+    row = extract(session)
+    assert (row["commands"], row["test_failures"], row["retry_loops"]) == (1, 1, 0)

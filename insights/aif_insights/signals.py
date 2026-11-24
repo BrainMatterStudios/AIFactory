@@ -164,7 +164,15 @@ def extract(session: Session) -> dict:
     main = session.main or parts[0]
     stamps = sorted(t for p in parts for ts in p.timestamps if (t := _t(ts)))
     calls = {c.call_id: c for p in parts for c in p.calls.values()}  # forks repeat a few calls
-    commands = [c for p in parts for c in p.commands]
+    # Forked Codex threads repeat some of their parent's history: count each
+    # execution once (commands with no identity are always kept).
+    seen: set[str] = set()
+    commands = []
+    for c in (c for p in parts for c in p.commands):
+        if c.source and c.source in seen:
+            continue
+        seen.add(c.source)
+        commands.append(c)
     errors = Counter(c.error_class or "other" for c in calls.values() if c.ok is False)
 
     prompts = [h for h in main.humans if h.kind == "prompt"]

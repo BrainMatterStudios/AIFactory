@@ -139,6 +139,9 @@ class Command:
     ok: bool | None = None
     exit_code: int | None = None
     output: str = ""
+    #: Identity of the execution (tool call or event id plus position), so a
+    #: forked Codex thread that repeats its parent's history counts it once.
+    source: str = ""
 
 
 @dataclass
@@ -263,7 +266,7 @@ def _claude(p: Part, r: dict, ts: str | None, state: dict) -> None:
                 p.calls[call_id] = ToolCall(call_id, ts, str(block.get("name")))
                 command = _dict(block.get("input")).get("command")
                 if block.get("name") == "Bash" and isinstance(command, str):
-                    p.commands.append(Command(ts, command))
+                    p.commands.append(Command(ts, command, source=call_id))
                     state[f"cmd:{call_id}"] = p.commands[-1]
         message_id = message.get("id")
         # One API message is written as one record per content block.
@@ -350,8 +353,8 @@ def _codex_item(p: Part, item: dict, ts: str | None, state: dict) -> None:
         name = str(item.get("name") or kind)
         p.calls[call_id] = ToolCall(call_id, ts, name)
         state["asked"] = False
-        for text in _codex_commands(name, item):
-            p.commands.append(Command(ts, text))
+        for i, text in enumerate(_codex_commands(name, item)):
+            p.commands.append(Command(ts, text, source=f"{call_id}#{i}"))
             state.setdefault(f"cmds:{call_id}", []).append(p.commands[-1])
         polled = _codex_polled_sessions(name, item)
         if polled:
@@ -396,6 +399,18 @@ def _codex_item(p: Part, item: dict, ts: str | None, state: dict) -> None:
             p.agent_turns.append(ts)
 
 
+def _js_string(double: str, single: str, template: str) -> str:
+    """The value of a JavaScript string literal from its source spelling, so
+    `"cd x\\npytest"` becomes two lines. Template literals are taken as written."""
+    if template:
+        return template
+    body = double or single.replace("\\'", "'").replace('"', '\\"')
+    try:
+        return json.loads(f'"{body}"')
+    except json.JSONDecodeError:
+        return body
+
+
 def _codex_polled_sessions(name: str, item: dict) -> list[str]:
     """Session ids a `write_stdin` call (direct, or inside a script) polls."""
     if name == "write_stdin":
@@ -415,7 +430,7 @@ def _codex_commands(name: str, item: dict) -> list[str]:
         return [" ".join(command)] if isinstance(command, list) else []
     if name == "exec" and isinstance(item.get("input"), str):
         found = _CODEX_SCRIPT_CMD.findall(item["input"])
-        return [next((g for g in groups if g), "") for groups in found if any(groups)]
+        return [_js_string(*groups) for groups in found if any(groups)]
     if name in ("exec_command", "shell", "shell_command", "container.exec"):
         try:
             args = json.loads(item.get("arguments") or "{}")
@@ -455,6 +470,7 @@ def _codex_event(p: Part, event: dict, ts: str | None, state: dict) -> None:
             code = item.get("exit_code")
             if isinstance(command, str):
                 entry = Command(ts, command, ok=code == 0 if isinstance(code, int) else None,
-                                exit_code=code if isinstance(code, int) else None)
+                                exit_code=code if isinstance(code, int) else None,
+                                source=f"ce:{item.get('id')}" if item.get("id") else "")
                 entry.output = _keep(entry, str(item.get("aggregated_output") or ""))
                 state["ce_commands"].append(entry)
