@@ -89,9 +89,11 @@ baseline. No separate comparison against the old factory is planned.
       token with contents and PR write access, no merge or admin rights.
 - [x] Protect `develop`, the branch agent PRs target: an active ruleset with
       the same rules as `main` (2026-11-24).
-- [ ] Restore the required approval on `main` and `develop`. It was lowered
-      from 1 to 0 on 2026-11-24 so Ahmed can merge without waiting for a
-      second reviewer; PRs and required checks still apply.
+- [x] One approval is required on `main` and `develop` (the "Review approval"
+      ruleset). Repository admins may skip it when merging a PR, so either
+      maintainer can merge without waiting for the other; required checks
+      still apply to admins (2026-11-24). Revisit once the bot identity
+      exists.
 
 ## L1: retire the old machinery (week 1)
 
