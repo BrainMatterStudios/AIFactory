@@ -159,7 +159,11 @@ def build(store: ReadableStore, *, out: Path = DEFAULT_OUT, cache: Path = DEFAUL
     report.sessions = len(rows)
     report.bad_lines = sum(r["bad_lines"] for r in rows)
     report.unknown_types = summarize_unknowns(rows)
-    _write(duckdb, rows, out / "sessions")
+    if rows:
+        _write(duckdb, rows, out / "sessions")
+    else:
+        # No rows means no schema to infer; keep any existing table as it is.
+        report.out = "nowhere: no sessions, the existing table was left unchanged"
     return report
 
 

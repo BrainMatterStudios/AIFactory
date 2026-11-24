@@ -84,6 +84,8 @@ def is_test(command: str) -> bool:
     return False
 
 
+_RUNNING = re.compile(r"Process running with session ID (\d+)")
+_SCRIPT_SESSION = re.compile(r"""["']?session_id["']?\s*:\s*(\d+)""")
 #: Commands inside a Codex `exec` script: `cmd: "..."`, `"cmd": '...'`, or a template.
 _CODEX_SCRIPT_CMD = re.compile(
     r"""["']?cmd["']?\s*:\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|`([^`]*)`)""")
@@ -339,6 +341,9 @@ def _codex_item(p: Part, item: dict, ts: str | None, state: dict) -> None:
         for text in _codex_commands(name, item):
             p.commands.append(Command(ts, text))
             state.setdefault(f"cmds:{call_id}", []).append(p.commands[-1])
+        polled = _codex_polled_sessions(name, item)
+        if polled:
+            state[f"polls:{call_id}"] = polled
     elif kind in ("function_call_output", "custom_tool_call_output"):
         call_id = str(item.get("call_id"))
         output = item.get("output")
@@ -351,9 +356,20 @@ def _codex_item(p: Part, item: dict, ts: str | None, state: dict) -> None:
             call.error_class = None if call.ok else error_class(text, code)
         elif call is not None:
             call.ok = True  # the tool returned; whether a command inside it worked is unknown
-        for command in state.get(f"cmds:{call_id}", []):
+        commands = state.get(f"cmds:{call_id}", [])
+        for command in commands:
             command.output = _keep(command, text)
-            if code is not None and len(state[f"cmds:{call_id}"]) == 1:
+            if code is not None and len(commands) == 1:
+                command.exit_code, command.ok = code, code == 0
+        # A long command returns a session id and finishes in a later
+        # `write_stdin` poll, under another call id: carry the result back.
+        running = _RUNNING.search(text)
+        if running and len(commands) == 1 and code is None:
+            state[f"bg:{running.group(1)}"] = commands[0]
+        polled = state.get(f"polls:{call_id}", [])
+        if len(polled) == 1 and (command := state.get(f"bg:{polled[0]}")) is not None:
+            command.output = _keep(command, command.output + "\n" + text)
+            if code is not None:
                 command.exit_code, command.ok = code, code == 0
     elif kind == "message" and item.get("role") == "user" and not p.is_subagent:
         text = _codex_text(item).lstrip()
@@ -364,6 +380,19 @@ def _codex_item(p: Part, item: dict, ts: str | None, state: dict) -> None:
         state["asked"] = _block_text(item.get("content")).rstrip().endswith("?")
         if ts:
             p.agent_turns.append(ts)
+
+
+def _codex_polled_sessions(name: str, item: dict) -> list[str]:
+    """Session ids a `write_stdin` call (direct, or inside a script) polls."""
+    if name == "write_stdin":
+        try:
+            sid = _dict(json.loads(item.get("arguments") or "{}")).get("session_id")
+        except json.JSONDecodeError:
+            return []
+        return [str(sid)] if sid is not None else []
+    if name == "exec" and isinstance(item.get("input"), str) and "write_stdin" in item["input"]:
+        return sorted(set(_SCRIPT_SESSION.findall(item["input"])))
+    return []
 
 
 def _codex_commands(name: str, item: dict) -> list[str]:

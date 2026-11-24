@@ -329,3 +329,28 @@ def test_no_after_a_question_is_an_answer_not_a_correction():
     ]
     [session] = fold([("ahmed", parse_part(CLAUDE, "s", "session", lines))])
     assert extract(session)["corrections"] == 1
+
+
+def test_a_polled_codex_command_gets_its_final_result():
+    lines = [
+        _codex("session_meta", 0, id="r", cwd="/w/shop", originator="Codex Desktop"),
+        _codex("response_item", 1, type="function_call", name="exec_command", call_id="a",
+               arguments=json.dumps({"cmd": "pytest -q"})),
+        _codex("response_item", 1, type="function_call_output", call_id="a",
+               output="Chunk ID: 1\nProcess running with session ID 42\ncollecting ..."),
+        _codex("response_item", 2, type="function_call", name="write_stdin", call_id="b",
+               arguments=json.dumps({"session_id": 42, "chars": ""})),
+        _codex("response_item", 3, type="function_call_output", call_id="b",
+               output="Chunk ID: 2\nProcess exited with code 1\n=== 3 failed, 9 passed ==="),
+    ]
+    [session] = fold([("hossam", parse_part(CODEX, "r", "session", lines))])
+    row = extract(session)
+    assert (row["test_runs"], row["test_failures"], row["test_unknown"]) == (1, 1, 0)
+
+
+def test_an_empty_archive_builds_nothing_and_does_not_crash(tmp_path):
+    pytest.importorskip("duckdb")
+    report = build(LocalStore(tmp_path / "bucket"), out=tmp_path / "derived",
+                   cache=tmp_path / "cache", workers=1)
+    assert report.sessions == 0 and not report.failed
+    assert not (tmp_path / "derived" / "sessions").exists()
