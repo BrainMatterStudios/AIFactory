@@ -15,7 +15,7 @@ from collections import Counter
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 
-from aif_insights.sources import CLAUDE, CODEX, TranscriptFile
+from aif_insights.sources import CLAUDE, TranscriptFile
 
 INTERRUPT_MARKER = "[Request interrupted by user"
 
@@ -26,7 +26,11 @@ _CLAUDE_KNOWN = frozenset({
 })
 _CODEX_KNOWN = frozenset({
     "session_meta", "response_item", "event_msg", "turn_context", "compacted",
+    "inter_agent_communication_metadata", "world_state", "token_usage_record", "realtime_item",
 })
+#: Codex writes injected context (AGENTS.md, environment, reminders, plugin
+#: lists) as user messages. Only typed prompts count as prompts.
+_CODEX_INJECTED = ("<", "# AGENTS.md")
 
 
 @dataclass
@@ -34,7 +38,7 @@ class Summary:
     agent: str
     session_id: str
     part: str
-    parser: str = "ok"                    # "ok" | "unverified" (Codex)
+    parser: str = "ok"
     title: str | None = None
     cwd: str | None = None
     #: Every working directory the file mentions; exclusions check all of them.
@@ -80,8 +84,6 @@ def _add_unique(items: list[str], value) -> None:
 
 def summarize(file: TranscriptFile, lines: Iterable[str]) -> Summary:
     summary = Summary(agent=file.agent, session_id=file.session_id, part=file.part)
-    if file.agent == CODEX:
-        summary.parser = "unverified"
     unknown: Counter = Counter()
     seen_messages: set[str] = set()
     for line in lines:
@@ -172,12 +174,16 @@ def _codex_record(s: Summary, r: dict, unknown: Counter) -> None:
     if kind in ("session_meta", "turn_context"):
         _add_unique(s.cwds, payload.get("cwd"))
     if kind == "session_meta":
-        if isinstance(payload.get("cwd"), str):
+        # A forked or multi-agent session repeats this record; the first one is
+        # the session's own.
+        if s.cwd is None and isinstance(payload.get("cwd"), str):
             s.cwd = payload["cwd"]
         git = payload.get("git") if isinstance(payload.get("git"), dict) else {}
         _add_unique(s.git_branches, git.get("branch"))
-        if isinstance(payload.get("cli_version"), str):
+        if s.agent_version is None and isinstance(payload.get("cli_version"), str):
             s.agent_version = payload["cli_version"]
+        if s.entrypoint is None and isinstance(payload.get("originator"), str):
+            s.entrypoint = payload["originator"]
     elif kind == "turn_context":
         _add_unique(s.models, payload.get("model"))
         if s.cwd is None and isinstance(payload.get("cwd"), str):
@@ -187,16 +193,31 @@ def _codex_record(s: Summary, r: dict, unknown: Counter) -> None:
         if item in ("function_call", "local_shell_call", "custom_tool_call"):
             s.tool_calls += 1
         elif item == "message" and payload.get("role") == "user":
-            s.user_prompts += 1
+            if not _codex_text(payload).lstrip().startswith(_CODEX_INJECTED):
+                s.user_prompts += 1
         elif item == "message" and payload.get("role") == "assistant":
             s.assistant_messages += 1
     elif kind == "event_msg" and payload.get("type") == "token_count":
         info = payload.get("info") if isinstance(payload.get("info"), dict) else {}
         total = info.get("total_token_usage") if isinstance(info.get("total_token_usage"), dict) else {}
         if total:
-            # Cumulative per session: keep the latest, do not add.
-            s.input_tokens = int(total.get("input_tokens") or 0)
+            # Cumulative per session: keep the latest, do not add. Codex counts
+            # cached input inside input_tokens; Claude Code counts it apart, so
+            # subtract it to keep the two agents comparable.
+            cached = int(total.get("cached_input_tokens") or 0)
+            s.input_tokens = max(int(total.get("input_tokens") or 0) - cached, 0)
             s.output_tokens = int(total.get("output_tokens") or 0)
-            s.cache_read_tokens = int(total.get("cached_input_tokens") or 0)
+            s.cache_read_tokens = cached
+            s.cache_write_tokens = int(total.get("cache_write_input_tokens") or 0)
     elif kind == "event_msg" and payload.get("type") == "turn_aborted":
         s.interrupts += 1
+
+
+def _codex_text(payload: dict) -> str:
+    content = payload.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list) and content and isinstance(content[0], dict):
+        text = content[0].get("text")
+        return text if isinstance(text, str) else ""
+    return ""

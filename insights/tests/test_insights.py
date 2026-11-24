@@ -149,24 +149,62 @@ def test_claude_summary():
     assert s.first_ts == "2026-11-20T10:00:00Z" and s.last_ts == "2026-11-20T10:01:01Z"
 
 
-def test_codex_summary_is_marked_unverified():
-    lines = [json.dumps(r) for r in (
+def _codex_lines() -> list[str]:
+    def user(text):
+        return {"timestamp": "2026-11-20T09:00:02Z", "type": "response_item",
+                "payload": {"type": "message", "role": "user",
+                            "content": [{"type": "input_text", "text": text}]}}
+    return [json.dumps(r) for r in (
         {"timestamp": "2026-11-20T09:00:00Z", "type": "session_meta",
-         "payload": {"id": "c1", "cwd": "/work/app", "git": {"branch": "main"}, "cli_version": "0.9"}},
+         "payload": {"id": "c1", "cwd": "/work/app", "git": {"branch": "main"},
+                     "cli_version": "0.9", "originator": "codex_desktop"}},
+        # A forked session repeats session_meta; the first one is the session's own.
+        {"timestamp": "2026-11-20T09:00:00Z", "type": "session_meta",
+         "payload": {"id": "c0", "cwd": "/work/other", "cli_version": "0.8"}},
         {"timestamp": "2026-11-20T09:00:01Z", "type": "turn_context", "payload": {"model": "gpt-5-codex"}},
-        {"timestamp": "2026-11-20T09:00:02Z", "type": "response_item",
-         "payload": {"type": "message", "role": "user"}},
+        user("# AGENTS.md instructions for /work/app"),
+        user("<environment_context>cwd</environment_context>"),
+        user("fix the bug"),
         {"timestamp": "2026-11-20T09:00:03Z", "type": "response_item",
-         "payload": {"type": "function_call"}},
+         "payload": {"type": "custom_tool_call"}},
         {"timestamp": "2026-11-20T09:00:04Z", "type": "event_msg",
          "payload": {"type": "token_count", "info": {"total_token_usage": {
-             "input_tokens": 50, "output_tokens": 9, "cached_input_tokens": 20}}}},
+             "input_tokens": 50, "output_tokens": 9, "cached_input_tokens": 20,
+             "cache_write_input_tokens": 4}}}},
+        {"timestamp": "2026-11-20T09:00:05Z", "type": "world_state", "payload": {}},
     )]
-    s = summarize(TranscriptFile(CODEX, Path("rollout.jsonl"), "c1"), lines)
-    assert s.parser == "unverified"
-    assert s.cwd == "/work/app" and s.models == ["gpt-5-codex"]
-    assert s.tool_calls == 1 and s.user_prompts == 1
-    assert s.input_tokens == 50 and s.cache_read_tokens == 20
+
+
+def test_codex_summary():
+    s = summarize(TranscriptFile(CODEX, Path("rollout.jsonl"), "c1"), _codex_lines())
+    assert s.parser == "ok"
+    assert s.cwd == "/work/app" and s.agent_version == "0.9"
+    assert s.cwds == ["/work/app", "/work/other"]          # exclusions see both
+    assert s.entrypoint == "codex_desktop" and s.models == ["gpt-5-codex"]
+    assert s.tool_calls == 1 and s.user_prompts == 1       # injected context is not a prompt
+    assert s.input_tokens == 30 and s.cache_read_tokens == 20 and s.cache_write_tokens == 4
+    assert s.unknown_types == {}
+
+
+def test_compressed_codex_sessions_are_found_and_read(tmp_path):
+    from aif_insights.sources import _zstd_decompress, read_transcript
+    if _zstd_decompress is None:
+        pytest.skip("no zstd support")
+    try:
+        from compression.zstd import compress
+    except ImportError:
+        import zstandard
+
+        compress = zstandard.ZstdCompressor().compress
+    day = tmp_path / "2026" / "11" / "20"
+    day.mkdir(parents=True)
+    session = "019a797f-bf0f-7ae1-831b-b207a747c069"
+    text = "\n".join(_codex_lines()) + "\n"
+    path = day / f"rollout-2026-11-20T09-00-00-{session}.jsonl.zst"
+    path.write_bytes(compress(text.encode()))
+    found = list(discover(claude=tmp_path / "none", codex=tmp_path))
+    assert [(f.agent, f.session_id, f.path) for f in found] == [(CODEX, session, path)]
+    assert read_transcript(path) == text
 
 
 # --------------------------------------------------------------------------- #
