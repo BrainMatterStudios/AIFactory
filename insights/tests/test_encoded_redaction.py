@@ -63,6 +63,14 @@ def test_random_segment_is_removed_and_the_path_is_kept():
     assert out == "/work/project/[REDACTED:high-entropy]/config"
 
 
+def test_blob_with_plain_stretches_leaves_no_fragment_between_random_parts():
+    first, middle, last = (_random(BASE64, n, seed) for n, seed in ((40, 9), (24, 10), (40, 11)))
+    plain = "/".join(["aaaaaaaaaaaaaaaaaaaaaaaa"] * 12)
+    blob = f"{first}/{plain}/{middle}/{last}"
+    out = redact_text(f"value {blob} end", RedactionStats())
+    assert out == "value [REDACTED:encoded-blob] end"
+
+
 @pytest.mark.parametrize("prefix", ["toolu_", "srvtoolu_"])
 def test_tool_ids_survive_so_calls_match_results(prefix):
     tool_id = prefix + _random(string.ascii_letters + string.digits, 24, 7)
