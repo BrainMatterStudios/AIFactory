@@ -1,6 +1,6 @@
 # AIFactory roadmap
 
-**Last updated:** 2026-11-22
+**Last updated:** 2026-11-24
 **Supersedes:** the 2026-10-23 roadmap (0.3.1 → 0.8.0), which remains in git
 history. The analysis behind this revision is in
 [REVIEW-2026-11.md](REVIEW-2026-11.md).
@@ -51,8 +51,8 @@ come from scope estimates, not commitments.
 |---|---|---|---|---|---|
 | **0** | — | Start | Retention raised, telemetry on, history backed up, `v0.3-archive` branch created | Both machines exporting OTel to Grafana Cloud | **This week** |
 | **L1** | Lean | Retire | Old machinery removed from `main`; slim CLI | `main` holds only kept modules; CI green | **Done** (merged in #18) |
-| **L2** | Lean | Lean factory v1 | One-session-per-issue dispatcher, platform gates, cross-vendor review, human merge | First 5 real issues through it end to end | **In progress:** `factory dispatch` built |
-| **A1** | Analytics | Collect | Redacted transcripts from both machines and both agents land in the bucket every night | 7 consecutive days with ≥99% of sessions archived (reconciled against OTel `session.count`) | **In progress:** collector built (`insights/`) |
+| **L2** | Lean | Lean factory v1 | One-session-per-issue dispatcher, platform gates, cross-vendor review, human merge | First 5 real issues through it end to end | **In progress:** `factory dispatch` built, `develop` protected, Codex review workflow added |
+| **A1** | Analytics | Collect | Redacted transcripts from both machines and both agents land in the bucket every night | 7 consecutive days with ≥99% of sessions archived (reconciled against OTel `session.count`) | **In progress:** collector running hourly on both laptops |
 | **A2** | Analytics | Extract and join | Deterministic signals, Parquet/DuckDB store, session↔PR↔CI↔deploy joins, KPI dashboard | Dashboard shows the core KPIs; 10 spot-checked joins correct | Weeks 2–4 |
 | **A3** | Analytics | Diagnose | Calibrated rubric pass (batch), weekly synthesis report and deduped issues | Rubric meets the calibration bar; first weekly report filed | Weeks 4–6 |
 | **L3** | Both | Closed loop | Weekly proposals become config PRs, with each change's KPI effect tracked | 3 changes shipped with measured before/after | From week 6, ongoing |
@@ -79,14 +79,19 @@ baseline. No separate comparison against the old factory is planned.
       Compliance API access, so A1 can compare it with laptop sync.
 - [ ] Agree the privacy rules: redaction before storage, a client-repository
       exclusion list, mutual read access, and KPIs that are not a personal
-      leaderboard.
+      leaderboard. Redaction is in place, and Ahmed chose an empty exclusion
+      list (2026-11-23). Read access and KPI rules are still to agree.
 - [x] Create the `v0.3-archive` branch at `main` (`00fe2d1`), done
       2026-11-21. It is the only copy of the 0.x machinery after L1, and an
       active ruleset protects it.
 - [x] Protect `main` with an active ruleset.
 - [ ] Set up the lean factory's bot identity: a GitHub App or fine-grained
       token with contents and PR write access, no merge or admin rights.
-- [ ] Protect `develop`, the branch agent PRs target. It has no protection yet.
+- [x] Protect `develop`, the branch agent PRs target: an active ruleset with
+      the same rules as `main` (2026-11-24).
+- [ ] Restore the required approval on `main` and `develop`. It was lowered
+      from 1 to 0 on 2026-11-24 so Ahmed can merge without waiting for a
+      second reviewer; PRs and required checks still apply.
 
 ## L1: retire the old machinery (week 1)
 
@@ -111,10 +116,19 @@ baseline. No separate comparison against the old factory is planned.
 
 ## L2: lean factory v1 (weeks 2–3)
 
-**Status (2026-11-21):** `factory dispatch` is implemented and tested against
-real git. Remaining: deploy it on the VPS, the bot identity and `develop`
-protection (phase 0 items), the cross-vendor review workflow, and the first 5
-real issues.
+**Status (2026-11-24):** `factory dispatch` is implemented and tested against
+real git. `develop` is protected. The cross-vendor review is a workflow
+(`.github/workflows/codex-review.yml`) that posts an advisory Codex review on
+every PR once an `OPENAI_API_KEY` repository secret exists. Remaining: deploy
+the dispatcher on the VPS, the bot identity (phase 0), and the first 5 real
+issues.
+
+Claude Code's `/ship` command (v2.1.330) was checked on 2026-11-24 and is not
+adopted. It runs only from a typed command in an interactive terminal, not
+from `claude -p`, so the dispatcher cannot use it. It acts under the
+operator's own GitHub login and pushes fixes without the dispatcher's re-test
+and secret scan. Its review is Claude's own, not another vendor's. It remains
+useful for a human-driven PR.
 
 - **Intake:** observe loops (production through the fleet agent, the factory
   through analytics) file deduped issues. A human adds the `ready` label.
@@ -141,13 +155,16 @@ real issues.
 
 ## A1: Collect
 
-**Status (2026-11-21):** decided: Cloudflare R2, with machine sync as the
+**Status (2026-11-24):** decided: Cloudflare R2, with machine sync as the
 primary source and the Compliance API as a backfill and weekly completeness
-check. The collector (`insights/`, `aif-insights collect`) is built and tested
-on real Claude Code transcripts: discovery including subagents, redaction,
-per-session index, append-only upload. Remaining: the R2 bucket and tokens,
-installing it on both laptops and the VPS, verifying the Codex parser on a real
-file, the Compliance API backfill, and the reconciliation job.
+check. The collector (`insights/`, `aif-insights collect`) runs hourly on both
+laptops and uploads to R2. Redaction was hardened twice (encoded secrets with
+slashes, and blobs with plain stretches), and Ahmed's earlier uploads were
+replaced with redacted copies. The Codex parser was checked against 761 real
+files, which Codex stores compressed (`.jsonl.zst`); collecting them merged
+in #23. Remaining: replacing the second laptop's pre-fix uploads, the VPS
+install, the Compliance API backfill, and the reconciliation job, which needs
+OTel first.
 
 - Package `insights/` (Python `aif_insights`, with its own `pyproject.toml`,
   installed separately). It must **not** import `software_factory`, enforced by
