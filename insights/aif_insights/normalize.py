@@ -204,7 +204,8 @@ def _block_text(content) -> str:
 
 def parse_part(agent: str, session_id: str, part: str, lines: Iterable[str]) -> Part:
     p = Part(agent=agent, session_id=session_id, part=part, is_subagent=part != "session")
-    state: dict = {"seen": set(), "ce_commands": [], "compacted": 0, "ctx_compactions": 0}
+    state: dict = {"seen": set(), "ce_commands": [], "script_calls": set(), "compacted": 0,
+                   "ctx_compactions": 0}
     for line in lines:
         if not line.strip():
             continue
@@ -225,10 +226,8 @@ def parse_part(agent: str, session_id: str, part: str, lines: Iterable[str]) -> 
         else:
             _codex(p, record, ts, state)
     if agent != CLAUDE:
-        # Codex reports nested script commands as CommandExecution events when
-        # it has them; those carry real exit codes, so prefer them.
         if state["ce_commands"]:
-            p.commands = state["ce_commands"]
+            p.commands = _reconcile(p, state)
         p.compactions = max(state["compacted"], state["ctx_compactions"])
     p.timestamps.sort()
     return p
@@ -353,6 +352,8 @@ def _codex_item(p: Part, item: dict, ts: str | None, state: dict) -> None:
         name = str(item.get("name") or kind)
         p.calls[call_id] = ToolCall(call_id, ts, name)
         state["asked"] = False
+        if name == "exec":
+            state["script_calls"].add(call_id)
         for i, text in enumerate(_codex_commands(name, item)):
             p.commands.append(Command(ts, text, source=f"{call_id}#{i}"))
             state.setdefault(f"cmds:{call_id}", []).append(p.commands[-1])
@@ -409,6 +410,21 @@ def _js_string(double: str, single: str, template: str) -> str:
         return json.loads(f'"{body}"')
     except json.JSONDecodeError:
         return body
+
+
+def _reconcile(p: Part, state: dict) -> list[Command]:
+    """Merge Codex CommandExecution events, which carry real exit codes, with
+    the commands read from tool calls. An event for a direct call has that
+    call's id and replaces it. Other events are commands run inside `exec`
+    scripts; when there are any, they replace the commands guessed from script
+    text. Commands with no event are kept."""
+    events = state["ce_commands"]
+    event_ids = {c.source.removeprefix("ce:") for c in events}
+    nested = any(i not in p.calls for i in event_ids)
+    kept = [c for c in p.commands
+            if c.source.split("#")[0] not in event_ids
+            and not (nested and c.source.split("#")[0] in state["script_calls"])]
+    return sorted(kept + events, key=lambda c: c.ts or "")
 
 
 def _codex_polled_sessions(name: str, item: dict) -> list[str]:

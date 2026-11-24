@@ -410,3 +410,32 @@ def test_a_fork_that_repeats_its_parents_command_counts_it_once():
     [session] = fold(parts)
     row = extract(session)
     assert (row["commands"], row["test_failures"], row["retry_loops"]) == (1, 1, 0)
+
+
+def test_command_events_replace_only_the_commands_they_describe():
+    lines = [
+        _codex("session_meta", 0, id="r", cwd="/w/shop", originator="Codex Desktop"),
+        # A direct call with no event of its own: kept, with its result.
+        _codex("response_item", 1, type="function_call", name="exec_command", call_id="d1",
+               arguments=json.dumps({"cmd": "pytest -q"})),
+        _codex("response_item", 1, type="function_call_output", call_id="d1",
+               output="Process exited with code 1\n3 failed"),
+        # A direct call that has an event with the same id: the event replaces it.
+        _codex("response_item", 2, type="function_call", name="exec_command", call_id="d2",
+               arguments=json.dumps({"cmd": "npm test"})),
+        _codex("event_msg", 2, type="item_completed", item={
+            "type": "CommandExecution", "id": "d2", "command": ["/bin/zsh", "-lc", "npm test"],
+            "exit_code": 0, "aggregated_output": "Tests: 4 passed"}),
+        # A script whose nested command is reported as an event.
+        _codex("response_item", 3, type="custom_tool_call", name="exec", call_id="s1",
+               input='await tools.exec_command({cmd: "ls"})'),
+        _codex("event_msg", 3, type="item_completed", item={
+            "type": "CommandExecution", "id": "exec-1", "command": ["/bin/zsh", "-lc", "ls"],
+            "exit_code": 0, "aggregated_output": ""}),
+    ]
+    part = parse_part(CODEX, "r", "session", lines)
+    assert [(c.text, c.exit_code) for c in part.commands] == [
+        ("pytest -q", 1), ("npm test", 0), ("ls", 0)]
+    [session] = fold([("h", part)])
+    row = extract(session)
+    assert (row["test_runs"], row["test_failures"]) == (2, 1)
