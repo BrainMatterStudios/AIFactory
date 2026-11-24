@@ -12,7 +12,7 @@ It does not import `software_factory` and can be installed on its own.
 | Agent | Location | Status |
 |---|---|---|
 | Claude Code | `~/.claude/projects/<project>/<session>.jsonl`, plus subagents in `<session>/subagents/agent-<id>.jsonl` | Parser tested on real transcripts |
-| Codex | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | Summary marked `unverified` until checked against a real file |
+| Codex | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, or `.jsonl.zst` once Codex compresses it | Parser checked against 761 real files |
 
 Files still being written are skipped until they have been quiet for
 `quiet_minutes`. A session that grows later is uploaded again as a new object:

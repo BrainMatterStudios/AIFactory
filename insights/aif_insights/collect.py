@@ -31,7 +31,7 @@ from pathlib import Path
 from aif_insights import __version__
 from aif_insights.config import Config
 from aif_insights.redact import redact_lines
-from aif_insights.sources import TranscriptFile, discover
+from aif_insights.sources import TranscriptFile, discover, read_transcript
 from aif_insights.store import Store
 from aif_insights.summarize import summarize
 
@@ -104,7 +104,7 @@ def _split_lines(text: str) -> list[str]:
 
 @lru_cache(maxsize=32)
 def _parent_cwds(file: TranscriptFile, mtime_ns: int) -> tuple[str, ...]:
-    text = file.path.read_text(encoding="utf-8", errors="replace")
+    text = read_transcript(file.path)
     return tuple(summarize(file, _split_lines(text)).cwds)
 
 
@@ -195,7 +195,7 @@ def _collect_one(cfg: Config, store: Store, manifest: Manifest, file: Transcript
         report.unchanged += 1
         return
 
-    text = file.path.read_text(encoding="utf-8", errors="replace")
+    text = read_transcript(file.path)
     lines = _split_lines(text)
     # Checked on the original text: redaction could rewrite a directory name.
     if cfg.exclude_cwd and _excluded(_cwds_with_parent(file, lines), cfg.exclude_cwd):
