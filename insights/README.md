@@ -89,6 +89,43 @@ uploaded.
 On Linux or the VPS, put the keys in `AIF_R2_ACCESS_KEY_ID` and
 `AIF_R2_SECRET_ACCESS_KEY` and use `aif-insights schedule cron`.
 
+## Sessions and KPIs (phase A2)
+
+`aif-insights extract` reads the archive back and writes one row per session
+(a parent with its subagents) to Parquet, queryable with DuckDB. It needs the
+`analytics` extra (`pip install 'aif-insights[analytics,r2]'`) and the same R2
+keys, which can read as well as write.
+
+```bash
+aif-insights extract          # rebuild ~/.local/share/aif-insights/derived/sessions
+aif-insights kpis --weeks 4   # weekly KPIs per agent, interactive vs headless
+```
+
+Only the largest upload of each part is read, and downloads are cached in
+`~/.cache/aif-insights`, so a rebuild fetches only new objects. Output stays on
+the machine. The table holds counts, times, tokens, cost, and the session's
+folder and branches, never message text.
+
+Every signal is a fixed rule with no model call. The rules are listed at the top
+of `aif_insights/signals.py`, so a spot check can test them. Known limits:
+
+- corrections are found by opening phrases ("no", "that's wrong", "revert"),
+  an uncalibrated heuristic;
+- most Codex script calls don't record an exit code. Their commands count, but
+  pass or fail is known only for tests whose output has a summary line;
+- Codex cost is left empty: Codex records none, and OpenAI's prices for these
+  models aren't verified here. Claude Code cost is the figure it writes itself;
+- projects are named after the working folder, with agent worktrees mapped back
+  to their repository.
+
+```sql
+-- example: sessions with a failing-test loop, last 14 days
+SELECT agent, project, session_id, test_loops, corrections
+FROM read_parquet('~/.local/share/aif-insights/derived/sessions/*/*.parquet',
+                  hive_partitioning = true)
+WHERE test_loops > 0 AND dt >= current_date - 14;
+```
+
 ## Development
 
 ```bash

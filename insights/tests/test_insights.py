@@ -314,7 +314,7 @@ def test_cli_collect_and_status(tmp_path, homes, capsys):
 
 
 def test_package_does_not_import_the_factory():
-    code = "import sys, aif_insights.cli, aif_insights.collect; print([m for m in sys.modules if m.startswith('software_factory')])"
+    code = "import sys, aif_insights.cli, aif_insights.collect, aif_insights.derive; print([m for m in sys.modules if m.startswith('software_factory')])"
     env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
     assert out.returncode == 0, out.stderr
