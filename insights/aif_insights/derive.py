@@ -216,6 +216,55 @@ def kpis(out: Path = DEFAULT_OUT, weeks: int = 4) -> tuple[list[str], list[tuple
     return columns, cur.fetchall()
 
 
+#: One row per linked PR: who worked on it, and its share of their cost and
+#: attention. Weeks are the week the PR opened, so a PR's cost counts even if
+#: it never merged ("cost per merged PR" includes the waste).
+PR_SQL = """
+WITH s AS (
+  SELECT agent, "user", session_id, mode, cost_usd, attention_min
+  FROM read_parquet('{path}/sessions/*/*.parquet', hive_partitioning = true)
+), per_pr AS (
+  SELECT p.repo, p.number, p.created_at, p.merged_at, p.docs_only, p.first_ci_green,
+         p.rework, p.lead_time_h,
+         string_agg(DISTINCT s.agent, '+' ORDER BY s.agent) AS agent,
+         string_agg(DISTINCT s.mode, '+' ORDER BY s.mode) AS mode,
+         sum(s.cost_usd * l.weight) AS cost_usd,
+         sum(s.attention_min * l.weight) AS attention_min,
+         bool_and(l.how = 'branch') AS branch_only
+  FROM read_parquet('{path}/prs.parquet') p
+  JOIN read_parquet('{path}/links.parquet') l USING (repo, number)
+  JOIN s ON s.agent = l.agent AND s."user" = l."user" AND s.session_id = l.session_id
+  GROUP BY ALL
+)
+"""
+
+PR_KPI_SQL = PR_SQL + """
+SELECT strftime(date_trunc('week', created_at::TIMESTAMPTZ), '%Y-%m-%d') AS week,
+       agent, mode,
+       count(*) AS prs,
+       count(merged_at) AS merged,
+       round(sum(cost_usd) / nullif(count(merged_at), 0), 2) AS cost_per_merged_pr,
+       round(avg(first_ci_green::INT) FILTER (WHERE NOT docs_only), 3) AS first_pass_ci,
+       round(avg(rework::INT), 3) AS rework_rate,
+       round(sum(attention_min) / nullif(count(merged_at), 0), 1) AS attention_min_per_merged_pr,
+       round(median(lead_time_h), 1) AS lead_time_h
+FROM per_pr
+WHERE created_at::TIMESTAMPTZ >= date_trunc('week', now()) - INTERVAL {weeks} WEEK
+GROUP BY ALL
+ORDER BY week, agent, mode
+"""
+
+
+def pr_kpis(out: Path = DEFAULT_OUT, weeks: int = 4) -> tuple[list[str], list[tuple]]:
+    import duckdb
+
+    path = out.expanduser()
+    if not (path / "links.parquet").is_file():
+        raise FileNotFoundError(f"no PR links under {path}: run `aif-insights github` first")
+    cur = duckdb.connect().execute(PR_KPI_SQL.format(path=path.as_posix(), weeks=int(weeks) - 1))
+    return [d[0] for d in cur.description], cur.fetchall()
+
+
 def format_table(columns: list[str], rows: list[tuple]) -> str:
     cells = [columns, *[["" if v is None else str(v) for v in row] for row in rows]]
     widths = [max(len(r[i]) for r in cells) for i in range(len(columns))]

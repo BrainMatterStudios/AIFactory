@@ -182,6 +182,8 @@ class Part:
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
     cost_usd: float | None = None
+    #: Claude Code `pr-link` records: (owner/repo, PR number, timestamp).
+    pr_links: list[tuple[str, int, str | None]] = field(default_factory=list)
 
 
 def _add(items: list[str], value) -> None:
@@ -237,6 +239,14 @@ def parse_part(agent: str, session_id: str, part: str, lines: Iterable[str]) -> 
 
 def _claude(p: Part, r: dict, ts: str | None, state: dict) -> None:
     kind = r.get("type")
+    if kind == "pr-link":
+        # Written by Claude Code when the session opens or works on a PR.
+        repo, number = r.get("prRepository"), r.get("prNumber")
+        if isinstance(repo, str) and "/" in repo and isinstance(number, int):
+            link = (repo, number, ts)
+            if all(link[:2] != seen[:2] for seen in p.pr_links):
+                p.pr_links.append(link)
+        return
     if not isinstance(kind, str) or kind not in _CLAUDE_KNOWN:
         p.unknown_types[str(kind)] += 1
     if p.cwd is None and isinstance(r.get("cwd"), str):

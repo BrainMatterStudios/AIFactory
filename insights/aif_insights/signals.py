@@ -20,6 +20,13 @@ and listed here so a spot check can test them against the transcript:
 - autonomy span: for each human intervention (prompt or interrupt), minutes
   until the agent's last activity before the next one. The session value is
   the median.
+- human attention (estimate): for each prompt or interrupt, the time since
+  the session's previous record (usually the agent's last message: the human
+  was reading, then typing), capped at 5 minutes; 1 minute for the opening
+  prompt. Headless sessions count zero: a program wrote their prompt.
+- PR links: the PRs Claude Code itself recorded for the session (`pr-link`
+  records), as `owner/repo#number` with the first time each was recorded.
+  Codex records none.
 - outcome: a commit, push or `gh pr create` that a command actually runs (not
   one it only mentions, as in `rg 'git commit'`) and that did not fail. A
   session with none is counted as abandoned.
@@ -159,6 +166,22 @@ def _autonomy_spans(main: Part) -> list[float]:
     return spans
 
 
+ATTENTION_CAP_S = 300
+OPENING_PROMPT_S = 60
+
+
+def _attention_seconds(main: Part) -> float:
+    records = sorted(t for ts in main.timestamps if (t := _t(ts)))
+    total = 0.0
+    for h in main.humans:
+        t = _t(h.ts)
+        if t is None:
+            continue
+        i = bisect.bisect_left(records, t)
+        total += min((t - records[i - 1]).total_seconds(), ATTENTION_CAP_S) if i else OPENING_PROMPT_S
+    return total
+
+
 def extract(session: Session) -> dict:
     parts = session.parts
     main = session.main or parts[0]
@@ -200,6 +223,15 @@ def extract(session: Session) -> dict:
     for p in parts:
         unknown.update(p.unknown_types)
     first = stamps[0] if stamps else None
+    mode = "headless" if _HEADLESS.search(main.entrypoint or "") else "interactive"
+    first_link: dict[str, str | None] = {}
+    for p in parts:
+        for repo, number, ts in p.pr_links:
+            ref = f"{repo}#{number}"
+            known = first_link.get(ref)
+            if ref not in first_link or (ts and (known is None or ts < known)):
+                first_link[ref] = ts
+    links = [{"pr": ref, "ts": first_link[ref]} for ref in sorted(first_link)]
 
     row = {
         "agent": session.agent,
@@ -214,7 +246,7 @@ def extract(session: Session) -> dict:
         "models": sorted({m for p in parts for m in p.models}),
         "agent_version": main.version,
         "entrypoint": main.entrypoint,
-        "mode": "headless" if _HEADLESS.search(main.entrypoint or "") else "interactive",
+        "mode": mode,
         "has_main": session.main is not None,
         "subagents": len(session.subagents),
         "records": sum(p.records for p in parts),
@@ -226,6 +258,7 @@ def extract(session: Session) -> dict:
         "interrupts": sum(1 for h in main.humans if h.kind == "interrupt"),
         "corrections": corrections,
         "autonomy_span_min": _minutes(statistics.median(spans)) if spans else None,
+        "attention_min": 0.0 if mode == "headless" else _minutes(_attention_seconds(main)),
         "agent_turns": sum(len(p.agent_turns) for p in parts),
         "tool_calls": len(calls),
         "tool_errors": sum(errors.values()),
@@ -246,6 +279,7 @@ def extract(session: Session) -> dict:
         "committed": any(runs(c, _COMMIT) for c in succeeded),
         "pushed": any(runs(c, _PUSH) for c in succeeded),
         "pr_opened": any(runs(c, _PR) for c in succeeded),
+        "pr_links": links,
     }
     row["abandoned"] = not (row["committed"] or row["pushed"] or row["pr_opened"])
     return row

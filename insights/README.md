@@ -116,7 +116,10 @@ of `aif_insights/signals.py`, so a spot check can test them. Known limits:
 - Codex cost is left empty: Codex records none, and OpenAI's prices for these
   models aren't verified here. Claude Code cost is the figure it writes itself;
 - projects are named after the working folder, with agent worktrees mapped back
-  to their repository.
+  to their repository;
+- human attention is an estimate: for each prompt, the time since the agent's
+  last record, capped at 5 minutes (1 minute for the opening prompt). Reading
+  a long answer or reviewing a PR on GitHub is not seen.
 
 ```sql
 -- example: sessions with a failing-test loop, last 14 days
@@ -125,6 +128,37 @@ FROM read_parquet('~/.local/share/aif-insights/derived/sessions/*/*.parquet',
                   hive_partitioning = true)
 WHERE test_loops > 0 AND dt >= current_date - 14;
 ```
+
+## Pull requests and the dashboard (phase A2b)
+
+`aif-insights github` fetches the PRs of every repository a session linked
+to, then writes `derived/prs.parquet` and `derived/links.parquet`. It reads
+with your `gh` login (or `GITHUB_TOKEN`) at run time and stores no token. It
+fetches only metadata: dates, branch names, changed file paths, review times
+and CI results. Answers are cached in `~/.cache/aif-insights/github`, so a
+rerun asks only for PRs updated since.
+
+```bash
+aif-insights extract     # first: the session table
+aif-insights github      # PRs and session <-> PR links
+aif-insights kpis        # session KPIs, then PR KPIs
+aif-insights dashboard   # ~/.local/share/aif-insights/derived/dashboard.html
+```
+
+The dashboard is one self-contained HTML file with weekly trends. It holds
+private data: keep it on your machine and never commit it.
+
+The rules (link, first-pass CI, docs-only, rework, lead time) are listed at the
+top of `aif_insights/github.py`. Known limits:
+
+- Claude Code sessions are linked by its own `pr-link` records, which are
+  certain. Codex records none, so Codex sessions are matched by repository
+  folder and branch name, a weaker link marked `branch`;
+- cost per merged PR counts Claude Code sessions only (Codex cost is empty);
+- a squashed or force-pushed PR has lost its first pushed commit, so its
+  first-pass CI reads the earliest commit that remains;
+- deploy metrics (deploy frequency, change-fail rate, time to recover) need
+  the Dokploy API and are not built yet.
 
 ## Development
 
