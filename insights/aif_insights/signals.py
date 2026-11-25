@@ -172,13 +172,16 @@ OPENING_PROMPT_S = 60
 
 def _attention_seconds(main: Part) -> float:
     records = sorted(t for ts in main.timestamps if (t := _t(ts)))
+    stamps = sorted(t for h in main.humans if (t := _t(h.ts)))
     total = 0.0
-    for h in main.humans:
-        t = _t(h.ts)
-        if t is None:
+    for n, t in enumerate(stamps):
+        if n == 0:
+            # The opening prompt: setup records written just before it are
+            # not the agent's reply, so it gets the fixed allowance.
+            total += OPENING_PROMPT_S
             continue
         i = bisect.bisect_left(records, t)
-        total += min((t - records[i - 1]).total_seconds(), ATTENTION_CAP_S) if i else OPENING_PROMPT_S
+        total += min((t - records[i - 1]).total_seconds(), ATTENTION_CAP_S)
     return total
 
 

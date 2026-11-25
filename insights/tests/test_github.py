@@ -192,6 +192,12 @@ def test_pr_link_records_and_attention_reach_the_session_row():
     assert row["attention_min"] == 4.0
 
 
+def test_the_opening_prompt_gets_its_allowance_after_setup_records():
+    setup = _j(type="permission-mode", timestamp="2026-11-23T09:59:59.900Z", mode="default")
+    [session] = fold([("u", parse_part(CLAUDE, "s-1", "session", [setup, *_claude_lines()]))])
+    assert extract(session)["attention_min"] == 4.0
+
+
 def test_headless_sessions_have_no_human_attention():
     lines = [line.replace('"entrypoint": "cli"', '"entrypoint": "sdk-cli"') for line in _claude_lines()]
     [session] = fold([("u", parse_part(CLAUDE, "s-1", "session", lines))])
