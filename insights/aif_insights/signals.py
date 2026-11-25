@@ -27,6 +27,10 @@ and listed here so a spot check can test them against the transcript:
 - PR links: the PRs Claude Code itself recorded for the session (`pr-link`
   records), as `owner/repo#number` with the first time each was recorded.
   Codex records none.
+- kind: "batch" for a headless session that made no tool call: a program
+  using the agent as a model API (on 2026-11-25, 15,322 such calls were
+  product-matching jobs), plus the odd headless run that died before acting.
+  Everything else is "agent". Session KPIs count agent sessions only.
 - outcome: a commit, push or `gh pr create` that a command actually runs (not
   one it only mentions, as in `rg 'git commit'`) and that did not fail. A
   session with none is counted as abandoned.
@@ -250,6 +254,7 @@ def extract(session: Session) -> dict:
         "agent_version": main.version,
         "entrypoint": main.entrypoint,
         "mode": mode,
+        "kind": "batch" if mode == "headless" and not calls else "agent",
         "has_main": session.main is not None,
         "subagents": len(session.subagents),
         "records": sum(p.records for p in parts),

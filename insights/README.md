@@ -117,6 +117,10 @@ of `aif_insights/signals.py`, so a spot check can test them. Known limits:
   models aren't verified here. Claude Code cost is the figure it writes itself;
 - projects are named after the working folder, with agent worktrees mapped back
   to their repository;
+- a headless session that made no tool call is a **batch call**: a program
+  using the agent as a model API (for example a product-matching job). Batch
+  calls are reported apart, as calls and cost per week, and left out of the
+  session KPIs, which they would otherwise swamp;
 - human attention is an estimate: for each prompt, the time since the agent's
   last record, capped at 5 minutes (1 minute for the opening prompt). Reading
   a long answer or reviewing a PR on GitHub is not seen.

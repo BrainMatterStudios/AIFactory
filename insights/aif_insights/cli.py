@@ -86,11 +86,15 @@ def cmd_github(args) -> int:
 
 
 def cmd_kpis(args) -> int:
-    from aif_insights.derive import format_table, kpis, pr_kpis
+    from aif_insights.derive import batch_calls, format_table, kpis, pr_kpis
 
     columns, rows = kpis(Path(args.out), args.weeks)
-    print("Sessions")
+    print("Agent sessions")
     print(format_table(columns, rows) if rows else "no sessions in that period")
+    columns, rows = batch_calls(Path(args.out), args.weeks)
+    if rows:
+        print("\nBatch calls (headless, no tool use: a program using the agent as a model API)")
+        print(format_table(columns, rows))
     try:
         columns, rows = pr_kpis(Path(args.out), args.weeks)
     except FileNotFoundError as exc:
