@@ -197,10 +197,17 @@ signals, no joins) is built: `aif-insights extract` turns the whole archive
 (18,146 parts, both laptops) into 15,662 session rows in about 45 seconds, and
 `aif-insights kpis` prints the session-only KPIs. It was spot-checked by hand
 on 10 random sessions, on every flagged correction (21 of 30 real), and on
-samples of detected test runs. **A2b** (joins to PRs, CI and deploys, the
-PR-based KPIs, Grafana and the dashboard) is next. Claude Code's own `pr-link`
-records (about 19,500 in the archive) are a ready source for the session↔PR
-join.
+samples of detected test runs. **A2b** (session↔PR links, the PR-based KPIs
+and a local dashboard) is built: `aif-insights github` reads 1,765 PRs from the
+12 repositories sessions linked to and links 644 of them to 78 sessions, from
+Claude Code's own `pr-link` records. 10 random links were checked against
+GitHub's REST API (head branch, merge time, first CI result, link inside the
+session): 10 of 10 correct. `aif-insights dashboard` writes the weekly trends
+to one local HTML page. Still open: deploy metrics (need the Dokploy API),
+Grafana and Loki (need Phase 0's OTel), the VPS job, and Codex PR links
+(Codex records none; branch matching found no real ones yet). Most headless
+Claude Code sessions are one-shot programmatic calls with no tool use, which
+swamp the session KPIs; they need their own category.
 
 - `normalize()` turns each agent's format into one `Session` schema. Parsers
   are version-tolerant: unknown record types are counted and reported.

@@ -5,7 +5,9 @@
     aif-insights status  [--config PATH]
     aif-insights schedule launchd|cron [--config PATH]
     aif-insights extract [--config PATH] [--local DIR] [--out DIR] [--cache DIR]
+    aif-insights github  [--out DIR] [--cache DIR] [--repo OWNER/NAME ...]
     aif-insights kpis    [--out DIR] [--weeks N]
+    aif-insights dashboard [--out DIR] [--weeks N] [--html PATH]
 """
 from __future__ import annotations
 
@@ -69,11 +71,41 @@ def cmd_extract(args) -> int:
     return 1 if report.failed else 0
 
 
+def cmd_github(args) -> int:
+    from aif_insights.github import build
+
+    report = build(Path(args.out), Path(args.cache), extra_repos=args.repo or (),
+                   progress=lambda m: print(m, flush=True))
+    print(f"repositories {report['repositories']}: {report['prs']} PRs, "
+          f"{report['linked_prs']} linked to sessions")
+    print(f"links {report['links']} ({report['linked_by']['pr-link']} from pr-link records, "
+          f"{report['linked_by']['branch']} by branch) covering {report['linked_sessions']} sessions")
+    for line in report["failed"]:
+        print(f"failed: {line}")
+    return 1 if report["failed"] else 0
+
+
 def cmd_kpis(args) -> int:
-    from aif_insights.derive import format_table, kpis
+    from aif_insights.derive import format_table, kpis, pr_kpis
 
     columns, rows = kpis(Path(args.out), args.weeks)
+    print("Sessions")
     print(format_table(columns, rows) if rows else "no sessions in that period")
+    try:
+        columns, rows = pr_kpis(Path(args.out), args.weeks)
+    except FileNotFoundError as exc:
+        print(f"\nPRs: {exc}")
+        return 0
+    print("\nPull requests (by week opened; cost is Claude only, token-equivalent)")
+    print(format_table(columns, rows) if rows else "no linked PRs in that period")
+    return 0
+
+
+def cmd_dashboard(args) -> int:
+    from aif_insights.dashboard import write
+
+    path = write(Path(args.out), args.weeks, Path(args.html) if args.html else None)
+    print(f"dashboard written to {path} (private data: keep it on this machine)")
     return 0
 
 
@@ -111,10 +143,20 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument("--cache", default=str(DEFAULT_CACHE), help="download cache")
     ex.add_argument("--workers", type=int, default=16)
     ex.set_defaults(func=cmd_extract)
+    gh = sub.add_parser("github", help="fetch PRs and link them to sessions")
+    gh.add_argument("--out", default=str(DEFAULT_OUT))
+    gh.add_argument("--cache", default=str(DEFAULT_CACHE))
+    gh.add_argument("--repo", action="append", help="also fetch this repository (repeatable)")
+    gh.set_defaults(func=cmd_github)
     kp = sub.add_parser("kpis", help="weekly KPIs per agent from the session table")
     kp.add_argument("--out", default=str(DEFAULT_OUT))
     kp.add_argument("--weeks", type=int, default=4)
     kp.set_defaults(func=cmd_kpis)
+    db = sub.add_parser("dashboard", help="write a local HTML page of the weekly KPIs")
+    db.add_argument("--out", default=str(DEFAULT_OUT))
+    db.add_argument("--weeks", type=int, default=12)
+    db.add_argument("--html", help="where to write the page (default: <out>/dashboard.html)")
+    db.set_defaults(func=cmd_dashboard)
     return p
 
 
