@@ -16,7 +16,8 @@ dependencies = ["zstandard>=0.22; python_version < '3.14'"]
 
 [project.optional-dependencies]
 r2 = ["boto3>=1.34"]          # Cloudflare R2 (S3-compatible) store
-dev = ["pytest>=7", "ruff==0.16.0"]
+analytics = ["duckdb>=1.1"]   # `extract` and `kpis`: Parquet tables and SQL
+dev = ["pytest>=7", "ruff==0.16.0", "duckdb>=1.1"]
 
 [project.scripts]
 aif-insights = "aif_insights.cli:main"

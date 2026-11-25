@@ -122,8 +122,8 @@ baseline. No separate comparison against the old factory is planned.
 real git. `develop` is protected. The cross-vendor review is the ChatGPT Codex
 GitHub app, already installed on the organization: it reviews PRs on the
 ChatGPT plan, so no OpenAI API key or workflow is needed (decided 2026-11-24;
-the API-key workflow from #24 was removed). Automatic reviews still need
-turning on in Codex's settings for this repository. Remaining: deploy
+the API-key workflow from #24 was removed). Automatic reviews are already on
+for this repository, and a test review on #25 completed. Remaining: deploy
 the dispatcher on the VPS, the bot identity (phase 0), and the first 5 real
 issues.
 
@@ -191,6 +191,16 @@ OTel first.
   per user per day and alert on gaps.
 
 ## A2: Extract and join
+
+**Status (2026-11-24):** split in two. **A2a** (sessions and deterministic
+signals, no joins) is built: `aif-insights extract` turns the whole archive
+(18,146 parts, both laptops) into 15,662 session rows in about 45 seconds, and
+`aif-insights kpis` prints the session-only KPIs. It was spot-checked by hand
+on 10 random sessions, on every flagged correction (21 of 30 real), and on
+samples of detected test runs. **A2b** (joins to PRs, CI and deploys, the
+PR-based KPIs, Grafana and the dashboard) is next. Claude Code's own `pr-link`
+records (about 19,500 in the archive) are a ready source for the session↔PR
+join.
 
 - `normalize()` turns each agent's format into one `Session` schema. Parsers
   are version-tolerant: unknown record types are counted and reported.
