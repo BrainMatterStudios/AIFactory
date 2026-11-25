@@ -205,9 +205,10 @@ GitHub's REST API (head branch, merge time, first CI result, link inside the
 session): 10 of 10 correct. `aif-insights dashboard` writes the weekly trends
 to one local HTML page. Still open: deploy metrics (need the Dokploy API),
 Grafana and Loki (need Phase 0's OTel), the VPS job, and Codex PR links
-(Codex records none; branch matching found no real ones yet). Most headless
-Claude Code sessions are one-shot programmatic calls with no tool use, which
-swamp the session KPIs; they need their own category.
+(Codex records none; branch matching found no real ones yet). Headless sessions
+with no tool use (15,339 on 2026-11-25, mostly product-matching jobs that use
+Claude Code as a model API) are now a separate "batch call" kind, reported as
+calls and cost and left out of the session KPIs.
 
 - `normalize()` turns each agent's format into one `Session` schema. Parsers
   are version-tolerant: unknown record types are counted and reported.

@@ -259,3 +259,29 @@ def test_a_rebuild_with_no_links_replaces_the_old_table(tmp_path):
     assert duckdb.sql(f"SELECT count(*) FROM '{out}/links.parquet'").fetchall() == [(0,)]
     _, rows = pr_kpis(out, weeks=520)
     assert rows == []
+
+
+def test_headless_sessions_without_tool_use_are_batch_calls(tmp_path, capsys):
+    pytest.importorskip("duckdb")
+    from aif_insights.derive import batch_calls, kpis
+
+    headless = [line.replace('"entrypoint": "cli"', '"entrypoint": "sdk-cli"') for line in _claude_lines()]
+    tool = _j(type="assistant", timestamp="2026-11-23T10:02:00.000Z", message={
+        "id": "m9", "model": "claude-opus-5-5", "usage": {"input_tokens": 1},
+        "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]})
+    store = LocalStore(tmp_path / "bucket")
+    for sid, source in {"s-1": headless, "s-2": [*headless, tool], "s-3": _claude_lines()}.items():
+        lines = [line.replace('"s-1"', f'"{sid}"') for line in source]
+        store.put(f"raw/claude-code/u/2026/11/23/{sid}/session.1111111111111111.jsonl.gz",
+                  gzip.compress("\n".join(lines).encode()), content_type="application/gzip")
+    out = tmp_path / "derived"
+    extract_build(store, out=out, cache=tmp_path / "cache", workers=1)
+    columns, rows = kpis(out, weeks=520)
+    assert sorted((r[2], r[3]) for r in rows) == [("headless", 1), ("interactive", 1)]
+    columns, rows = batch_calls(out, weeks=520)
+    assert [dict(zip(columns, r, strict=True))["calls"] for r in rows] == [1]
+    assert main(["kpis", "--out", str(out), "--weeks", "520"]) == 0
+    assert "Batch calls" in capsys.readouterr().out
+    page = tmp_path / "page.html"
+    assert main(["dashboard", "--out", str(out), "--weeks", "520", "--html", str(page)]) == 0
+    assert "Batch cost" in page.read_text()

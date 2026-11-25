@@ -12,7 +12,7 @@ import html
 from datetime import UTC, datetime
 from pathlib import Path
 
-from aif_insights.derive import DEFAULT_OUT, kpis, pr_kpis
+from aif_insights.derive import DEFAULT_OUT, batch_calls, kpis, pr_kpis
 
 #: (column, title, unit note). Order is the page order.
 SESSION_KPIS = [
@@ -23,6 +23,10 @@ SESSION_KPIS = [
     ("tool_error_rate", "Tool error rate", "failed tool calls / tool calls"),
     ("test_loop_rate", "Test-loop rate", "share of sessions failing one test 3+ times"),
     ("cost_usd", "Cost", "USD, Claude only, token-equivalent"),
+]
+BATCH_KPIS = [
+    ("calls", "Batch calls", "count"),
+    ("cost_usd", "Batch cost", "USD, Claude only, token-equivalent"),
 ]
 PR_KPIS = [
     ("merged", "Merged PRs", "count, by week opened"),
@@ -136,7 +140,9 @@ def render(out: Path = DEFAULT_OUT, weeks: int = 12) -> str:
     except FileNotFoundError:
         pcolumns, prows = [], []
     p_weeks, p_series = _series(pcolumns, prows) if prows else ([], {})
-    names = sorted(set(s_series) | set(p_series))
+    bcolumns, brows = batch_calls(out, weeks)
+    b_weeks, b_series = _series(bcolumns, brows) if brows else ([], {})
+    names = sorted(set(s_series) | set(p_series) | set(b_series))
     colors = {n: i % len(SERIES) + 1 for i, n in enumerate(names)}  # entity -> fixed slot
     slots = "\n".join(f"  --s{i}: {light};" for i, (light, _) in enumerate(SERIES, 1))
     dark = "\n".join(f"  --s{i}: {d};" for i, (_, d) in enumerate(SERIES, 1))
@@ -146,6 +152,8 @@ def render(out: Path = DEFAULT_OUT, weeks: int = 12) -> str:
         if s_weeks else '<p class="empty">No sessions in this period.</p>'
     p_cards = "".join(_chart(k, t, n, p_weeks, p_series, colors) for k, t, n in PR_KPIS) \
         if p_weeks else '<p class="empty">No linked PRs yet: run <code>aif-insights github</code>.</p>'
+    b_cards = "".join(_chart(k, t, n, b_weeks, b_series, colors) for k, t, n in BATCH_KPIS) \
+        if b_weeks else '<p class="empty">No batch calls in this period.</p>'
     built = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -202,12 +210,15 @@ code {{ font-size: 12.5px; }}
 <p class="sub">Weekly, last {int(weeks)} weeks, built {built}. Trends, not targets: two developers make small samples.
 Hover a point for its value; each chart has a table.</p>
 {_legend(colors)}
-<h2>Sessions</h2>
-<p class="sub">By week the session started. Headless sessions are runs started by a program.</p>
+<h2>Agent sessions</h2>
+<p class="sub">By week the session started. Headless sessions are runs started by a program. Batch calls are left out (below).</p>
 <div class="grid-cards">{s_cards}</div>
 <h2>Pull requests</h2>
 <p class="sub">PRs linked to at least one session, by week opened. A session linked to several PRs splits its cost and attention evenly.</p>
 <div class="grid-cards">{p_cards}</div>
+<h2>Batch calls</h2>
+<p class="sub">Headless sessions with no tool use: a program using the agent as a model API, such as a product-matching job. Counted apart so they do not swamp the session KPIs.</p>
+<div class="grid-cards">{b_cards}</div>
 </main></body></html>
 """
 

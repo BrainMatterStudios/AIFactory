@@ -197,23 +197,47 @@ SELECT strftime(date_trunc('week', first_ts::TIMESTAMPTZ), '%Y-%m-%d') AS week,
        round(avg((test_loops > 0)::INT), 3) AS test_loop_rate,
        round(sum(cost_usd), 2) AS cost_usd
 FROM read_parquet('{path}/*/*.parquet', hive_partitioning = true)
-WHERE first_ts IS NOT NULL
+WHERE first_ts IS NOT NULL AND kind = 'agent'
+  AND first_ts::TIMESTAMPTZ >= date_trunc('week', now()) - INTERVAL {weeks} WEEK
+GROUP BY ALL
+ORDER BY week, agent, mode
+"""
+
+#: Programs using an agent as a model API: counted apart, so they neither
+#: swamp the session KPIs nor hide their spend.
+BATCH_SQL = """
+SELECT strftime(date_trunc('week', first_ts::TIMESTAMPTZ), '%Y-%m-%d') AS week,
+       agent, mode,
+       count(*) AS calls,
+       round(sum(cost_usd), 2) AS cost_usd
+FROM read_parquet('{path}/*/*.parquet', hive_partitioning = true)
+WHERE first_ts IS NOT NULL AND kind = 'batch'
   AND first_ts::TIMESTAMPTZ >= date_trunc('week', now()) - INTERVAL {weeks} WEEK
 GROUP BY ALL
 ORDER BY week, agent, mode
 """
 
 
-def kpis(out: Path = DEFAULT_OUT, weeks: int = 4) -> tuple[list[str], list[tuple]]:
+def kpis(out: Path = DEFAULT_OUT, weeks: int = 4, sql: str = KPI_SQL) -> tuple[list[str], list[tuple]]:
     import duckdb
 
     path = (out.expanduser() / "sessions").as_posix()
     if not Path(path).is_dir():
         raise FileNotFoundError(f"no session table at {path}: run `aif-insights extract` first")
     con = duckdb.connect()
-    cur = con.execute(KPI_SQL.format(path=path, weeks=int(weeks) - 1))
+    try:
+        cur = con.execute(sql.format(path=path, weeks=int(weeks) - 1))
+    except duckdb.BinderException as exc:
+        if "kind" in str(exc):
+            raise FileNotFoundError(f"the session table at {path} predates session kinds: "
+                                    "rerun `aif-insights extract`") from exc
+        raise
     columns = [d[0] for d in cur.description]
     return columns, cur.fetchall()
+
+
+def batch_calls(out: Path = DEFAULT_OUT, weeks: int = 4) -> tuple[list[str], list[tuple]]:
+    return kpis(out, weeks, BATCH_SQL)
 
 
 #: One row per linked PR: who worked on it, and its share of their cost and
