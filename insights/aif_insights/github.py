@@ -136,12 +136,17 @@ def _cache_file(cache: Path, repo: str) -> Path:
 def fetch_repo(repo: str, post: Post, cache: Path, since: str | None = None) -> dict:
     """Bring one repository's cached PRs up to date. Pages run newest update
     first and stop at the first PR already cached unchanged, or older than
-    `since` (no session can belong to it)."""
+    `since` (no session can belong to it). The cache remembers how far back
+    it reaches (`covered_since`; None is all history): when `since` moves
+    earlier, because older sessions were added, it reads back to the new
+    `since` instead of stopping at what is cached."""
     path = _cache_file(cache, repo)
     stored = json.loads(path.read_text()) if path.is_file() else {"prs": {}}
-    known = stored.get("fetched_through")
+    covered = stored.get("covered_since", "unknown")
+    backfill = covered == "unknown" or (covered is not None and (since is None or since < covered))
+    known = None if backfill else stored.get("fetched_through")
     owner, name = repo.split("/", 1)
-    after, newest, fetched = None, known, 0
+    after, newest, fetched = None, stored.get("fetched_through"), 0
     while True:
         data = post(QUERY, {"owner": owner, "name": name, "after": after})["data"]
         repository = data["repository"]
@@ -162,6 +167,8 @@ def fetch_repo(repo: str, post: Post, cache: Path, since: str | None = None) -> 
             break
         after = page["pageInfo"]["endCursor"]
     stored["fetched_through"] = newest
+    if backfill:
+        stored["covered_since"] = since
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(stored))
@@ -209,7 +216,11 @@ def rework(node: dict) -> bool | None:
     reviewed = first_review_at(node)
     if reviewed is None:
         return None
-    return any(c["commit"]["committedDate"] > reviewed for c in _nodes(node.get("commits")))
+    commits = _nodes(node.get("commits"))
+    if any(c["commit"]["committedDate"] > reviewed for c in commits):
+        return True
+    # Only the first 100 commits are fetched: past that, "no rework" is unproven.
+    return None if (node.get("commits") or {}).get("totalCount", 0) > len(commits) else False
 
 
 def pr_row(repo: str, node: dict) -> dict:
@@ -319,10 +330,10 @@ def build(out: Path, cache: Path, post: Post | None = None, extra_repos: Iterabl
             continue
         prs.extend(pr_row(stored["repo"], n) for n in stored["prs"].values())
     edges = link(sessions, prs, aliases)
-    if prs:
-        _write(con, prs, out / "prs.parquet")
-    if edges:
-        _write(con, edges, out / "links.parquet")
+    # Always replace both tables, even with no rows: a stale table left
+    # behind would keep joining against the new one.
+    _write(con, prs, out / "prs.parquet", _PR_SCHEMA)
+    _write(con, edges, out / "links.parquet", _LINK_SCHEMA)
     con.close()
     linked = {(e["repo"], e["number"]) for e in edges}
     return {"repositories": len(seen), "prs": len(prs), "linked_prs": len(linked),
@@ -332,12 +343,28 @@ def build(out: Path, cache: Path, post: Post | None = None, extra_repos: Iterabl
             "failed": failed}
 
 
-def _write(con, rows: list[dict], target: Path) -> None:
+#: Column types, so a table with no rows still has its schema.
+_PR_SCHEMA = {
+    "repo": "VARCHAR", "number": "BIGINT", "url": "VARCHAR", "title": "VARCHAR",
+    "author": "VARCHAR", "state": "VARCHAR", "draft": "BOOLEAN", "created_at": "VARCHAR",
+    "merged_at": "VARCHAR", "closed_at": "VARCHAR", "head_ref": "VARCHAR", "base_ref": "VARCHAR",
+    "additions": "BIGINT", "deletions": "BIGINT", "changed_files": "BIGINT", "commits": "BIGINT",
+    "docs_only": "BOOLEAN", "first_ci_green": "BOOLEAN", "first_review_at": "VARCHAR",
+    "rework": "BOOLEAN", "lead_time_h": "DOUBLE",
+}
+_LINK_SCHEMA = {
+    "agent": "VARCHAR", "user": "VARCHAR", "session_id": "VARCHAR", "repo": "VARCHAR",
+    "number": "BIGINT", "how": "VARCHAR", "weight": "DOUBLE",
+}
+
+
+def _write(con, rows: list[dict], target: Path, schema: dict[str, str]) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=target.parent) as tmp:
         ndjson = Path(tmp) / "rows.jsonl"
-        ndjson.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+        ndjson.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
         staged = Path(tmp) / target.name
-        con.execute(f"COPY (SELECT * FROM read_json_auto('{ndjson}', sample_size=-1)) "
-                    f"TO '{staged}' (FORMAT parquet)")
+        columns = ", ".join(f"'{k}': '{v}'" for k, v in schema.items())
+        con.execute(f"COPY (SELECT * FROM read_json('{ndjson}', format = 'newline_delimited', "
+                    f"columns = {{{columns}}})) TO '{staged}' (FORMAT parquet)")
         shutil.move(staged, target)

@@ -80,6 +80,14 @@ def test_rework_is_a_commit_after_the_first_review_by_someone_else():
     assert rework(_pr(commits=commits, reviews=[("dev", "2026-11-23T10:00:00Z")])) is None
 
 
+def test_rework_is_unknown_when_later_commits_were_not_fetched():
+    commits = [_commit("c1", "2026-11-23T09:00:00Z")]
+    pr = _pr(commits=commits, reviews=[("bot", "2026-11-23T10:00:00Z")])
+    assert rework(pr) is False
+    pr["commits"]["totalCount"] = 150
+    assert rework(pr) is None
+
+
 def test_pr_row_lead_time():
     row = pr_row("acme/widgets", _pr())
     assert row["lead_time_h"] == 6.0 and row["first_ci_green"] is False and not row["docs_only"]
@@ -146,9 +154,17 @@ def test_a_refetch_stops_at_prs_already_cached(tmp_path):
     fake.calls = 0
     stored = fetch_repo("acme/widgets", fake, tmp_path)
     assert fake.calls == 1 and stored["fetched"] == 1  # only the newest, unchanged, is re-read
-    # Nothing older than `since` is fetched.
-    assert fetch_repo("acme/widgets", _FakeGitHub(nodes), tmp_path / "fresh",
+    # Nothing older than `since` is fetched...
+    fresh = tmp_path / "fresh"
+    assert fetch_repo("acme/widgets", _FakeGitHub(nodes), fresh,
                       since="2026-11-24T00:00:00Z")["fetched"] == 2
+    # ...until older sessions move `since` back: then the gap is read too.
+    stored = fetch_repo("acme/widgets", _FakeGitHub(nodes), fresh, since="2026-11-22T00:00:00Z")
+    assert sorted(stored["prs"]) == ["2", "3", "4", "5"]
+    # A later ordinary run is incremental again.
+    again = _FakeGitHub(nodes)
+    fetch_repo("acme/widgets", again, fresh, since="2026-11-22T00:00:00Z")
+    assert again.calls == 1
 
 
 def _claude_lines() -> list[str]:
@@ -219,3 +235,21 @@ def test_dashboard_renders_both_sections(tmp_path):
     text = page.read_text()
     assert "Cost per merged PR" in text and "claude-code · interactive" in text
     assert "<script" not in text  # self-contained, nothing loaded from the network
+
+
+def test_a_rebuild_with_no_links_replaces_the_old_table(tmp_path):
+    duckdb = pytest.importorskip("duckdb")
+    store = LocalStore(tmp_path / "bucket")
+    store.put("raw/claude-code/u/2026/11/23/s-1/session.1111111111111111.jsonl.gz",
+              gzip.compress("\n".join(_claude_lines()).encode()), content_type="application/gzip")
+    out, cache = tmp_path / "derived", tmp_path / "cache"
+    extract_build(store, out=out, cache=cache, workers=1)
+    build(out, cache / "a", post=_FakeGitHub([_pr(7)]))
+    assert duckdb.sql(f"SELECT count(*) FROM '{out}/links.parquet'").fetchall() == [(1,)]
+    # The PR now closed before the session recorded it: the link is rejected.
+    closed_early = _pr(7, created="2026-11-20T09:00:00Z", merged="2026-11-20T15:00:00Z")
+    report = build(out, cache / "b", post=_FakeGitHub([closed_early]))
+    assert report["links"] == 0
+    assert duckdb.sql(f"SELECT count(*) FROM '{out}/links.parquet'").fetchall() == [(0,)]
+    _, rows = pr_kpis(out, weeks=520)
+    assert rows == []
