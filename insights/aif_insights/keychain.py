@@ -20,12 +20,13 @@ ITEM_PRIVATE = "secret-access-key"
 Runner = Callable[..., subprocess.CompletedProcess]
 
 
-def read(account: str, *, run: Runner = subprocess.run, platform: str = sys.platform) -> str | None:
+def read(account: str, *, service: str = SERVICE, run: Runner = subprocess.run,
+         platform: str = sys.platform) -> str | None:
     if platform != "darwin":
         return None
     try:
         proc = run(
-            ["security", "find-generic-password", "-s", SERVICE, "-a", account, "-w"],
+            ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
             capture_output=True, text=True, timeout=30,
         )
     except (OSError, subprocess.SubprocessError):
@@ -34,7 +35,7 @@ def read(account: str, *, run: Runner = subprocess.run, platform: str = sys.plat
     return value if proc.returncode == 0 and value else None
 
 
-def write(account: str, value: str, *, run: Runner = subprocess.run) -> None:
+def write(account: str, value: str, *, service: str = SERVICE, run: Runner = subprocess.run) -> None:
     """Create or update one Keychain item.
 
     `security` takes the password as an argument, so it is briefly visible in
@@ -42,8 +43,8 @@ def write(account: str, value: str, *, run: Runner = subprocess.run) -> None:
     script it; on a single-user Mac the exposure is to your own processes only.
     """
     proc = run(
-        ["security", "add-generic-password", "-U", "-s", SERVICE, "-a", account,
-         "-l", f"aif-insights R2 {account}", "-w", value],
+        ["security", "add-generic-password", "-U", "-s", service, "-a", account,
+         "-l", f"{service} {account}", "-w", value],
         capture_output=True, text=True, timeout=30,
     )
     if proc.returncode != 0:
