@@ -203,6 +203,10 @@ def test_watch_paths_keep_other_apps_prs_out_of_a_monorepo_service():
     assert deploys.touches({"files": None}, ["api/**"])                           # unknown
     assert deploys.touches({"files": ["web/x.ts"], "changed_files": 150}, ["api/**"])  # cut off
     assert deploys.touches({"files": ["web/x.ts"]}, [])                           # no filter
+    assert deploys.touches({"files": ["api/app.py"]}, ["api/**/*.py"])            # ** = no folder
+    assert deploys.touches({"files": ["api/v1/deep/app.py"]}, ["api/**/*.py"])
+    assert deploys.touches({"files": ["setup.py"]}, ["**/*.py"])
+    assert not deploys.touches({"files": ["api/app.ts"], "changed_files": 1}, ["api/**/*.py"])
     h = _history({"s1": _svc(watch=["api/**"])}, {
         "d1": _rec(start="2026-11-20T10:00:00Z", end="2026-11-20T10:05:00Z"),
         "d2": _rec(start="2026-11-21T10:00:00Z", end="2026-11-21T10:05:00Z")})

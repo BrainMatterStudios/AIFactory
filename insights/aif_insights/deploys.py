@@ -295,11 +295,15 @@ def env_of(branch: str | None, name: str | None = None) -> str:
 
 
 def _glob(pattern: str) -> re.Pattern:
-    """Dokploy watch path (a glob) as a regex: `**` crosses folders, `*` does not."""
+    """Dokploy watch path (a glob) as a regex: `**` crosses folders, `*` does
+    not, and `**/` also matches no folder at all (`api/**/*.py` matches
+    `api/app.py`)."""
     out, i = "", 0
     pattern = pattern.lstrip("/")
     while i < len(pattern):
-        if pattern.startswith("**", i):
+        if pattern.startswith("**/", i):
+            out, i = out + "(?:.*/)?", i + 3
+        elif pattern.startswith("**", i):
             out, i = out + ".*", i + 2
         elif pattern[i] == "*":
             out, i = out + "[^/]*", i + 1
