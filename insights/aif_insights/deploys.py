@@ -50,6 +50,8 @@ Rules (all in `build`):
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -200,28 +202,45 @@ def _service_meta(panel: str, kind: str, one: dict) -> dict:
 def snapshot(panel: Panel, get: Get, history: Path) -> dict:
     """Add every deployment the panel still has to the history file. Returns
     counts. Existing entries are updated (a running deployment finishes)."""
-    stored = load_history(history)
     services = _services(get("project.all", {}))  # type: ignore[arg-type]
-    new = 0
+    metas, seen = {}, {}
     for kind, sid in services:
         id_key = "applicationId" if kind == "application" else "composeId"
         one = get(f"{kind}.one", {id_key: sid})
-        stored["services"][sid] = _service_meta(panel.name, kind, one)  # type: ignore[arg-type]
+        metas[sid] = _service_meta(panel.name, kind, one)  # type: ignore[arg-type]
         listing = "deployment.all" if kind == "application" else "deployment.allByCompose"
         for d in get(listing, {id_key: sid}) or []:  # type: ignore[union-attr]
             if d.get("isPreviewDeployment") or any(d.get(k) for k in _SKIP_KINDS):
                 continue
-            new += d["deploymentId"] not in stored["deployments"]
-            stored["deployments"][d["deploymentId"]] = {
+            seen[d["deploymentId"]] = {
                 "service_id": sid, "panel": panel.name, "status": d.get("status"),
                 "title": d.get("title"), "description": d.get("description"),
                 "created_at": d.get("createdAt"), "started_at": d.get("startedAt"),
                 "finished_at": d.get("finishedAt"), "rollback": bool(d.get("rollbackId")),
             }
-    stored["snapshots"][panel.name] = datetime.now(UTC).isoformat()
-    save_history(history, stored)
-    return {"panel": panel.name, "services": len(services), "new": new,
-            "total": len(stored["deployments"])}
+    # Fetch first, then merge under the lock into whatever is on disk now, so
+    # an overlapping run (the hourly job and a manual one) never loses records.
+    with locked(history):
+        stored = load_history(history)
+        new = sum(did not in stored["deployments"] for did in seen)
+        stored["services"].update(metas)
+        stored["deployments"].update(seen)
+        stored["snapshots"][panel.name] = datetime.now(UTC).isoformat()
+        save_history(history, stored)
+        total = len(stored["deployments"])
+    return {"panel": panel.name, "services": len(services), "new": new, "total": total}
+
+
+@contextlib.contextmanager
+def locked(history: Path):
+    """Hold an exclusive lock on the history while reading and rewriting it."""
+    history.parent.mkdir(parents=True, exist_ok=True)
+    with open(history.with_name(history.name + ".lock"), "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 def load_history(path: Path) -> dict:
@@ -327,8 +346,14 @@ def derive(history: dict, prs: Iterable[dict], aliases: dict[str, str] | None = 
         group.sort(key=lambda p: p["merged_at"])
 
     by_service: dict[str, list[dict]] = {}
+    started: dict[str, datetime] = {}  # first recorded deployment, finished or not
     for did, d in history["deployments"].items():
-        if d["service_id"] in services and d.get("status") in ("done", "error"):
+        if d["service_id"] not in services:
+            continue
+        at = _t(d.get("started_at") or d.get("created_at"))
+        if at and (d["service_id"] not in started or at < started[d["service_id"]]):
+            started[d["service_id"]] = at
+        if d.get("status") in ("done", "error"):
             by_service.setdefault(d["service_id"], []).append({**d, "deployment_id": did})
 
     deploys, shipped = [], []
@@ -355,7 +380,9 @@ def derive(history: dict, prs: Iterable[dict], aliases: dict[str, str] | None = 
                             "source": "dokploy", "status": d["status"], "at": _iso(end),
                             "failed_change": failed or reverted, "reverted": reverted,
                             "recovery_h": recovery})
-        first = _t(recorded[0]["started_at"] or recorded[0]["created_at"]) if recorded else None
+        # Estimates stop where recording starts, counting a deployment still
+        # running: it is recorded, only its outcome is not known yet.
+        first = started.get(sid)
         created = _t(svc.get("created_at"))
         if svc["auto_deploy"]:
             for p in branch_prs:
@@ -437,7 +464,10 @@ def build(out: Path, history_path: Path, resolve: Callable[[str], str] | None = 
     before = dict(history.get("repo_names") or {})
     aliases = resolve_names(history, {p["repo"].lower() for p in prs}, resolve)
     if aliases != before:
-        save_history(history_path, history)
+        with locked(history_path):  # merge into the file as it is now
+            current = load_history(history_path)
+            current.setdefault("repo_names", {}).update(aliases)
+            save_history(history_path, current)
     deploys, shipped = derive(history, prs, aliases)
     _write(con, deploys, out / "deploys.parquet", DEPLOY_SCHEMA)
     _write(con, shipped, out / "deploy_prs.parquet", SHIPPED_SCHEMA)

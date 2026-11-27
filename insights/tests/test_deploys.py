@@ -333,3 +333,46 @@ def test_keychain_reads_and_writes_under_the_given_service():
     assert keychain.read("prod", service="aif-insights-dokploy", run=run, platform="darwin") == "v"
     keychain.write("prod", "secret", service="aif-insights-dokploy", run=run)
     assert all(a[a.index("-s") + 1] == "aif-insights-dokploy" for a in seen)
+
+
+def test_an_overlapping_snapshot_loses_nothing(tmp_path):
+    """The hourly job and a manual run overlap: the second finishes while the
+    first is still fetching. Both runs' deployments must survive."""
+    history = tmp_path / "deploys.json"
+    other = FakePanel([_app("app2")], {"app2": [_dep("b1")]})
+    first = FakePanel([_app("app1")], {"app1": [_dep("a1")]})
+    inner = first.__call__
+
+    def slow(procedure, params):
+        if procedure == "deployment.all" and params == {"applicationId": "app1"}:
+            snapshot(Panel("other", "x"), other, history)  # runs and saves meanwhile
+        return inner(procedure, params)
+
+    snapshot(Panel("prod", "x"), slow, history)
+    stored = json.loads(history.read_text())
+    assert set(stored["deployments"]) == {"a1", "b1"} and set(stored["snapshots"]) == {"prod", "other"}
+
+
+def test_the_history_lock_is_exclusive(tmp_path):
+    import threading
+
+    history = tmp_path / "deploys.json"
+    done = threading.Event()
+
+    def writer():
+        with deploys.locked(history):
+            done.set()
+
+    with deploys.locked(history):
+        t = threading.Thread(target=writer)
+        t.start()
+        assert not done.wait(0.3)  # blocked while the lock is held
+    t.join(5)
+    assert done.is_set()
+
+
+def test_a_running_first_deployment_still_ends_the_estimates():
+    h = _history({"s1": _svc()}, {"d1": _rec(status="running", start="2026-11-20T10:00:00Z", end=None)})
+    rows, shipped = derive(h, [_pr(1, "2026-03-01T00:00:00Z"), _pr(2, "2026-11-20T12:00:00Z")])
+    assert [r["deployment_id"] for r in rows] == ["estimate:acme/widgets#1"]
+    assert shipped == []
