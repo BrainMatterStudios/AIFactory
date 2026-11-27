@@ -231,7 +231,7 @@ def homes(tmp_path):
 def _cfg(tmp_path, homes, **extra) -> Config:
     claude, codex = homes
     return from_dict({
-        "user": "Ahmed M", "machine": "mbp", "store": "local", "quiet_minutes": 0,
+        "user": "Alice M", "machine": "mbp", "store": "local", "quiet_minutes": 0,
         "state_dir": str(tmp_path / "state"), "local": {"dir": str(tmp_path / "archive")},
         "claude_root": str(claude), "codex_root": str(codex), **extra,
     })
@@ -252,7 +252,7 @@ def test_collect_archives_redacted_files_with_index(tmp_path, homes):
     assert report.uploaded == 3
     raw = sorted((tmp_path / "archive" / "raw").rglob("*.jsonl.gz"))
     assert len(raw) == 3
-    assert any("raw/claude-code/Ahmed-M/2026/11/20/s1/session." in str(p) for p in raw)
+    assert any("raw/claude-code/Alice-M/2026/11/20/s1/session." in str(p) for p in raw)
     for path in raw:
         text = gzip.decompress(path.read_bytes()).decode()
         assert GITHUB_TOKEN not in text
@@ -301,7 +301,7 @@ def test_cli_collect_and_status(tmp_path, homes, capsys):
     claude, codex = homes
     config = tmp_path / "config.toml"
     config.write_text(
-        'user = "ahmed"\nstore = "local"\nquiet_minutes = 0\n'
+        'user = "alice"\nstore = "local"\nquiet_minutes = 0\n'
         f'state_dir = "{tmp_path / "state"}"\nclaude_root = "{claude}"\ncodex_root = "{codex}"\n'
         f'[local]\ndir = "{tmp_path / "archive"}"\n'
     )

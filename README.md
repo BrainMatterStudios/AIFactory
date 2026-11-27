@@ -124,7 +124,7 @@ python -m pytest -q
 
 The observe→diagnose→queue→verify loop, the harvester and its dedup, the
 collectors and ratchets, and the governance rails are generalized from a
-production factory (ElBasket `TheScraperEngine`). The single-session build
+production factory that runs a data-scraping product. The single-session build
 model replaces an autonomous builder that never reached production; its full
 history, including eight adversarial review rounds, is in the `v0.3-archive`
 branch.

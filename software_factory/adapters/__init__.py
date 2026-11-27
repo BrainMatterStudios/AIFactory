@@ -1,7 +1,7 @@
 """The adapter layer — the one genuinely new thing the product adds over the
-proven ElBasket factory.
+proven production factory it was generalized from.
 
-Everything ElBasket hardcoded (GitHub, Dokploy, Supabase, Telegram, launchd)
+Everything that factory hardcoded (GitHub, Dokploy, Supabase, Telegram, launchd)
 becomes a small, swappable interface here. The core and the loop talk only to
 these Protocols, never to a concrete provider, so the same factory runs on
 anyone's stack. Ship a reference set; let adopters bring their own.

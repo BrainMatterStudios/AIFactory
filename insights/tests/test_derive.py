@@ -136,13 +136,13 @@ def _codex_child() -> list[str]:
 def claude_row():
     main_part = parse_part(CLAUDE, "s-1", "session", _claude_session())
     sub = parse_part(CLAUDE, "s-1", "agent-a1", _claude_subagent())
-    [session] = fold([("ahmed", main_part), ("ahmed", sub)])
+    [session] = fold([("alice", main_part), ("alice", sub)])
     return extract(session)
 
 
 def test_claude_session_signals(claude_row):
     r = claude_row
-    assert (r["agent"], r["user"], r["session_id"], r["dt"]) == ("claude-code", "ahmed", "s-1", "2026-11-23")
+    assert (r["agent"], r["user"], r["session_id"], r["dt"]) == ("claude-code", "alice", "s-1", "2026-11-23")
     assert r["project"] == "w" and r["branches"] == ["feat-x"] and r["mode"] == "interactive"
     assert r["models"] == ["claude-haiku-5-5", "claude-opus-5-5"]
     assert r["subagents"] == 1 and r["has_main"]
@@ -166,7 +166,7 @@ def test_codex_threads_fold_into_their_root():
     root = parse_part(CODEX, "root-1", "session", _codex_root())
     child = parse_part(CODEX, "child-1", "session", _codex_child())
     assert child.is_subagent and child.parent_id == "root-1"
-    [session] = fold([("ahmed", child), ("ahmed", root)])
+    [session] = fold([("alice", child), ("alice", root)])
     r = extract(session)
     assert r["session_id"] == "root-1" and r["subagents"] == 1
     assert r["project"] == "shop" and r["models"] == ["gpt-5.6-sol"]
@@ -208,12 +208,12 @@ def test_project_names_map_worktrees_back_to_the_repo():
 
 
 def test_only_the_largest_upload_of_each_part_is_read():
-    base = "raw/claude-code/ahmed/2026/11/23/s-1/"
+    base = "raw/claude-code/alice/2026/11/23/s-1/"
     refs, superseded = latest_parts([
         (base + "session.aaaaaaaaaaaaaaaa.jsonl.gz", 100),
         (base + "session.bbbbbbbbbbbbbbbb.jsonl.gz", 300),
         (base + "agent-a1.cccccccccccccccc.jsonl.gz", 50),
-        ("index/claude-code/ahmed/2026/11/23/s-1/session.bbbbbbbbbbbbbbbb.json", 9),
+        ("index/claude-code/alice/2026/11/23/s-1/session.bbbbbbbbbbbbbbbb.json", 9),
     ])
     assert superseded == 1
     assert [r.key.rsplit("/", 1)[1] for r in refs] == [
@@ -223,11 +223,11 @@ def test_only_the_largest_upload_of_each_part_is_read():
 def _archive(tmp_path):
     store = LocalStore(tmp_path / "bucket")
     files = {
-        "raw/claude-code/ahmed/2026/11/23/s-1/session.1111111111111111.jsonl.gz": _claude_session()[:4],
-        "raw/claude-code/ahmed/2026/11/23/s-1/session.2222222222222222.jsonl.gz": _claude_session(),
-        "raw/claude-code/ahmed/2026/11/23/s-1/agent-a1.3333333333333333.jsonl.gz": _claude_subagent(),
-        "raw/codex/hossam/2026/11/23/root-1/session.4444444444444444.jsonl.gz": _codex_root(),
-        "raw/codex/hossam/2026/11/23/child-1/session.5555555555555555.jsonl.gz": _codex_child(),
+        "raw/claude-code/alice/2026/11/23/s-1/session.1111111111111111.jsonl.gz": _claude_session()[:4],
+        "raw/claude-code/alice/2026/11/23/s-1/session.2222222222222222.jsonl.gz": _claude_session(),
+        "raw/claude-code/alice/2026/11/23/s-1/agent-a1.3333333333333333.jsonl.gz": _claude_subagent(),
+        "raw/codex/bob/2026/11/23/root-1/session.4444444444444444.jsonl.gz": _codex_root(),
+        "raw/codex/bob/2026/11/23/child-1/session.5555555555555555.jsonl.gz": _codex_child(),
     }
     for key, lines in files.items():
         store.put(key, gzip.compress("\n".join(lines).encode()), content_type="application/gzip")
@@ -246,7 +246,7 @@ def test_build_writes_a_queryable_table_and_kpis(tmp_path):
         f"SELECT agent, user, session_id, subagents, corrections FROM "
         f"read_parquet('{out}/sessions/*/*.parquet', hive_partitioning=true) ORDER BY agent"
     ).fetchall()
-    assert rows == [("claude-code", "ahmed", "s-1", 1, 1), ("codex", "hossam", "root-1", 1, 0)]
+    assert rows == [("claude-code", "alice", "s-1", 1, 1), ("codex", "bob", "root-1", 1, 0)]
     # A second build reuses the cache and replaces the table.
     assert build(store, out=out, cache=cache, workers=2).downloaded == 0
     columns, table = kpis(out, weeks=520)
@@ -283,7 +283,7 @@ def test_failed_downloads_are_retried_then_reported(tmp_path, monkeypatch):
     pytest.importorskip("duckdb")
     monkeypatch.setattr("aif_insights.derive.time.sleep", lambda _s: None)
     store = _archive(tmp_path)
-    broken = "raw/codex/hossam/2026/11/23/child-1/session.5555555555555555.jsonl.gz"
+    broken = "raw/codex/bob/2026/11/23/child-1/session.5555555555555555.jsonl.gz"
     flaky = _FlakyStore(store.root, broken)
     report = build(flaky, out=tmp_path / "derived", cache=tmp_path / "cache", workers=2)
     assert report.downloaded == 3 and report.sessions == 2
@@ -328,7 +328,7 @@ def test_no_after_a_question_is_an_answer_not_a_correction():
         _assistant(3, "q2", {"type": "text", "text": "Deleted the local branches."}),
         _prompt(4, "no, you deleted main too"),
     ]
-    [session] = fold([("ahmed", parse_part(CLAUDE, "s", "session", lines))])
+    [session] = fold([("alice", parse_part(CLAUDE, "s", "session", lines))])
     assert extract(session)["corrections"] == 1
 
 
@@ -344,7 +344,7 @@ def test_a_polled_codex_command_gets_its_final_result():
         _codex("response_item", 3, type="function_call_output", call_id="b",
                output="Chunk ID: 2\nProcess exited with code 1\n=== 3 failed, 9 passed ==="),
     ]
-    [session] = fold([("hossam", parse_part(CODEX, "r", "session", lines))])
+    [session] = fold([("bob", parse_part(CODEX, "r", "session", lines))])
     row = extract(session)
     assert (row["test_runs"], row["test_failures"], row["test_unknown"]) == (1, 1, 0)
 
@@ -363,7 +363,7 @@ def test_outcomes_count_only_commands_that_run():
         _assistant(1, "o1", _bash("x1", "rg 'git commit' README.md && echo 'gh pr create'")),
         _result(1, "x1", "README.md: run git commit"),
     ]
-    [session] = fold([("ahmed", parse_part(CLAUDE, "s", "session", lines))])
+    [session] = fold([("alice", parse_part(CLAUDE, "s", "session", lines))])
     row = extract(session)
     assert not row["committed"] and not row["pr_opened"] and row["abandoned"]
     assert runs("cd repo && git -C . commit -qm x", re.compile(r"git\s+(?:-C\s+\S+\s+)?commit\b"))
