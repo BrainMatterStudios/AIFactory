@@ -443,8 +443,10 @@ def derive(history: dict, prs: Iterable[dict], aliases: dict[str, str] | None = 
             at = _t(p["merged_at"])
             if first is None or at < first:
                 continue  # merged before the history starts: the shipping deploy is unknown
-            hit = next((d for d in done if _t(d["started_at"] or d["created_at"]) >= at), None)
-            if hit and touches(p, hit["_watch"]):
+            # The first deployment after the merge that watches the PR's files.
+            hit = next((d for d in done if _t(d["started_at"] or d["created_at"]) >= at
+                        and touches(p, d["_watch"])), None)
+            if hit:
                 live = _t(hit["finished_at"]) or _t(hit["started_at"])
                 shipped.append({**base, "pr_repo": p["repo"], "pr_number": p["number"],
                                 "merged_at": p["merged_at"], "deployment_id": hit["deployment_id"],
