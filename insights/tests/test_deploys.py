@@ -405,3 +405,26 @@ def test_records_without_a_setup_use_the_services_current_one():
     h = _history({"s1": _svc(branch="dev")}, {"d1": _rec()})  # an older record: no branch on it
     rows, _ = derive(h, [_pr(1, None)])
     assert [(r["branch"], r["env"]) for r in rows] == [("dev", "dev")]
+
+
+def test_a_stale_running_reading_never_undoes_a_finished_deployment(tmp_path):
+    history = tmp_path / "deploys.json"
+    panel = FakePanel([_app("app1")], {"app1": [_dep("d1", status="done")]})
+    snapshot(Panel("prod", "x"), panel, history)
+    panel.deployments = {"app1": [_dep("d1", status="running", end=None)]}  # fetched earlier, saved later
+    snapshot(Panel("prod", "x"), panel, history)
+    d1 = deploys.load_history(history)["deployments"]["d1"]
+    assert d1["status"] == "done" and d1["finished_at"] == "2026-11-20T10:05:00.000Z"
+
+
+def test_each_deployment_is_matched_by_its_own_watch_paths():
+    h = _history({"s1": _svc(watch=["web/**"])}, {   # the service now watches web/**
+        "d1": {**_rec(start="2026-11-20T10:00:00Z", end="2026-11-20T10:05:00Z"), "watch_paths": ["api/**"]},
+        "d2": {**_rec(start="2026-11-22T10:00:00Z", end="2026-11-22T10:05:00Z"), "watch_paths": ["web/**"]}})
+    prs = [_pr(1, "2026-11-19T00:00:00Z", files=["api/a.py"]),   # before recording
+           _pr(2, "2026-11-21T12:00:00Z", files=["web/b.ts"]),   # shipped by d2
+           _pr(3, "2026-11-21T13:00:00Z", files=["api/c.py"]),   # not d2's concern any more
+           _pr(4, "2026-11-20T12:00:00Z", files=["api/d.py"], title='Revert "api"')]  # reverts d1
+    rows, shipped = derive(h, prs)
+    assert [s["pr_number"] for s in shipped] == [2]
+    assert {r["deployment_id"]: r["reverted"] for r in rows if r["source"] == "dokploy"} == {"d1": True, "d2": False}

@@ -83,6 +83,7 @@ REVERT_WINDOW = timedelta(hours=24)
 #: one that triggered it, so it is not estimated as a deployment of its own.
 ESTIMATE_GAP = timedelta(hours=1)
 _SKIP_KINDS = ("scheduleId", "backupId", "volumeBackupId")
+FINAL = ("done", "error")
 
 Get = Callable[[str, dict], object]
 
@@ -231,7 +232,11 @@ def snapshot(panel: Panel, get: Get, history: Path) -> dict:
             old = stored["deployments"].get(did)
             setup = ({k: old[k] for k in SETUP_KEYS if k in old} if old else {}) or \
                 {k: metas[rec["service_id"]].get(k) for k in SETUP_KEYS}
-            stored["deployments"][did] = {**rec, **setup}
+            outcome = {}
+            if old and old.get("status") in FINAL and rec.get("status") not in FINAL:
+                # An overlapping run fetched this before it finished: keep the outcome.
+                outcome = {k: old.get(k) for k in ("status", "finished_at")}
+            stored["deployments"][did] = {**rec, **outcome, **setup}
         stored["snapshots"][panel.name] = datetime.now(UTC).isoformat()
         save_history(history, stored)
         total = len(stored["deployments"])
@@ -383,8 +388,8 @@ def derive(history: dict, prs: Iterable[dict], aliases: dict[str, str] | None = 
         if at and (d["service_id"] not in started or at < started[d["service_id"]]):
             started[d["service_id"]] = at
         entry = setups.setdefault((d["service_id"], repo, cfg["branch"]), {**cfg, "repo": repo, "recorded": []})
-        if d.get("status") in ("done", "error"):
-            entry["recorded"].append({**d, "deployment_id": did})
+        if d.get("status") in FINAL:
+            entry["recorded"].append({**d, "deployment_id": did, "_watch": cfg.get("watch_paths") or []})
     for sid, svc in services.items():  # the current setup, even with nothing recorded under it
         repo = session_repo(svc.get("repo"))
         if repo:
@@ -395,9 +400,11 @@ def derive(history: dict, prs: Iterable[dict], aliases: dict[str, str] | None = 
     deploys, shipped = [], []
     for (sid, repo, branch), cfg in sorted(setups.items(), key=lambda kv: tuple(str(k) for k in kv[0])):
         svc = services[sid]
-        branch_prs = [p for p in merged.get((repo.lower(), branch), [])
-                      if touches(p, cfg.get("watch_paths") or [])]
-        reverts = [_t(p["merged_at"]) for p in branch_prs if (p.get("title") or "").startswith("Revert")]
+        # Watch paths can change without the branch changing: each recorded
+        # deployment is judged by its own, estimates by the current ones.
+        all_prs = merged.get((repo.lower(), branch), [])
+        branch_prs = [p for p in all_prs if touches(p, cfg.get("watch_paths") or [])]
+        revert_prs = [p for p in all_prs if (p.get("title") or "").startswith("Revert")]
         recorded = sorted(cfg["recorded"], key=lambda d: d["started_at"] or d["created_at"])
         base = {"service_id": sid, "service": cfg["name"], "repo": repo, "branch": branch,
                 "env": env_of(branch, cfg["name"])}
@@ -405,7 +412,9 @@ def derive(history: dict, prs: Iterable[dict], aliases: dict[str, str] | None = 
             start = _t(d["started_at"] or d["created_at"])
             end = _t(d["finished_at"]) or start
             failed = d["status"] == "error"
-            reverted = not failed and any(end <= r <= end + REVERT_WINDOW for r in reverts if r)
+            reverted = not failed and any(
+                end <= _t(p["merged_at"]) <= end + REVERT_WINDOW
+                for p in revert_prs if touches(p, d["_watch"]))
             recovery = None
             if failed:
                 nxt = next((n for n in recorded[i + 1:] if n["status"] == "done"), None)
@@ -430,12 +439,12 @@ def derive(history: dict, prs: Iterable[dict], aliases: dict[str, str] | None = 
                                     "at": p["merged_at"], "failed_change": None, "reverted": None,
                                     "recovery_h": None})
         done = [d for d in recorded if d["status"] == "done"]
-        for p in branch_prs:
+        for p in all_prs:
             at = _t(p["merged_at"])
             if first is None or at < first:
                 continue  # merged before the history starts: the shipping deploy is unknown
             hit = next((d for d in done if _t(d["started_at"] or d["created_at"]) >= at), None)
-            if hit:
+            if hit and touches(p, hit["_watch"]):
                 live = _t(hit["finished_at"]) or _t(hit["started_at"])
                 shipped.append({**base, "pr_repo": p["repo"], "pr_number": p["number"],
                                 "merged_at": p["merged_at"], "deployment_id": hit["deployment_id"],
