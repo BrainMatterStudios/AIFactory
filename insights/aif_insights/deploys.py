@@ -36,6 +36,9 @@ Rules (all in `build`):
   unknown or was cut off).
 * Renames: a service pointing at a repository's old name is matched through
   GitHub to its current name.
+* Reconfiguration: each deployment keeps the repository, branch, name and
+  watch paths its service had when it was first recorded, so changing a
+  service's branch does not move its past deployments.
 * Estimates: for a service that deploys on every push, each PR merged into its
   branch before the first recorded deployment counts as one estimated
   deployment at the merge time; a merge in the hour before it is taken to be
@@ -224,7 +227,11 @@ def snapshot(panel: Panel, get: Get, history: Path) -> dict:
         stored = load_history(history)
         new = sum(did not in stored["deployments"] for did in seen)
         stored["services"].update(metas)
-        stored["deployments"].update(seen)
+        for did, rec in seen.items():
+            old = stored["deployments"].get(did)
+            setup = ({k: old[k] for k in SETUP_KEYS if k in old} if old else {}) or \
+                {k: metas[rec["service_id"]].get(k) for k in SETUP_KEYS}
+            stored["deployments"][did] = {**rec, **setup}
         stored["snapshots"][panel.name] = datetime.now(UTC).isoformat()
         save_history(history, stored)
         total = len(stored["deployments"])
@@ -326,22 +333,33 @@ def touches(pr: dict, watch_paths: list[str]) -> bool:
     return (pr.get("changed_files") or 0) > len(files)
 
 
+#: Service settings copied onto each deployment when it is first recorded, so a
+#: later change of branch or repository does not rewrite past deployments.
+SETUP_KEYS = ("repo", "branch", "name", "watch_paths", "auto_deploy")
+
+
+def _setup(d: dict, svc: dict) -> dict:
+    """A deployment's own setup, or the service's current one for records made
+    before deployments carried their setup."""
+    return {k: d[k] if k in d else svc.get(k) for k in SETUP_KEYS}
+
+
 def derive(history: dict, prs: Iterable[dict], aliases: dict[str, str] | None = None
            ) -> tuple[list[dict], list[dict]]:
     """(deploy rows, PR-to-deploy rows) for services in the session repos.
     `prs` are rows of prs.parquet (repo, number, title, base_ref, merged_at,
     files, changed_files). `aliases` maps an old repository name, lower-cased,
-    to its current one."""
+    to its current one. Each deployment is judged by the setup (repository,
+    branch, name, watch paths) it was recorded under."""
     prs = list(prs)
     aliases = aliases or {}
     repos = {p["repo"].lower(): p["repo"] for p in prs}
-    services = {}
-    for sid, s in history["services"].items():
-        if s.get("source") != "github" or not s.get("repo"):
-            continue
-        current = aliases.get(s["repo"].lower(), s["repo"])
-        if current.lower() in repos:
-            services[sid] = {**s, "repo": repos[current.lower()]}
+
+    def session_repo(repo: str | None) -> str | None:
+        if not repo:
+            return None
+        return repos.get(aliases.get(repo.lower(), repo).lower())
+
     merged: dict[tuple[str, str], list[dict]] = {}
     for p in prs:
         if p.get("merged_at") and p.get("base_ref"):
@@ -349,26 +367,40 @@ def derive(history: dict, prs: Iterable[dict], aliases: dict[str, str] | None = 
     for group in merged.values():
         group.sort(key=lambda p: p["merged_at"])
 
-    by_service: dict[str, list[dict]] = {}
-    started: dict[str, datetime] = {}  # first recorded deployment, finished or not
+    services = {sid: s for sid, s in history["services"].items() if s.get("source") == "github"}
+    # A setup is one service under one repository and branch.
+    setups: dict[tuple[str, str, str], dict] = {}
+    started: dict[str, datetime] = {}  # first recorded deployment per service, finished or not
     for did, d in history["deployments"].items():
-        if d["service_id"] not in services:
+        svc = services.get(d["service_id"])
+        if svc is None:
+            continue
+        cfg = _setup(d, svc)
+        repo = session_repo(cfg["repo"])
+        if repo is None:
             continue
         at = _t(d.get("started_at") or d.get("created_at"))
         if at and (d["service_id"] not in started or at < started[d["service_id"]]):
             started[d["service_id"]] = at
+        entry = setups.setdefault((d["service_id"], repo, cfg["branch"]), {**cfg, "repo": repo, "recorded": []})
         if d.get("status") in ("done", "error"):
-            by_service.setdefault(d["service_id"], []).append({**d, "deployment_id": did})
+            entry["recorded"].append({**d, "deployment_id": did})
+    for sid, svc in services.items():  # the current setup, even with nothing recorded under it
+        repo = session_repo(svc.get("repo"))
+        if repo:
+            entry = setups.setdefault((sid, repo, svc["branch"]),
+                                      {**_setup({}, svc), "repo": repo, "recorded": []})
+            entry["current"] = True
 
     deploys, shipped = [], []
-    for sid, svc in sorted(services.items()):
-        env = env_of(svc["branch"], svc["name"])
-        branch_prs = [p for p in merged.get((svc["repo"].lower(), svc["branch"]), [])
-                      if touches(p, svc.get("watch_paths") or [])]
+    for (sid, repo, branch), cfg in sorted(setups.items(), key=lambda kv: tuple(str(k) for k in kv[0])):
+        svc = services[sid]
+        branch_prs = [p for p in merged.get((repo.lower(), branch), [])
+                      if touches(p, cfg.get("watch_paths") or [])]
         reverts = [_t(p["merged_at"]) for p in branch_prs if (p.get("title") or "").startswith("Revert")]
-        recorded = sorted(by_service.get(sid, []), key=lambda d: d["started_at"] or d["created_at"])
-        base = {"service_id": sid, "service": svc["name"], "repo": svc["repo"], "branch": svc["branch"],
-                "env": env}
+        recorded = sorted(cfg["recorded"], key=lambda d: d["started_at"] or d["created_at"])
+        base = {"service_id": sid, "service": cfg["name"], "repo": repo, "branch": branch,
+                "env": env_of(branch, cfg["name"])}
         for i, d in enumerate(recorded):
             start = _t(d["started_at"] or d["created_at"])
             end = _t(d["finished_at"]) or start
@@ -384,11 +416,12 @@ def derive(history: dict, prs: Iterable[dict], aliases: dict[str, str] | None = 
                             "source": "dokploy", "status": d["status"], "at": _iso(end),
                             "failed_change": failed or reverted, "reverted": reverted,
                             "recovery_h": recovery})
-        # Estimates stop where recording starts, counting a deployment still
-        # running: it is recorded, only its outcome is not known yet.
+        # Estimates stop where recording of the service starts, counting a
+        # deployment still running: it is recorded, only its outcome is not
+        # known yet. Only the service's current setup is estimated.
         first = started.get(sid)
         created = _t(svc.get("created_at"))
-        if svc["auto_deploy"]:
+        if cfg.get("current") and cfg.get("auto_deploy"):
             for p in branch_prs:
                 at = _t(p["merged_at"])
                 if (first is None or at < first - ESTIMATE_GAP) and (created is None or at >= created):
@@ -403,11 +436,11 @@ def derive(history: dict, prs: Iterable[dict], aliases: dict[str, str] | None = 
                 continue  # merged before the history starts: the shipping deploy is unknown
             hit = next((d for d in done if _t(d["started_at"] or d["created_at"]) >= at), None)
             if hit:
+                live = _t(hit["finished_at"]) or _t(hit["started_at"])
                 shipped.append({**base, "pr_repo": p["repo"], "pr_number": p["number"],
                                 "merged_at": p["merged_at"], "deployment_id": hit["deployment_id"],
-                                "deployed_at": _iso(_t(hit["finished_at"]) or _t(hit["started_at"])),
-                                "merge_to_deploy_h": round(((_t(hit["finished_at"]) or _t(hit["started_at"]))
-                                                            - at).total_seconds() / 3600, 2)})
+                                "deployed_at": _iso(live),
+                                "merge_to_deploy_h": round((live - at).total_seconds() / 3600, 2)})
     return deploys, shipped
 
 
@@ -429,9 +462,11 @@ def resolve_names(history: dict, known: set[str], resolve: Callable[[str], str])
     know (GitHub answers for a renamed repository). Answers are kept in the
     history, so each name is asked once; a failed lookup is retried next run."""
     names = history.setdefault("repo_names", {})
-    for s in history["services"].values():
-        repo = s.get("repo")
-        if s.get("source") != "github" or not repo or repo.lower() in known or repo.lower() in names:
+    github = {sid for sid, s in history["services"].items() if s.get("source") == "github"}
+    candidates = [s.get("repo") for sid, s in history["services"].items() if sid in github]
+    candidates += [d.get("repo") for d in history["deployments"].values() if d["service_id"] in github]
+    for repo in dict.fromkeys(candidates):
+        if not repo or repo.lower() in known or repo.lower() in names:
             continue
         try:
             names[repo.lower()] = resolve(repo)

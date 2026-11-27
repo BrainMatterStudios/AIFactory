@@ -380,3 +380,28 @@ def test_a_running_first_deployment_still_ends_the_estimates():
     rows, shipped = derive(h, [_pr(1, "2026-03-01T00:00:00Z"), _pr(2, "2026-11-20T12:00:00Z")])
     assert [r["deployment_id"] for r in rows] == ["estimate:acme/widgets#1"]
     assert shipped == []
+
+
+def test_a_branch_change_does_not_rewrite_past_deployments(tmp_path):
+    history = tmp_path / "deploys.json"
+    panel = FakePanel([_app("app1", branch="dev")], {"app1": [
+        _dep("old1", start="2026-11-20T10:00:00.000Z", end="2026-11-20T10:05:00.000Z"),
+        _dep("old2", start="2026-11-21T10:00:00.000Z", end="2026-11-21T10:05:00.000Z")]})
+    snapshot(Panel("prod", "x"), panel, history)
+    panel.apps["app1"]["branch"] = "main"      # the service now deploys main
+    panel.deployments["app1"].append(_dep("new1", start="2026-11-25T10:00:00.000Z",
+                                          end="2026-11-25T10:05:00.000Z"))
+    snapshot(Panel("prod", "x"), panel, history)
+    stored = deploys.load_history(history)
+    assert {d: r["branch"] for d, r in stored["deployments"].items()} == \
+        {"old1": "dev", "old2": "dev", "new1": "main"}
+    prs = [_pr(1, "2026-11-20T12:00:00Z", base="dev"), _pr(2, "2026-11-24T12:00:00Z", base="main")]
+    rows, shipped = derive(stored, prs)
+    assert {r["deployment_id"]: r["env"] for r in rows} == {"old1": "dev", "old2": "dev", "new1": "prod"}
+    assert {(s["pr_number"], s["deployment_id"]) for s in shipped} == {(1, "old2"), (2, "new1")}
+
+
+def test_records_without_a_setup_use_the_services_current_one():
+    h = _history({"s1": _svc(branch="dev")}, {"d1": _rec()})  # an older record: no branch on it
+    rows, _ = derive(h, [_pr(1, None)])
+    assert [(r["branch"], r["env"]) for r in rows] == [("dev", "dev")]
