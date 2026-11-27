@@ -9,7 +9,7 @@
     aif-insights kpis    [--out DIR] [--weeks N]
     aif-insights dashboard [--out DIR] [--weeks N] [--html PATH]
     aif-insights deploys [--config PATH] [--out DIR] [--no-fetch]
-    aif-insights dokploy-key NAME            (macOS: store a panel's API key)
+    aif-insights dokploy-key NAME [--stdin]  (macOS: store a panel's API key)
 """
 from __future__ import annotations
 
@@ -119,11 +119,27 @@ def cmd_dokploy_key(args) -> int:
     from aif_insights import keychain
     from aif_insights.deploys import KEYCHAIN_SERVICE
 
-    value = getpass.getpass(f"API key for Dokploy panel {args.name} (not shown): ").strip()
+    if args.stdin:
+        # Piped in (e.g. from a file), so the key is never typed or shown.
+        value = sys.stdin.readline().strip()
+    elif not sys.stdin.isatty():
+        print("there is no terminal here to type the key into without showing it: run this in "
+              "Terminal, or pipe the key in with --stdin", file=sys.stderr)
+        return 2
+    else:
+        try:
+            value = getpass.getpass(f"API key for Dokploy panel {args.name} (not shown): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\ncancelled; nothing stored", file=sys.stderr)
+            return 130
     if not value:
-        print("nothing entered; nothing stored")
+        print("no key given; nothing stored", file=sys.stderr)
         return 1
-    keychain.write(args.name, value, service=KEYCHAIN_SERVICE)
+    try:
+        keychain.write(args.name, value, service=KEYCHAIN_SERVICE)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     print(f"stored in the login Keychain as {KEYCHAIN_SERVICE} / {args.name}")
     return 0
 
@@ -218,6 +234,8 @@ def build_parser() -> argparse.ArgumentParser:
     dp.set_defaults(func=cmd_deploys)
     dk = sub.add_parser("dokploy-key", help="store a Dokploy panel's API key in the Keychain")
     dk.add_argument("name", help="the panel's name in the [[dokploy]] config")
+    dk.add_argument("--stdin", action="store_true",
+                    help="read the key from standard input (a pipe) instead of asking")
     dk.set_defaults(func=cmd_dokploy_key)
     return p
 

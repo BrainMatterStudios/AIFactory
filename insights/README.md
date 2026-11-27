@@ -189,7 +189,9 @@ tunnel = { host = "me@203.0.113.5", identity = "~/.ssh/id_ed25519", local_port =
 
 Each panel's API key comes from `AIF_DOKPLOY_TOKEN_<NAME>`, else a
 `token_file = "path"` in its entry, else the login Keychain. Store it there
-once with `aif-insights dokploy-key prod` (it asks without showing the key).
+once with `aif-insights dokploy-key prod`, run in Terminal: it asks without
+showing the key. Where there is no terminal, pipe it in instead, for example
+`grep '^DOKPLOY_API_TOKEN=' path/to/.env | cut -d= -f2- | aif-insights dokploy-key prod --stdin`.
 
 ```bash
 aif-insights github      # first: PRs, with their changed files
