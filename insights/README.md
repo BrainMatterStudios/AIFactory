@@ -160,9 +160,49 @@ top of `aif_insights/github.py`. Known limits:
   folder and branch name, a weaker link marked `branch`;
 - cost per merged PR counts Claude Code sessions only (Codex cost is empty);
 - a squashed or force-pushed PR has lost its first pushed commit, so its
-  first-pass CI reads the earliest commit that remains;
-- deploy metrics (deploy frequency, change-fail rate, time to recover) need
-  the Dokploy API and are not built yet.
+  first-pass CI reads the earliest commit that remains.
+
+## Deployments (Dokploy)
+
+`aif-insights deploys` reads deployments from one or more Dokploy panels,
+keeps the services built from repositories your sessions touched, and writes
+`derived/deploys.parquet` and `derived/deploy_prs.parquet`. `kpis` and the
+dashboard then show, per week and environment: successful deployments, merge
+to deploy time, change failure rate and recovery time.
+
+Dokploy keeps only the last few deployments of each service, so the history
+is copied to `~/.local/state/aif-insights/deploys.json` on every run and only
+grows. Once panels are configured, the hourly `collect` job records them too.
+Weeks before recording began are estimated from merges (deploy count only).
+
+List the panels in the collector config. It holds no keys:
+
+```toml
+[[dokploy]]
+name = "prod"
+url = "https://panel.example.com"
+
+[[dokploy]]
+name = "dev"                       # a panel reachable only over SSH
+tunnel = { host = "me@203.0.113.5", identity = "~/.ssh/id_ed25519", local_port = 13000, remote_port = 3000 }
+```
+
+Each panel's API key comes from `AIF_DOKPLOY_TOKEN_<NAME>`, else a
+`token_file = "path"` in its entry, else the login Keychain. Store it there
+once with `aif-insights dokploy-key prod` (it asks without showing the key).
+
+```bash
+aif-insights github      # first: PRs, with their changed files
+aif-insights deploys     # record deployments, then rebuild the tables
+aif-insights deploys --no-fetch   # rebuild from the recorded history only
+```
+
+The rules are listed at the top of `aif_insights/deploys.py`. Known limits:
+
+- a deployment is matched to PRs by time (the first successful deployment
+  after the merge), not by commit;
+- services that deploy a prebuilt image, not a GitHub branch, are left out;
+- failure and recovery exist only from the day recording began.
 
 ## Development
 

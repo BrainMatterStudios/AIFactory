@@ -49,6 +49,8 @@ class Config:
     state_dir: str = "~/.local/state/aif-insights"
     claude_root: str | None = None
     codex_root: str | None = None
+    #: `[[dokploy]]` panels whose deployments `collect` snapshots (no secrets).
+    dokploy: tuple[dict, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "user", slug(self.user))
@@ -97,6 +99,7 @@ def from_dict(data: dict) -> Config:
         "state_dir": data.get("state_dir", "~/.local/state/aif-insights"),
         "claude_root": data.get("claude_root"),
         "codex_root": data.get("codex_root"),
+        "dokploy": tuple(data.get("dokploy") or ()),
     }
     if "machine" in data:
         values["machine"] = data["machine"]

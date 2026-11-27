@@ -36,6 +36,12 @@ PR_KPIS = [
     ("attention_min_per_merged_pr", "Human attention per merged PR", "estimated minutes"),
     ("lead_time_h", "Lead time", "median hours, opened to merged"),
 ]
+DEPLOY_KPIS = [
+    ("deploys", "Successful deployments", "count; before recording began, estimated from merges"),
+    ("merge_to_deploy_h", "Merge to deploy", "median hours, PR merged to live"),
+    ("change_fail_rate", "Change failure rate", "share of recorded deployments that failed or were reverted"),
+    ("recovery_h", "Recovery time", "median hours, failed deployment to the next good one"),
+]
 #: Reference categorical palette, fixed order (light, dark).
 SERIES = [("#2a78d6", "#3987e5"), ("#eb6834", "#d95926"), ("#1baf7a", "#199e70"),
           ("#eda100", "#c98500"), ("#e87ba4", "#d55181"), ("#008300", "#0ca30c"),
@@ -142,7 +148,13 @@ def render(out: Path = DEFAULT_OUT, weeks: int = 12) -> str:
     p_weeks, p_series = _series(pcolumns, prows) if prows else ([], {})
     bcolumns, brows = batch_calls(out, weeks)
     b_weeks, b_series = _series(bcolumns, brows) if brows else ([], {})
-    names = sorted(set(s_series) | set(p_series) | set(b_series))
+    from aif_insights.deploys import deploy_kpis
+    try:
+        dcolumns, drows = deploy_kpis(out, weeks)
+    except FileNotFoundError:
+        dcolumns, drows = [], []
+    d_weeks, d_series = _series(dcolumns, drows) if drows else ([], {})
+    names = sorted(set(s_series) | set(p_series) | set(b_series) | set(d_series))
     colors = {n: i % len(SERIES) + 1 for i, n in enumerate(names)}  # entity -> fixed slot
     slots = "\n".join(f"  --s{i}: {light};" for i, (light, _) in enumerate(SERIES, 1))
     dark = "\n".join(f"  --s{i}: {d};" for i, (_, d) in enumerate(SERIES, 1))
@@ -154,6 +166,8 @@ def render(out: Path = DEFAULT_OUT, weeks: int = 12) -> str:
         if p_weeks else '<p class="empty">No linked PRs yet: run <code>aif-insights github</code>.</p>'
     b_cards = "".join(_chart(k, t, n, b_weeks, b_series, colors) for k, t, n in BATCH_KPIS) \
         if b_weeks else '<p class="empty">No batch calls in this period.</p>'
+    d_cards = "".join(_chart(k, t, n, d_weeks, d_series, colors) for k, t, n in DEPLOY_KPIS) \
+        if d_weeks else '<p class="empty">No deployments yet: run <code>aif-insights deploys</code>.</p>'
     built = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -219,6 +233,9 @@ Hover a point for its value; each chart has a table.</p>
 <h2>Batch calls</h2>
 <p class="sub">Headless sessions with no tool use: a program using the agent as a model API, such as a product-matching job. Counted apart so they do not swamp the session KPIs.</p>
 <div class="grid-cards">{b_cards}</div>
+<h2>Deployments</h2>
+<p class="sub">Dokploy deployments of services built from the repositories above, by week. Prod is a service deploying main, master or production whose name does not say dev, staging, test or preview; everything else is dev. In a monorepo, a service counts only the PRs that changed its watched folders. Dokploy keeps only a few recent deployments, so history is recorded hourly from the day recording began; earlier weeks are estimated from merges and have no failure or recovery data.</p>
+<div class="grid-cards">{d_cards}</div>
 </main></body></html>
 """
 

@@ -241,6 +241,7 @@ def pr_row(repo: str, node: dict) -> dict:
         "additions": node.get("additions"),
         "deletions": node.get("deletions"),
         "changed_files": node.get("changedFiles"),
+        "files": [f["path"] for f in _nodes(node.get("files"))],
         "commits": (node.get("commits") or {}).get("totalCount"),
         "docs_only": docs_only(node),
         "first_ci_green": first_ci_green(node),
@@ -348,7 +349,7 @@ _PR_SCHEMA = {
     "repo": "VARCHAR", "number": "BIGINT", "url": "VARCHAR", "title": "VARCHAR",
     "author": "VARCHAR", "state": "VARCHAR", "draft": "BOOLEAN", "created_at": "VARCHAR",
     "merged_at": "VARCHAR", "closed_at": "VARCHAR", "head_ref": "VARCHAR", "base_ref": "VARCHAR",
-    "additions": "BIGINT", "deletions": "BIGINT", "changed_files": "BIGINT", "commits": "BIGINT",
+    "additions": "BIGINT", "deletions": "BIGINT", "changed_files": "BIGINT", "files": "VARCHAR[]", "commits": "BIGINT",
     "docs_only": "BOOLEAN", "first_ci_green": "BOOLEAN", "first_review_at": "VARCHAR",
     "rework": "BOOLEAN", "lead_time_h": "DOUBLE",
 }

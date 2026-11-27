@@ -8,6 +8,8 @@
     aif-insights github  [--out DIR] [--cache DIR] [--repo OWNER/NAME ...]
     aif-insights kpis    [--out DIR] [--weeks N]
     aif-insights dashboard [--out DIR] [--weeks N] [--html PATH]
+    aif-insights deploys [--config PATH] [--out DIR] [--no-fetch]
+    aif-insights dokploy-key NAME            (macOS: store a panel's API key)
 """
 from __future__ import annotations
 
@@ -33,6 +35,12 @@ def cmd_collect(args) -> int:
     report = collect(cfg, store, progress=lambda m: print(m, flush=True))
     for line in report.lines():
         print(line)
+    if cfg.dokploy:
+        # Dokploy forgets old deployments, so record them on every run. A
+        # failing panel is reported but never fails the transcript collection.
+        from aif_insights.deploys import snapshot_all
+        for line in snapshot_all({"dokploy": cfg.dokploy}, cfg.state_path / "deploys.json"):
+            print(line, flush=True)
     return report.exit_code
 
 
@@ -85,6 +93,41 @@ def cmd_github(args) -> int:
     return 1 if report["failed"] else 0
 
 
+def cmd_deploys(args) -> int:
+    from aif_insights.deploys import build, snapshot_all
+
+    cfg = load(args.config)
+    history = cfg.state_path / "deploys.json"
+    if not args.no_fetch:
+        if not cfg.dokploy:
+            print("no [[dokploy]] panels in the config: nothing to fetch")
+        for line in snapshot_all({"dokploy": cfg.dokploy}, history):
+            print(line, flush=True)
+    report = build(Path(args.out), history)
+    print(f"services {report['services']}: {report['recorded']} recorded deployments, "
+          f"{report['estimated']} estimated from merges, {report['failed']} failed changes, "
+          f"{report['shipped_prs']} PRs traced to the deployment that shipped them")
+    if not report["file_lists"]:
+        print("the PR table has no file lists, so monorepo services count every PR: "
+              "rerun `aif-insights github` to add them")
+    return 0
+
+
+def cmd_dokploy_key(args) -> int:
+    import getpass
+
+    from aif_insights import keychain
+    from aif_insights.deploys import KEYCHAIN_SERVICE
+
+    value = getpass.getpass(f"API key for Dokploy panel {args.name} (not shown): ").strip()
+    if not value:
+        print("nothing entered; nothing stored")
+        return 1
+    keychain.write(args.name, value, service=KEYCHAIN_SERVICE)
+    print(f"stored in the login Keychain as {KEYCHAIN_SERVICE} / {args.name}")
+    return 0
+
+
 def cmd_kpis(args) -> int:
     from aif_insights.derive import batch_calls, format_table, kpis, pr_kpis
 
@@ -102,6 +145,13 @@ def cmd_kpis(args) -> int:
         return 0
     print("\nPull requests (by week opened; cost is Claude only, token-equivalent)")
     print(format_table(columns, rows) if rows else "no linked PRs in that period")
+    from aif_insights.deploys import deploy_kpis
+    try:
+        columns, rows = deploy_kpis(Path(args.out), args.weeks)
+    except FileNotFoundError:
+        return 0
+    print("\nDeployments (agent = environment; estimated = counted from merges before recording began)")
+    print(format_table(columns, rows) if rows else "no deployments in that period")
     return 0
 
 
@@ -161,6 +211,14 @@ def build_parser() -> argparse.ArgumentParser:
     db.add_argument("--weeks", type=int, default=12)
     db.add_argument("--html", help="where to write the page (default: <out>/dashboard.html)")
     db.set_defaults(func=cmd_dashboard)
+    dp = sub.add_parser("deploys", help="record Dokploy deployments and join them to merged PRs")
+    dp.add_argument("--config")
+    dp.add_argument("--out", default=str(DEFAULT_OUT))
+    dp.add_argument("--no-fetch", action="store_true", help="rebuild from the recorded history only")
+    dp.set_defaults(func=cmd_deploys)
+    dk = sub.add_parser("dokploy-key", help="store a Dokploy panel's API key in the Keychain")
+    dk.add_argument("name", help="the panel's name in the [[dokploy]] config")
+    dk.set_defaults(func=cmd_dokploy_key)
     return p
 
 

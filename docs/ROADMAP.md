@@ -203,8 +203,13 @@ and a local dashboard) is built: `aif-insights github` reads 1,765 PRs from the
 Claude Code's own `pr-link` records. 10 random links were checked against
 GitHub's REST API (head branch, merge time, first CI result, link inside the
 session): 10 of 10 correct. `aif-insights dashboard` writes the weekly trends
-to one local HTML page. Still open: deploy metrics (need the Dokploy API),
-Grafana and Loki (need Phase 0's OTel), the VPS job, and Codex PR links
+to one local HTML page. Deploy metrics are built: `aif-insights deploys`
+records Dokploy deployments hourly (Dokploy itself keeps only the last 11 per
+service), keeps the 11 services built from session repositories, traces merged
+PRs to the deployment that shipped them, and estimates earlier weeks from
+merges. Still open: Grafana and Loki panels from the factory's own tables
+(Claude Code and Codex OTel already reach Grafana Cloud from one Mac), the VPS
+job, and Codex PR links
 (Codex records none; branch matching found no real ones yet). Headless sessions
 with no tool use (15,339 on 2026-11-25, mostly product-matching jobs that use
 Claude Code as a model API) are now a separate "batch call" kind, reported as
