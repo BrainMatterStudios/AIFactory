@@ -78,7 +78,32 @@ def _toml_config(user: str, account_id: str, bucket: str, quiet: float,
     local_dir = (previous.get("local") or {}).get("dir")
     if isinstance(local_dir, str):
         text += f"\n[local]\ndir = {json.dumps(local_dir)}\n"
+    # Dokploy panels are not asked about, but dropping them would stop the
+    # hourly job recording deployments, and Dokploy forgets old ones.
+    for panel in previous.get("dokploy") or []:
+        if isinstance(panel, dict):
+            text += "\n[[dokploy]]\n" + "".join(
+                f"{_toml_key(k)} = {_toml_value(v)}\n" for k, v in panel.items())
     return text
+
+
+def _toml_key(key: str) -> str:
+    return key if key.replace("_", "").replace("-", "").isalnum() else json.dumps(key)
+
+
+def _toml_value(value) -> str:
+    """A TOML value for the simple types a config holds."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int | float):
+        return repr(value)
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(v) for v in value) + "]"
+    if isinstance(value, dict):
+        return "{ " + ", ".join(f"{_toml_key(k)} = {_toml_value(v)}" for k, v in value.items()) + " }"
+    raise TypeError(f"cannot write {type(value).__name__} to the config")
 
 
 def _exclusion_pattern(value: str, home: Path) -> str:

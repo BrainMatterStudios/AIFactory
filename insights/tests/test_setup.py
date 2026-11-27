@@ -109,6 +109,27 @@ def test_rerun_offers_previous_answers_as_defaults(tmp_path):
     assert any("[ahmed]" in p for p in prompts) and any("[bucket]" in p for p in prompts)
 
 
+def test_rerun_keeps_dokploy_panels(tmp_path):
+    import tomllib
+
+    system = FakeSystem()
+    _setup(tmp_path, system, _answers("dev", "acct", "bucket"), secrets=("K", "S"))
+    config = tmp_path / ".config" / "aif-insights" / "config.toml"
+    panels = [
+        {"name": "prod", "url": "https://panel.example.com", "token_file": "~/t.token"},
+        {"name": "dev", "tunnel": {"host": "me@203.0.113.5", "identity": "~/.ssh/k",
+                                   "local_port": 13000, "remote_port": 3000}},
+    ]
+    with config.open("a") as fh:
+        fh.write('\n[[dokploy]]\nname = "prod"\nurl = "https://panel.example.com"\ntoken_file = "~/t.token"\n'
+                 '\n[[dokploy]]\nname = "dev"\ntunnel = { host = "me@203.0.113.5", identity = "~/.ssh/k", '
+                 'local_port = 13000, remote_port = 3000 }\n')
+    assert tomllib.loads(config.read_text())["dokploy"] == panels
+    rc, out = _setup(tmp_path, system, _answers())  # rerun, accepting every default
+    assert rc == 0, out
+    assert tomllib.loads(config.read_text())["dokploy"] == panels
+
+
 def test_non_mac_explains_the_manual_route(tmp_path):
     out: list[str] = []
     rc = run_setup(ask=_answers(), ask_secret=_answers(), run=FakeSystem(), home=tmp_path,
