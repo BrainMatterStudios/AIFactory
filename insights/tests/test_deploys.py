@@ -437,3 +437,46 @@ def test_a_pr_ships_with_the_first_later_deployment_that_watches_it():
         "d2": {**_rec(start="2026-11-21T10:00:00Z", end="2026-11-21T10:05:00Z"), "watch_paths": ["web/**"]}})
     _, shipped = derive(h, [_pr(1, "2026-11-19T12:00:00Z", files=["web/a.ts"])])
     assert [(s["pr_number"], s["deployment_id"]) for s in shipped] == [(1, "d2")]
+
+
+# --- dokploy-key -------------------------------------------------------------------
+
+def _key_cli(monkeypatch, argv, stdin_text="", tty=False, typed=None):
+    import io
+
+    from aif_insights import cli, keychain
+
+    stored = []
+    monkeypatch.setattr(keychain, "write", lambda account, value, service: stored.append((account, value, service)))
+    stdin = io.StringIO(stdin_text)
+    stdin.isatty = lambda: tty
+    monkeypatch.setattr("sys.stdin", stdin)
+
+    def getpass(prompt):
+        if isinstance(typed, BaseException):
+            raise typed
+        return typed
+
+    monkeypatch.setattr("getpass.getpass", getpass)
+    return cli.main(argv), stored
+
+
+def test_dokploy_key_reads_a_piped_key(monkeypatch, capsys):
+    rc, stored = _key_cli(monkeypatch, ["dokploy-key", "prod", "--stdin"], stdin_text="k-123\n")
+    assert rc == 0 and stored == [("prod", "k-123", "aif-insights-dokploy")]
+    assert "k-123" not in capsys.readouterr().out
+
+
+def test_dokploy_key_without_a_terminal_explains_instead_of_crashing(monkeypatch, capsys):
+    rc, stored = _key_cli(monkeypatch, ["dokploy-key", "prod"])
+    assert rc == 2 and stored == []
+    assert "--stdin" in capsys.readouterr().err
+
+
+def test_dokploy_key_prompt_cancelled_or_empty_stores_nothing(monkeypatch, capsys):
+    rc, stored = _key_cli(monkeypatch, ["dokploy-key", "prod"], tty=True, typed=EOFError())
+    assert rc == 130 and stored == [] and "nothing stored" in capsys.readouterr().err
+    rc, stored = _key_cli(monkeypatch, ["dokploy-key", "prod"], tty=True, typed="  ")
+    assert rc == 1 and stored == []
+    rc, stored = _key_cli(monkeypatch, ["dokploy-key", "prod"], tty=True, typed="typed-key")
+    assert rc == 0 and stored == [("prod", "typed-key", "aif-insights-dokploy")]
