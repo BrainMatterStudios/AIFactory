@@ -1,6 +1,6 @@
 """The generalized observe → diagnose → queue → fix → verify loop (L1–L3).
 
-Lifted from the proven ElBasket spine and decoupled from its stack: every
+Lifted from the proven production factory's spine and decoupled from its stack: every
 external touch goes through an adapter, and the domain-specific collectors are
 replaced by a generic {name, verdict, evidence} contract an adopter implements
 for their own data.

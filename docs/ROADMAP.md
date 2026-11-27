@@ -64,7 +64,7 @@ baseline. No separate comparison against the old factory is planned.
 ## Phase 0: stop the bleeding (this week)
 
 - [ ] **Raise transcript retention now** on both machines: `cleanupPeriodDays`
-      (the default deletes sessions after 30 days). Set to 3650 on Ahmed's
+      (the default deletes sessions after 30 days). Set to 3650 on the first
       machine as of 2026-11-22; the second machine is unconfirmed. Then copy
       `~/.claude/projects` and `~/.codex/sessions` to the bucket or an
       encrypted disk as-is. These are the history that the first analytics
@@ -79,7 +79,7 @@ baseline. No separate comparison against the old factory is planned.
       Compliance API access, so A1 can compare it with laptop sync.
 - [ ] Agree the privacy rules: redaction before storage, a client-repository
       exclusion list, mutual read access, and KPIs that are not a personal
-      leaderboard. Redaction is in place, and Ahmed chose an empty exclusion
+      leaderboard. Redaction is in place, and the owner chose an empty exclusion
       list (2026-11-23). Read access and KPI rules are still to agree.
 - [x] Create the `v0.3-archive` branch at `main` (`00fe2d1`), done
       2026-11-21. It is the only copy of the 0.x machinery after L1, and an
@@ -163,7 +163,7 @@ useful for a human-driven PR.
 primary source and the Compliance API as a backfill and weekly completeness
 check. The collector (`insights/`, `aif-insights collect`) runs hourly on both
 laptops and uploads to R2. Redaction was hardened twice (encoded secrets with
-slashes, and blobs with plain stretches), and Ahmed's earlier uploads were
+slashes, and blobs with plain stretches), and the first machine's earlier uploads were
 replaced with redacted copies. The Codex parser was checked against 761 real
 files, which Codex stores compressed (`.jsonl.zst`); collecting them merged
 in #23. Remaining: replacing the second laptop's pre-fix uploads, the VPS

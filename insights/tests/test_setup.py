@@ -58,14 +58,14 @@ def test_fresh_setup_stores_keys_writes_config_and_installs_the_job(tmp_path):
     claude_settings.write_text(json.dumps({"model": "opus", "cleanupPeriodDays": 30}))
     system = FakeSystem()
 
-    rc, out = _setup(tmp_path, system, _answers("Hossam", "acct123", "agent-transcripts"),
+    rc, out = _setup(tmp_path, system, _answers("Bob", "acct123", "agent-transcripts"),
                      secrets=("KEYID", "SECRETVALUE"))
 
     assert rc == 0, out
     assert system.keys == {keychain.ITEM_KEY_ID: "KEYID",
                            keychain.ITEM_PRIVATE: "SECRETVALUE"}
     config = (tmp_path / ".config" / "aif-insights" / "config.toml").read_text()
-    assert 'user = "Hossam"' in config and 'bucket = "agent-transcripts"' in config
+    assert 'user = "Bob"' in config and 'bucket = "agent-transcripts"' in config
     assert "SECRETVALUE" not in config and "KEYID" not in config
     settings = json.loads(claude_settings.read_text())
     assert settings == {"model": "opus", "cleanupPeriodDays": 3650}
@@ -80,7 +80,7 @@ def test_fresh_setup_stores_keys_writes_config_and_installs_the_job(tmp_path):
 
 def test_existing_keychain_keys_are_reused(tmp_path):
     system = FakeSystem({keychain.ITEM_KEY_ID: "OLD", keychain.ITEM_PRIVATE: "OLDSECRET"})
-    rc, out = _setup(tmp_path, system, _answers("ahmed", "acct", "bucket", "y"))
+    rc, out = _setup(tmp_path, system, _answers("alice", "acct", "bucket", "y"))
     assert rc == 0, out
     assert not any(c[:2] == ["security", "add-generic-password"] for c in system.calls)
     assert "already in your Keychain" in out
@@ -88,7 +88,7 @@ def test_existing_keychain_keys_are_reused(tmp_path):
 
 def test_failed_connection_stops_before_installing_the_job(tmp_path):
     system = FakeSystem()
-    rc, out = _setup(tmp_path, system, _answers("ahmed", "acct", "bucket"),
+    rc, out = _setup(tmp_path, system, _answers("alice", "acct", "bucket"),
                      secrets=("K", "S"), fail_store=True)
     assert rc == 1
     assert "could not write to R2" in out
@@ -97,7 +97,7 @@ def test_failed_connection_stops_before_installing_the_job(tmp_path):
 
 def test_rerun_offers_previous_answers_as_defaults(tmp_path):
     system = FakeSystem()
-    _setup(tmp_path, system, _answers("ahmed", "acct", "bucket"), secrets=("K", "S"))
+    _setup(tmp_path, system, _answers("alice", "acct", "bucket"), secrets=("K", "S"))
     prompts: list[str] = []
 
     def ask(prompt):
@@ -106,7 +106,7 @@ def test_rerun_offers_previous_answers_as_defaults(tmp_path):
 
     rc, out = _setup(tmp_path, system, ask)
     assert rc == 0, out
-    assert any("[ahmed]" in p for p in prompts) and any("[bucket]" in p for p in prompts)
+    assert any("[alice]" in p for p in prompts) and any("[bucket]" in p for p in prompts)
 
 
 def test_rerun_keeps_dokploy_panels(tmp_path):

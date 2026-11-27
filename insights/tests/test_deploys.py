@@ -428,3 +428,12 @@ def test_each_deployment_is_matched_by_its_own_watch_paths():
     rows, shipped = derive(h, prs)
     assert [s["pr_number"] for s in shipped] == [2]
     assert {r["deployment_id"]: r["reverted"] for r in rows if r["source"] == "dokploy"} == {"d1": True, "d2": False}
+
+
+def test_a_pr_ships_with_the_first_later_deployment_that_watches_it():
+    h = _history({"s1": _svc(watch=["web/**"])}, {
+        "d0": {**_rec(start="2026-11-19T10:00:00Z", end="2026-11-19T10:05:00Z"), "watch_paths": ["web/**"]},
+        "d1": {**_rec(start="2026-11-20T10:00:00Z", end="2026-11-20T10:05:00Z"), "watch_paths": ["api/**"]},
+        "d2": {**_rec(start="2026-11-21T10:00:00Z", end="2026-11-21T10:05:00Z"), "watch_paths": ["web/**"]}})
+    _, shipped = derive(h, [_pr(1, "2026-11-19T12:00:00Z", files=["web/a.ts"])])
+    assert [(s["pr_number"], s["deployment_id"]) for s in shipped] == [(1, "d2")]

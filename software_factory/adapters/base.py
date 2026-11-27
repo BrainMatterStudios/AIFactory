@@ -5,7 +5,7 @@ object that structurally satisfies the relevant Protocol — no inheritance
 required — which is what keeps the layer open for extension (an adopter can drop
 in a GitLab or Jira source adapter without touching the core).
 
-Severity and the issue taxonomy mirror the proven ElBasket conventions so the
+Severity and the issue taxonomy mirror the proven conventions of the original production factory so the
 loop's dedup/queue/verify semantics carry over unchanged.
 """
 from __future__ import annotations
@@ -206,8 +206,8 @@ class DataAdapter(Protocol):
     """Read-only data access for data-quality collectors.
 
     Implementations MUST be fail-closed: error if the read-only DSN is unset
-    rather than falling back to a write-capable connection (see the ElBasket B2B
-    bug this rule prevents). `query` must reject non-SELECT statements.
+    rather than falling back to a write-capable connection (a production bug
+    prompted this rule). `query` must reject non-SELECT statements.
     """
 
     def query(

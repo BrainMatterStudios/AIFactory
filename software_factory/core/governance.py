@@ -2,7 +2,7 @@
 convention.
 
 Three concerns, ported and generalized from the software-factory runbooks
-(kill switch + budget caps) and the ElBasket ceiling:
+(kill switch + budget caps) and the original production factory's ceiling:
 
   * kill switch — cooperative (an env var checked each loop iteration) plus
     halt-by-markdown (a committed STOP/HALT/KILL file). Engaging either stops the

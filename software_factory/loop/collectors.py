@@ -1,4 +1,4 @@
-"""The collector contract — the generic version of ElBasket's data-quality
+"""The collector contract — the generic version of the original factory's data-quality
 checks.
 
 A collector returns a list of CheckResult `{name, verdict, evidence}`. The

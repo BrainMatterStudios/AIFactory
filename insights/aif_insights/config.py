@@ -3,8 +3,8 @@
 Default location: `~/.config/aif-insights/config.toml`. Secrets never go in it;
 R2 credentials are read from the environment by the R2 store.
 
-    user = "ahmed"                 # required: who ran the sessions
-    # machine = "ahmed-mbp"        # default: short hostname
+    user = "alice"                 # required: who ran the sessions
+    # machine = "alice-mbp"        # default: short hostname
     store = "r2"                   # "r2" or "local"
     quiet_minutes = 30             # skip files written to more recently than this
     exclude_cwd = ["*/clients/acme/*"]   # never upload sessions run under these paths
